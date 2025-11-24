@@ -1,0 +1,12 @@
+{
+  "card": {
+    "number": "2200 0000 0000 0000",
+    "bank": "Сбербанк",
+    "holder": "IVAN IVANOV"
+  },
+  "sbp": {
+    "phone": "+7 900 000 00 00",
+    "bank": "Сбербанк"
+  },
+  "active": true
+}
