@@ -1,0 +1,22 @@
+{
+  "1_month": {
+    "name": "Месяц",
+    "days": 30,
+    "price": 200
+  },
+  "3_months": {
+    "name": "3 месяца",
+    "days": 90,
+    "price": 500
+  },
+  "6_months": {
+    "name": "6 месяцев",
+    "days": 180,
+    "price": 1000
+  },
+  "1_year": {
+    "name": "Год",
+    "days": 365,
+    "price": 1500
+  }
+}

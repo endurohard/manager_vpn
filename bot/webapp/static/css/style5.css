@@ -1,0 +1,476 @@
+/* Layout normalization */
+*, *::before, *::after { box-sizing: border-box; }
+/* Windows XP Luna Theme Style */
+body {
+    background-color: var(--tg-theme-bg-color, #3a6ea5);
+    background-image: 
+        linear-gradient(to bottom, #7db9e8 0%, #1e5799 100%);
+    color: var(--tg-theme-text-color, #000000);
+    font-family: 'Tahoma', 'Segoe UI', sans-serif;
+    margin: 0;
+    padding: 0;
+    line-height: 1.5;
+    overflow-x: hidden;
+    min-height: 100vh;
+    transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.container {
+    max-width: 700px;
+    margin: 20px auto;
+    padding: 20px;
+    background-color: #ece9d8;
+    border-radius: 5px;
+    border: 1px solid #ffffff;
+    box-shadow: 
+        inset 0 1px 0 #f5f4f0,
+        inset 1px 0 0 #f5f4f0,
+        inset -1px 0 0 #f5f4f0,
+        inset 0 -1px 0 #d6d3c4,
+        0 0 0 1px #a7a394,
+        0 2px 4px rgba(0, 0, 0, 0.2);
+    position: relative;
+    overflow: hidden;
+    padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+}
+
+.highlight {
+    background: #d7e6f7;
+    padding: 15px;
+    border-radius: 3px;
+    text-align: center;
+    font-size: 20px;
+    margin-bottom: 20px;
+    border: 1px solid #a7c6f0;
+    color: #000000;
+    font-weight: bold;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+.tabs {
+    display: flex;
+    justify-content: flex-start;
+    gap: 2px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    background: #ece9d8;
+    border-bottom: 1px solid #a7a394;
+    padding: 2px 2px 0 2px;
+}
+
+.tab-btn {
+    padding: 6px 12px;
+    font-size: 14px;
+    border: 1px solid #a7a394;
+    background: linear-gradient(to bottom, #f6f6f6 0%, #e2e2e2 100%);
+    color: #000000;
+    border-radius: 3px 3px 0 0;
+    cursor: pointer;
+    transition: all 0.1s ease;
+    font-family: 'Tahoma', sans-serif;
+    position: relative;
+    margin-bottom: -1px;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+.tab-btn:hover {
+    background: linear-gradient(to bottom, #ffffff 0%, #f0f0f0 100%);
+}
+
+.tab-btn.active {
+    background: #ffffff;
+    color: #000000;
+    border-bottom: 1px solid #ffffff;
+    font-weight: bold;
+    box-shadow: none;
+    padding-bottom: 7px;
+}
+
+.accordion-custom {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.accordion-item {
+    background-color: #ffffff;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid #a7a394;
+    transition: all 0.1s ease;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+.accordion-item:hover {
+    border-color: #316ac5;
+}
+
+.accordion-header {
+    background: linear-gradient(to bottom, #f6f6f6 0%, #e2e2e2 100%);
+    color: #000000;
+    padding: 8px 15px;
+    font-size: 14px;
+    border: none;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+    font-weight: bold;
+    transition: 0.1s;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+.accordion-header::after {
+    content: "+";
+    font-size: 18px;
+    transition: transform 0.1s ease;
+    color: #000000;
+}
+
+.accordion-header.active {
+    background: #ffffff;
+}
+
+.accordion-header.active::after {
+    content: "-";
+    color: #000000;
+}
+
+.accordion-header:hover {
+    background: linear-gradient(to bottom, #ffffff 0%, #f0f0f0 100%);
+}
+
+.accordion-body {
+    display: none;
+    background-color: #ffffff;
+    padding: 15px;
+    font-size: 13px;
+    color: #000000;
+    border-top: 1px solid #d6d3c4;
+    line-height: 1.5;
+}
+
+.button {
+    background: linear-gradient(to bottom, #f6f6f6 0%, #e2e2e2 100%);
+    color: #000000;
+    border: 1px solid #a7a394;
+    padding: 4px 12px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+    margin-top: 10px;
+    transition: all 0.1s ease;
+    font-weight: normal;
+    font-family: 'Tahoma', sans-serif;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+    min-height: 23px;
+    min-width: 75px;
+}
+.button.small {
+    font-size: 12px;
+    padding: 6px 10px;
+}
+
+.button:hover {
+    background: linear-gradient(to bottom, #ffffff 0%, #f0f0f0 100%);
+    border-color: #316ac5;
+}
+.mobile-buttons {
+    display: flex;
+    /* flex-direction: column; */
+    gap: 4px;
+    align-items: flex-start;
+  }
+  
+/* Стили для кнопки копирования - Windows XP тема */
+.copy-btn {
+    background: linear-gradient(to bottom, #f0f0f0, #e0e0e0);
+    color: #000000;
+    border: 1px solid #a0a0a0;
+    padding: 6px 12px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.1s ease;
+    font-weight: normal;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    height: 32px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 1px 2px rgba(0, 0, 0, 0.1);
+    font-family: "MS Sans Serif", "Microsoft Sans Serif", sans-serif;
+}
+
+.copy-btn:hover {
+    background: linear-gradient(to bottom, #e8f4fd, #d8e8f8);
+    border-color: #4a90e2;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.copy-btn:active {
+    background: linear-gradient(to bottom, #d0e0f0, #c0d0e0);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+.button:active {
+    background: linear-gradient(to bottom, #e2e2e2 0%, #f6f6f6 100%);
+    box-shadow: 
+        inset 0 1px 2px rgba(0, 0, 0, 0.1),
+        0 1px 0 #ffffff;
+}
+
+.section-title {
+    font-size: 16px;
+    font-weight: bold;
+    margin: 20px 0 10px;
+    color: #003399;
+    position: relative;
+    padding-bottom: 5px;
+}
+
+.section-title::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(to right, #003399, #a7a394);
+}
+
+/* Windows XP Scrollbar (для WebKit браузеров) */
+::-webkit-scrollbar {
+    width: 16px;
+    height: 16px;
+    background-color: #ece9d8;
+}
+
+::-webkit-scrollbar-thumb {
+    background: linear-gradient(to bottom, #f6f6f6 0%, #e2e2e2 100%);
+    border: 1px solid #a7a394;
+    border-radius: 8px;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(to bottom, #ffffff 0%, #f0f0f0 100%);
+}
+
+/* Windows XP иконки и элементы */
+.info-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 15px;
+    background: #ffffff;
+    border: 1px solid #a7a394;
+    padding: 10px;
+    border-radius: 3px;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+}
+
+.info-row {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-start;
+}
+
+.info-box {
+    flex: 1 1 100%;
+    max-width: none;
+    background: #d7e6f7;
+    border: 1px solid #a7c6f0;
+    padding: 10px;
+    border-radius: 3px;
+    text-align: center;
+    color: #000000;
+    box-shadow: 
+        inset 0 1px 0 #ffffff,
+        0 1px 0 #ffffff;
+    transition: all 0.1s ease;
+}
+
+.info-box:hover {
+    background: #e8f2fc;
+    border-color: #316ac5;
+}
+
+.info-label i {
+    font-size: 18px;
+    margin-right: 6px;
+    color: #003399;
+    opacity: 0.8;
+}
+
+.info-value {
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 5px;
+    color: #000000;
+    text-align: left;
+}
+
+.info-label {
+    font-size: 9px;
+    color: #000000;
+    font-weight: bold;
+    opacity: 0.8;
+    text-align: left;
+}
+
+/* Специальный стиль для блока "Истекает" */
+.info-box-full .info-label {
+    font-size: 10px;
+    opacity: 0.6;
+}
+
+.info-box-full .info-value {
+    font-size: 16px;
+}
+
+.info-box-full {
+    flex: 1 1 100%;
+    max-width: none;
+}
+
+/* Адаптивность */
+@media (max-width: 768px) {
+    .container {
+        margin: 10px;
+        padding: 15px;
+    }
+    
+    .tab-btn {
+        padding: 5px 10px;
+        font-size: 12px;
+    }
+    
+    .section-title {
+        font-size: 14px;
+    }
+    
+    .info-box {
+        flex: 1 1 100%;
+        padding: 8px;
+    }
+}
+
+/* Windows XP Taskbar-like footer */
+.footer {
+    background: linear-gradient(to bottom, #3a6ea5 0%, #1e5799 100%);
+    color: white;
+    padding: 8px 15px;
+    font-size: 12px;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 -1px 0 #316ac5;
+}
+
+.start-button {
+    background: linear-gradient(to bottom, #7db9e8 0%, #3a6ea5 100%);
+    color: white;
+    border: 1px solid #316ac5;
+    border-radius: 3px;
+    padding: 4px 10px 4px 30px;
+    font-weight: bold;
+    position: relative;
+}
+
+.start-button::before {
+    content: "";
+    position: absolute;
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 16px;
+    height: 16px;
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" fill="white"/><polygon points="8,4 12,8 8,12" fill="%233a6ea5"/></svg>');
+    background-repeat: no-repeat;
+}
+
+.time-display {
+    background: linear-gradient(to bottom, #3a6ea5 0%, #1e5799 100%);
+    border: 1px solid #316ac5;
+    border-radius: 3px;
+    padding: 4px 10px;
+    font-family: 'Tahoma', sans-serif;
+}
+
+.config-links-section {
+    margin-top: 20px;
+    padding: 10px;
+    border-radius: 10px;
+}
+
+.config-link-item {
+    margin-bottom: 12px;
+}
+
+.config-copy-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.config-copy-row input[type="text"] {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-family: monospace;
+    background: #2e2e3e;
+    color: #fff;
+}
+.support-link {
+    text-align: center;
+    margin-top: 20px;
+    font-size: 16px;
+}
+.support-link a {
+    color: #00f;
+    text-decoration: underline;
+}
+
+/* QR: унифицированные размеры/поведение */
+.qr-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 12px 0;
+}
+
+.qr-code {
+    display: inline-block;
+    background: #ffffff;
+    padding: 10px;
+    border-radius: 8px;
+}
+
+.qr-code canvas,
+.qr-code img {
+    width: 200px;
+    height: 200px;
+    display: block;
+}

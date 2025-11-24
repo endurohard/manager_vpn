@@ -1,0 +1,443 @@
+/* Layout normalization */
+*, *::before, *::after { box-sizing: border-box; }
+/* Фиолетоый закругленный стиль */
+body {
+    background-color: var(--tg-theme-bg-color, #0a0a12);
+    color: var(--tg-theme-text-color, #e0e0ff);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    margin: 0;
+    padding: 20px;
+    line-height: 1.5;
+    transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.container {
+    max-width: 650px;
+    margin: 0 auto;
+    padding: 20px;
+    background-color: #121220;
+    border-radius: 12px;
+    border: 1px solid #2a2a3a;
+    box-shadow: 0 0 20px rgba(100, 60, 255, 0.1);
+    padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+}
+
+.highlight {
+    background: linear-gradient(90deg, #1a1a2e, #16213e);
+    padding: 16px;
+    border-radius: 10px;
+    text-align: center;
+    font-size: 18px;
+    margin-bottom: 16px;
+    border: 1px solid #3a3a5a;
+    box-shadow: 0 0 15px rgba(90, 70, 255, 0.2);
+    color: #a0f0ff;
+}
+
+.tabs {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.tab-btn {
+    padding: 5px 15px;
+    font-size: 17px;
+    border: none;
+    background-color: #1e1e2e;
+    color: #b0b0ff;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.tab-btn.active {
+    background: linear-gradient(90deg, #6e45e2, #88d3ce);
+    color: #fff;
+    box-shadow: 0 0 10px rgba(110, 69, 226, 0.5);
+}
+
+.accordion-custom {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.accordion-item {
+    background-color: #1a1a2a;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #2d2d4a;
+}
+
+.accordion-header {
+    background: none;
+    color: #d0d0ff;
+    padding: 14px 16px;
+    font-size: 16px;
+    border: none;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+    font-weight: 500;
+    transition: 0.3s;
+}
+
+.accordion-header:hover {
+    background-color: #252538;
+}
+
+.accordion-body {
+    display: none;
+    background-color: #151525;
+    padding: 12px 16px;
+    font-size: 14px;
+    color: #c0c0ff;
+    border-top: 1px solid #2d2d4a;
+}
+
+.info-line {
+    margin-bottom: 8px;
+}
+
+.button {
+    background: linear-gradient(90deg, #6e45e2, #88d3ce);
+    color: white;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    margin-top: 8px;
+    transition: all 0.3s ease;
+    font-weight: 500;
+    box-shadow: 0 0 10px rgba(110, 69, 226, 0.3);
+}
+.button.small {
+    font-size: 12px;
+    padding: 6px 10px;
+}
+
+.button:hover {
+    background: linear-gradient(90deg, #7d55f2, #98e3de);
+    box-shadow: 0 0 15px rgba(110, 69, 226, 0.5);
+}
+
+/* Стили для кнопки копирования - фиолетовая тема */
+.copy-btn {
+    background: linear-gradient(90deg, #7d55f2, #98e3de);
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.3s ease;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    height: 32px;
+    box-shadow: 0 4px 15px rgba(125, 85, 242, 0.3);
+}
+
+.copy-btn:hover {
+    background: linear-gradient(90deg, #8b5cf6, #a855f7);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(139, 92, 246, 0.4);
+}
+
+.button.small {
+    font-size: 13px;
+}
+
+.support-link {
+    margin: 20px 0 10px;
+    text-align: center;
+    font-size: 13px;
+    color: #9090d0;
+}
+.mobile-buttons {
+    display: flex;
+    /* flex-direction: column; */
+    gap: 4px;
+    align-items: flex-start;
+  }
+  
+.support-link a {
+    color: #6e45e2;
+    text-decoration: none;
+    transition: 0.3s;
+}
+
+.support-link a:hover {
+    text-shadow: 0 0 8px rgba(110, 69, 226, 0.7);
+}
+
+.section-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    margin-top: 10px;
+    color: #a0f0ff;
+    text-shadow: 0 0 5px rgba(160, 240, 255, 0.3);
+}
+
+
+
+.container {
+    background-color: rgba(18, 18, 32, 0.85);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(138, 43, 226, 0.3);
+}
+
+
+@keyframes hologram {
+0% {
+    box-shadow: 
+    0 0 5px rgba(0, 242, 255, 0.5),
+    0 0 10px rgba(255, 0, 242, 0.3),
+    inset 0 0 10px rgba(255, 255, 255, 0.1);
+    transform: perspective(500px) rotateX(0deg);
+}
+50% {
+    box-shadow: 
+    0 0 15px rgba(0, 242, 255, 0.8),
+    0 0 30px rgba(255, 0, 242, 0.5),
+    inset 0 0 20px rgba(255, 255, 255, 0.3);
+    transform: perspective(500px) rotateX(5deg);
+}
+100% {
+    box-shadow: 
+    0 0 5px rgba(0, 242, 255, 0.5),
+    0 0 10px rgba(255, 0, 242, 0.3),
+    inset 0 0 10px rgba(255, 255, 255, 0.1);
+    transform: perspective(500px) rotateX(0deg);
+}
+}
+
+.highlight, .tab-btn.active, .button {
+    animation: hologram 4s ease-in-out infinite;
+    transform-style: preserve-3d;
+}
+
+.platform-instruction {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 15px;
+    padding: 10px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 8px;
+    align-items: flex-start;
+}
+
+.platform-icon {
+    font-size: 20px;
+    background: rgba(110, 69, 226, 0.2);
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.install-link {
+    color: #2383e2;
+    font-weight: 500;
+    text-decoration: none;
+    border-bottom: 1px dashed #2383e2;
+    transition: all 0.2s ease;
+}
+
+.install-link:hover {
+    color: #1a6ac0;
+    border-bottom: 1px solid #1a6ac0;
+}
+#copy-btn2 {
+    margin-bottom: 10px; /* Отступ от нижнего контента */
+}
+
+
+.info-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-top: 16px;
+}
+
+.info-row {
+    display: flex;
+    gap: 16px;
+    justify-content: center;
+}
+
+.info-box {
+    background-color: #2f3143;
+    padding: 3px;
+    border-radius: 12px;
+    flex: 1 1 100%;
+    max-width: none;
+    text-align: center;
+    color: #fff;
+    box-shadow: 0 0 10px rgba(0,0,0,0.2);
+}
+
+.info-box-full {
+    flex: 1 1 100%;
+    max-width: none;
+}
+
+.info-label i {
+    font-size: 16px;
+    margin-right: 6px;
+    opacity: 0.8;
+}
+
+.info-value {
+    font-size: 20px;
+    font-weight: bold;
+    color: #ffffff;
+    margin-bottom: 4px;
+    text-align: left;
+}
+
+.info-label {
+    font-size: 10px;
+    opacity: 0.8;
+    text-align: left;
+}
+
+/* Специальный стиль для блока "Истекает" */
+.info-box-full .info-label {
+    font-size: 10px;
+    opacity: 0.6;
+    /* text-align: center; */
+}
+
+.info-box-full .info-value {
+    font-size: 18px;
+    /* text-align: center; */
+}
+
+.qr-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 20px 0;
+    position: relative;
+    margin: 15px 0;
+}
+
+.qr-code {
+    width: 220px;
+    height: 220px;
+    border-radius: 8px;
+    box-shadow: 
+        0 0 0 1px rgba(110, 69, 226, 0.3),
+        0 0 30px rgba(110, 69, 226, 0.2),
+        0 0 60px rgba(110, 69, 226, 0.1);
+    position: relative;
+    z-index: 1;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Стили для блока FAQ */
+.faq-section {
+    margin: 25px 0 15px;
+    padding: 15px;
+    background: rgba(30, 30, 46, 0.5);
+    border-radius: 12px;
+    border: 1px solid #2d2d4a;
+}
+
+.faq-section .section-title {
+    margin-bottom: 15px;
+    color: #a0f0ff;
+    text-align: center;
+}
+
+.faq-section .accordion-item {
+    margin-bottom: 10px;
+}
+
+.faq-section .accordion-header {
+    background: #252538;
+    padding: 12px 15px;
+    border-radius: 8px;
+    font-size: 15px;
+}
+
+.faq-section .accordion-body {
+    padding: 12px 15px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #c0c0ff;
+}
+
+.faq-section .accordion-body p {
+    margin: 8px 0;
+}
+
+.config-links-section {
+    margin-top: 20px;
+    padding: 10px;
+    border-radius: 10px;
+}
+
+.config-link-item {
+    margin-bottom: 12px;
+}
+
+.config-copy-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.config-copy-row input[type="text"] {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-family: monospace;
+    background: #2e2e3e;
+    color: #fff;
+}
+.support-link {
+    text-align: center;
+    margin-top: 20px;
+    font-size: 16px;
+}
+.support-link a {
+    color: #00f;
+    text-decoration: underline;
+}
+
+/* QR: унифицированные размеры/поведение */
+.qr-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 12px 0;
+}
+
+.qr-code {
+    display: inline-block;
+    background: #ffffff;
+    padding: 10px;
+    border-radius: 8px;
+}
+
+.qr-code canvas,
+.qr-code img {
+    width: 200px;
+    height: 200px;
+    display: block;
+}

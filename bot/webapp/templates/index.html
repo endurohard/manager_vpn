@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="description" content="Официальные инструкции по настройке для iOS, Android, Windows и macOS.">
+    <meta name="author" content="Raphael">
+    <meta name="robots" content="index, follow">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <title>Инструкции Raphael</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link id="theme-link" rel="stylesheet" href="static/css/stiyle_mini.css?v=4">
+    <link rel="stylesheet" href="static/css/theme_switcher.css?v=4">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Noto+Sans:wght@400;500;700&family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <div class="highlight"><i class="fa fa-bolt" aria-hidden="true"></i> Инструкции Raphael</div>
+
+        <!-- Переключатель тем -->
+        <div class="theme-switcher" aria-label="Переключатель темы">
+            <button type="button" class="theme-switcher-btn" title="Сменить тему" aria-haspopup="true" aria-expanded="false">
+                <i class="fa fa-palette"></i>
+            </button>
+            <div class="theme-menu" role="menu" aria-hidden="true">
+                <button class="theme-item" data-theme="style.css" role="menuitem">Киберпанк</button>
+                <button class="theme-item" data-theme="style2.css" role="menuitem">Синтвейв</button>
+                <button class="theme-item" data-theme="style3.css" role="menuitem">Фиолетовая</button>
+                <button class="theme-item" data-theme="style4.css" role="menuitem">Светлая</button>
+                <button class="theme-item" data-theme="style5.css" role="menuitem">Windows XP</button>
+                <button class="theme-item active" data-theme="stiyle_mini.css" role="menuitem">Мини</button>
+            </div>
+        </div>
+
+        <!-- Вкладки -->
+        <div class="tabs">
+            <button class="tab-btn active" data-target="instructions-tab"><i class="fa fa-book" aria-hidden="true"></i> Инструкции</button>
+            <button class="tab-btn" data-target="pricing-tab"><i class="fa fa-ruble-sign" aria-hidden="true"></i> Тарифы</button>
+            <button class="tab-btn" data-target="apps-tab"><i class="fa fa-download" aria-hidden="true"></i> Программы</button>
+        </div>
+
+        <!-- Вкладка: Инструкции -->
+        <div class="tab-content" id="instructions-tab" style="display: block;">
+            <div class="section-title"><i class="fa fa-book" aria-hidden="true"></i> Настройка V·P·N</div>
+            <div class="accordion-custom">
+
+                <!-- iOS -->
+                <div class="accordion-item">
+                    <button class="accordion-header">
+                        <i class="fab fa-apple" style="margin-right: 8px;"></i> iOS (iPhone/iPad)
+                    </button>
+                    <div class="accordion-body">
+                        <h3 style="margin-top: 0;">📱 V2RayTun для iOS</h3>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">1</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Скачайте приложение</strong>
+                                <p style="margin: 5px 0;">Установите <a href="https://apps.apple.com/app/v2raytun/id6476628951" target="_blank" style="color: var(--accent-primary);"><strong>V2RayTun</strong></a> из App Store</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">2</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Добавьте конфигурацию</strong>
+                                <p style="margin: 5px 0;">Скопируйте ключ из бота → откройте V2RayTun → нажмите "+" → "Импорт из буфера"</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">3</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Подключитесь</strong>
+                                <p style="margin: 5px 0;">Нажмите на сервер и включите V·P·N кнопкой внизу экрана</p>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                            <strong>💡 Альтернативы:</strong> v2rayNG, Shadowrocket ($2.99)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Android -->
+                <div class="accordion-item">
+                    <button class="accordion-header">
+                        <i class="fab fa-android" style="margin-right: 8px;"></i> Android
+                    </button>
+                    <div class="accordion-body">
+                        <h3 style="margin-top: 0;">🤖 V2RayTun для Android</h3>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">1</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Скачайте приложение</strong>
+                                <p style="margin: 5px 0;">Установите <a href="https://play.google.com/store/apps/details?id=com.v2raytun.android" target="_blank" style="color: var(--accent-primary);"><strong>V2RayTun</strong></a> из Google Play</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">2</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Импортируйте конфигурацию</strong>
+                                <p style="margin: 5px 0;">Скопируйте ключ из бота → откройте V2RayTun → "+" → "Импорт из буфера"</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">3</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Активируйте V·P·N</strong>
+                                <p style="margin: 5px 0;">Нажмите на сервер и включите V·P·N кнопкой внизу</p>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                            <strong>💡 Альтернатива:</strong> v2rayNG (Google Play / GitHub)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Windows -->
+                <div class="accordion-item">
+                    <button class="accordion-header">
+                        <i class="fab fa-windows" style="margin-right: 8px;"></i> Windows
+                    </button>
+                    <div class="accordion-body">
+                        <h3 style="margin-top: 0;">🪟 V2RayTun для Windows</h3>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">1</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Скачайте программу</strong>
+                                <p style="margin: 5px 0;">Загрузите <a href="https://v2raytun.com/download/windows" target="_blank" style="color: var(--accent-primary);"><strong>V2RayTun</strong></a> и установите</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">2</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Добавьте сервер</strong>
+                                <p style="margin: 5px 0;">Скопируйте ключ → в программе нажмите "+" → "Импорт из буфера"</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">3</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Запустите V·P·N</strong>
+                                <p style="margin: 5px 0;">Выберите сервер и нажмите кнопку подключения</p>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                            <strong>💡 Альтернативы:</strong> v2rayN, Hiddify
+                        </div>
+                    </div>
+                </div>
+
+                <!-- macOS -->
+                <div class="accordion-item">
+                    <button class="accordion-header">
+                        <i class="fab fa-apple" style="margin-right: 8px;"></i> macOS
+                    </button>
+                    <div class="accordion-body">
+                        <h3 style="margin-top: 0;">🍎 V2RayTun для macOS</h3>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">1</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Установите приложение</strong>
+                                <p style="margin: 5px 0;">Скачайте <a href="https://v2raytun.com/download/macos" target="_blank" style="color: var(--accent-primary);"><strong>V2RayTun</strong></a> и установите</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">2</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Импортируйте настройки</strong>
+                                <p style="margin: 5px 0;">Скопируйте ключ → в программе "+" → "Импорт из буфера"</p>
+                            </div>
+                        </div>
+                        <div class="step" style="margin-bottom: 15px;">
+                            <span class="step-number" style="background: var(--accent-primary); color: white; padding: 5px 12px; border-radius: 50%; font-weight: bold; margin-right: 10px;">3</span>
+                            <div style="display: inline-block; vertical-align: top; width: calc(100% - 50px);">
+                                <strong>Включите V·P·N</strong>
+                                <p style="margin: 5px 0;">Выберите сервер и нажмите кнопку подключения</p>
+                            </div>
+                        </div>
+                        <div style="margin-top: 20px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                            <strong>💡 Альтернативы:</strong> v2rayU, Hiddify
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Общие советы -->
+                <div class="accordion-item">
+                    <button class="accordion-header">
+                        <i class="fa fa-lightbulb" style="margin-right: 8px;"></i> Полезные советы
+                    </button>
+                    <div class="accordion-body">
+                        <ul style="padding-left: 20px; margin: 10px 0;">
+                            <li style="margin-bottom: 10px;"><strong>QR-код</strong> - самый простой способ подключения на мобильных устройствах</li>
+                            <li style="margin-bottom: 10px;"><strong>Копирование ссылки</strong> - универсальный метод для всех платформ</li>
+                            <li style="margin-bottom: 10px;"><strong>Проверка подключения</strong> - откройте любой заблокированный сайт</li>
+                            <li style="margin-bottom: 10px;"><strong>Одновременные подключения</strong> - максимум 2 устройства</li>
+                            <li style="margin-bottom: 10px;"><strong>Проблемы?</strong> - попробуйте переподключиться или обратитесь в поддержку</li>
+                        </ul>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- Вкладка: Тарифы -->
+        <div class="tab-content" id="pricing-tab" style="display: none;">
+            <div class="section-title"><i class="fa fa-ruble-sign" aria-hidden="true"></i> Тарифные планы</div>
+
+            <div class="pricing-grid">
+                <!-- Тариф: 1 месяц -->
+                <div class="pricing-card">
+                    <div class="pricing-header">
+                        <div class="pricing-icon">
+                            <i class="fa fa-calendar-day"></i>
+                        </div>
+                        <h3 class="pricing-title">Месяц</h3>
+                    </div>
+                    <div class="pricing-body">
+                        <div class="pricing-price">
+                            <span class="price-amount">200</span>
+                            <span class="price-currency">₽</span>
+                        </div>
+                        <div class="pricing-duration">30 дней</div>
+                        <ul class="pricing-features">
+                            <li><i class="fa fa-check"></i> Безлимитный трафик</li>
+                            <li><i class="fa fa-check"></i> Высокая скорость</li>
+                            <li><i class="fa fa-check"></i> 2 устройства</li>
+                            <li><i class="fa fa-check"></i> Техподдержка 24/7</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Тариф: 3 месяца -->
+                <div class="pricing-card popular">
+                    <div class="pricing-badge">
+                        <i class="fa fa-star"></i> Популярный
+                    </div>
+                    <div class="pricing-header">
+                        <div class="pricing-icon">
+                            <i class="fa fa-calendar-alt"></i>
+                        </div>
+                        <h3 class="pricing-title">3 месяца</h3>
+                    </div>
+                    <div class="pricing-body">
+                        <div class="pricing-price">
+                            <span class="price-amount">500</span>
+                            <span class="price-currency">₽</span>
+                        </div>
+                        <div class="pricing-duration">90 дней</div>
+                        <div class="pricing-savings">Экономия 100₽</div>
+                        <ul class="pricing-features">
+                            <li><i class="fa fa-check"></i> Безлимитный трафик</li>
+                            <li><i class="fa fa-check"></i> Высокая скорость</li>
+                            <li><i class="fa fa-check"></i> 2 устройства</li>
+                            <li><i class="fa fa-check"></i> Техподдержка 24/7</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Тариф: 6 месяцев -->
+                <div class="pricing-card">
+                    <div class="pricing-header">
+                        <div class="pricing-icon">
+                            <i class="fa fa-calendar-week"></i>
+                        </div>
+                        <h3 class="pricing-title">6 месяцев</h3>
+                    </div>
+                    <div class="pricing-body">
+                        <div class="pricing-price">
+                            <span class="price-amount">1000</span>
+                            <span class="price-currency">₽</span>
+                        </div>
+                        <div class="pricing-duration">180 дней</div>
+                        <div class="pricing-savings">Экономия 200₽</div>
+                        <ul class="pricing-features">
+                            <li><i class="fa fa-check"></i> Безлимитный трафик</li>
+                            <li><i class="fa fa-check"></i> Высокая скорость</li>
+                            <li><i class="fa fa-check"></i> 2 устройства</li>
+                            <li><i class="fa fa-check"></i> Техподдержка 24/7</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Тариф: 1 год -->
+                <div class="pricing-card best-value">
+                    <div class="pricing-badge">
+                        <i class="fa fa-gem"></i> Выгодно
+                    </div>
+                    <div class="pricing-header">
+                        <div class="pricing-icon">
+                            <i class="fa fa-calendar"></i>
+                        </div>
+                        <h3 class="pricing-title">Год</h3>
+                    </div>
+                    <div class="pricing-body">
+                        <div class="pricing-price">
+                            <span class="price-amount">1500</span>
+                            <span class="price-currency">₽</span>
+                        </div>
+                        <div class="pricing-duration">365 дней</div>
+                        <div class="pricing-savings">Экономия 900₽</div>
+                        <ul class="pricing-features">
+                            <li><i class="fa fa-check"></i> Безлимитный трафик</li>
+                            <li><i class="fa fa-check"></i> Высокая скорость</li>
+                            <li><i class="fa fa-check"></i> 2 устройства</li>
+                            <li><i class="fa fa-check"></i> Техподдержка 24/7</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Дополнительная информация -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-top: 20px;">
+                <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-info-circle"></i> Что входит в подписку?</h3>
+                <ul style="padding-left: 20px; margin: 10px 0;">
+                    <li style="margin-bottom: 10px;"><strong>Безлимитный трафик</strong> - используйте V·P·N без ограничений</li>
+                    <li style="margin-bottom: 10px;"><strong>Высокая скорость</strong> - наслаждайтесь быстрым интернетом</li>
+                    <li style="margin-bottom: 10px;"><strong>2 устройства одновременно</strong> - подключите телефон и компьютер</li>
+                    <li style="margin-bottom: 10px;"><strong>Защита данных</strong> - шифрование трафика по протоколу VLESS</li>
+                    <li style="margin-bottom: 10px;"><strong>Техподдержка 24/7</strong> - всегда готовы помочь</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Вкладка: Программы -->
+        <div class="tab-content" id="apps-tab" style="display: none;">
+            <div class="section-title"><i class="fa fa-download" aria-hidden="true"></i> Приложения для V·P·N</div>
+
+            <!-- iOS Apps -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0;"><i class="fab fa-apple"></i> iOS (iPhone/iPad)</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>V2RayTun</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Рекомендуемое приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://apps.apple.com/app/v2raytun/id6476628951" target="_blank" class="button small">App Store</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>v2rayNG</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Альтернативное приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://apps.apple.com/app/v2box/id6446814690" target="_blank" class="button small">App Store</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>Shadowrocket</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Платная альтернатива</p>
+                        <span style="background: #ff9800; color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">$2.99</span>
+                    </div>
+                    <a href="https://apps.apple.com/app/shadowrocket/id932747118" target="_blank" class="button small">App Store</a>
+                </div>
+            </div>
+
+            <!-- Android Apps -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0;"><i class="fab fa-android"></i> Android</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>V2RayTun</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Рекомендуемое приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://play.google.com/store/apps/details?id=com.v2raytun.android" target="_blank" class="button small">Google Play</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>v2rayNG</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Альтернативное приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://play.google.com/store/apps/details?id=com.v2ray.ang" target="_blank" class="button small">Google Play</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>v2rayNG APK</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Прямая загрузка с GitHub</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Последняя версия</span>
+                    </div>
+                    <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" class="button small">GitHub</a>
+                </div>
+            </div>
+
+            <!-- Windows Apps -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0;"><i class="fab fa-windows"></i> Windows</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>V2RayTun</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Рекомендуемое приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://v2raytun.com/download/windows" target="_blank" class="button small">Скачать</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>v2rayN</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Популярный клиент</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" class="button small">Скачать</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>Hiddify</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Современная альтернатива</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Простой интерфейс</span>
+                    </div>
+                    <a href="https://github.com/hiddify/hiddify-next/releases/latest" target="_blank" class="button small">Скачать</a>
+                </div>
+            </div>
+
+            <!-- macOS Apps -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0;"><i class="fab fa-apple"></i> macOS</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>V2RayTun</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Рекомендуемое приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://v2raytun.com/download/macos" target="_blank" class="button small">Скачать</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>v2rayU</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Альтернативное приложение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Бесплатно</span>
+                    </div>
+                    <a href="https://github.com/yanue/V2rayU/releases/latest" target="_blank" class="button small">Скачать</a>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--secondary-bg); border-radius: 8px;">
+                    <div>
+                        <strong>Hiddify</strong>
+                        <p style="margin: 5px 0; opacity: 0.8; font-size: 13px;">Кроссплатформенное решение</p>
+                        <span style="background: var(--accent-primary); color: white; padding: 3px 8px; border-radius: 5px; font-size: 11px;">Современный дизайн</span>
+                    </div>
+                    <a href="https://github.com/hiddify/hiddify-next/releases/latest" target="_blank" class="button small">Скачать</a>
+                </div>
+            </div>
+
+            <!-- Важная информация -->
+            <div style="background: #fff3cd; color: #856404; padding: 15px; border-radius: 12px; border-left: 4px solid #ffc107;">
+                <h3 style="margin-top: 0;"><i class="fa fa-exclamation-triangle"></i> Важная информация</h3>
+                <ul style="padding-left: 20px; margin: 10px 0;">
+                    <li style="margin-bottom: 8px;">Всегда скачивайте приложения только из официальных источников</li>
+                    <li style="margin-bottom: 8px;">Для Android - используйте Google Play или официальный GitHub</li>
+                    <li style="margin-bottom: 8px;">Для iOS - используйте только App Store</li>
+                    <li style="margin-bottom: 8px;">При возникновении проблем - переустановите приложение</li>
+                    <li style="margin-bottom: 8px;">Не делитесь своими ключами с другими людьми</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Ссылка на браузерную версию -->
+        <div style="background: var(--section-bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center;">
+            <i class="fa fa-globe" style="margin-right: 8px;"></i> <strong>Открыть в браузере:</strong>
+            <br>
+            <a href="https://zov-gor.ru" target="_blank" style="color: var(--accent-primary); font-size: 16px;">zov-gor.ru</a>
+        </div>
+
+        <div class="support-link">
+            <i class="fa fa-question-circle"></i> Нужна помощь?
+            <br>
+            <a href="https://t.me/bagamedovit" target="_blank" style="margin-right: 15px;"><i class="fab fa-telegram"></i> Telegram</a>
+            <a href="https://wa.me/79633707007" target="_blank"><i class="fab fa-whatsapp"></i> WhatsApp</a>
+        </div>
+    </div>
+
+    <script src="static/js/script.js?v=4"></script>
+</body>
+</html>
