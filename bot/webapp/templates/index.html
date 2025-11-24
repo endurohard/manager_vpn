@@ -11,10 +11,11 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Инструкции Raphael</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link id="theme-link" rel="stylesheet" href="static/css/stiyle_mini.css?v=4">
+    <link id="theme-link" rel="stylesheet" href="static/css/stiyle_mini.css?v=8">
     <link rel="stylesheet" href="static/css/theme_switcher.css?v=4">
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Noto+Sans:wght@400;500;700&family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -40,6 +41,7 @@
             <button class="tab-btn active" data-target="instructions-tab"><i class="fa fa-book" aria-hidden="true"></i> Инструкции</button>
             <button class="tab-btn" data-target="pricing-tab"><i class="fa fa-ruble-sign" aria-hidden="true"></i> Тарифы</button>
             <button class="tab-btn" data-target="apps-tab"><i class="fa fa-download" aria-hidden="true"></i> Программы</button>
+            <button class="tab-btn" data-target="order-tab"><i class="fa fa-shopping-cart" aria-hidden="true"></i> Заказать</button>
         </div>
 
         <!-- Вкладка: Инструкции -->
@@ -455,6 +457,144 @@
             </div>
         </div>
 
+        <!-- Вкладка: Заказать -->
+        <div class="tab-content" id="order-tab" style="display: none;">
+            <div class="section-title"><i class="fa fa-shopping-cart" aria-hidden="true"></i> Заказать ключ</div>
+
+            <!-- Шаг 1: Выбор тарифа -->
+            <div id="order-step-1" class="order-step">
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-list"></i> Выберите тариф</h3>
+                    <div id="tariffs-list" style="display: flex; flex-direction: column; gap: 10px;">
+                        <div style="text-align: center; padding: 20px;">
+                            <i class="fa fa-spinner fa-spin"></i> Загрузка тарифов...
+                        </div>
+                    </div>
+                </div>
+
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-user"></i> Ваши контакты</h3>
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">Telegram или телефон:</label>
+                        <input type="text" id="order-contact" placeholder="@username или +7..."
+                               style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--secondary-bg); color: var(--text-primary); font-size: 16px; box-sizing: border-box;">
+                    </div>
+                    <button id="create-order-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px;" disabled>
+                        <i class="fa fa-arrow-right"></i> Продолжить
+                    </button>
+                </div>
+            </div>
+
+            <!-- Шаг 2: Оплата -->
+            <div id="order-step-2" class="order-step" style="display: none;">
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-receipt"></i> Ваш заказ</h3>
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px;">
+                        <p style="margin: 0 0 10px 0;"><strong>Номер заказа:</strong> <span id="order-id" style="color: var(--accent-primary); font-weight: bold;"></span></p>
+                        <p style="margin: 0 0 10px 0;"><strong>Тариф:</strong> <span id="order-tariff"></span></p>
+                        <p style="margin: 0;"><strong>К оплате:</strong> <span id="order-price" style="color: var(--accent-primary); font-weight: bold; font-size: 18px;"></span></p>
+                    </div>
+                </div>
+
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-credit-card"></i> Реквизиты для оплаты</h3>
+                    <div id="payment-details">
+                        <div style="text-align: center; padding: 20px;">
+                            <i class="fa fa-spinner fa-spin"></i> Загрузка...
+                        </div>
+                    </div>
+                </div>
+
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-check-circle"></i> Подтвердить оплату</h3>
+
+                    <!-- Загрузка скриншота -->
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">
+                            <i class="fa fa-camera"></i> Скриншот оплаты:
+                        </label>
+                        <div id="upload-area" style="border: 2px dashed var(--secondary-bg); border-radius: 12px; padding: 20px; text-align: center; cursor: pointer; transition: all 0.3s ease;">
+                            <input type="file" id="payment-proof" accept="image/*,.pdf" style="display: none;">
+                            <div id="upload-placeholder">
+                                <i class="fa fa-cloud-upload-alt" style="font-size: 32px; color: var(--accent-primary); margin-bottom: 10px;"></i>
+                                <p style="margin: 0; opacity: 0.8;">Нажмите или перетащите файл</p>
+                                <p style="margin: 5px 0 0 0; font-size: 12px; opacity: 0.6;">JPG, PNG, PDF (до 10 МБ)</p>
+                            </div>
+                            <div id="upload-preview" style="display: none;">
+                                <img id="preview-image" style="max-width: 100%; max-height: 150px; border-radius: 8px; margin-bottom: 10px;">
+                                <p id="preview-filename" style="margin: 0; font-size: 14px; color: var(--accent-primary);"></p>
+                                <button type="button" id="remove-file-btn" style="margin-top: 10px; padding: 5px 15px; border: none; background: #ff6b6b; color: white; border-radius: 6px; cursor: pointer; font-size: 12px;">
+                                    <i class="fa fa-times"></i> Удалить
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 500;">Комментарий (необязательно):</label>
+                        <input type="text" id="payment-info" placeholder="Последние 4 цифры карты или время перевода"
+                               style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--secondary-bg); color: var(--text-primary); font-size: 16px; box-sizing: border-box;">
+                    </div>
+                    <button id="confirm-payment-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px; background: #28a745;">
+                        <i class="fa fa-paper-plane"></i> Я оплатил
+                    </button>
+                    <button id="back-to-step1-btn" class="button" style="width: 100%; padding: 12px; font-size: 14px; margin-top: 10px; background: var(--secondary-bg); color: var(--text-primary);">
+                        <i class="fa fa-arrow-left"></i> Назад
+                    </button>
+                </div>
+            </div>
+
+            <!-- Шаг 3: Ожидание -->
+            <div id="order-step-3" class="order-step" style="display: none;">
+                <div style="background: var(--section-bg); padding: 30px; border-radius: 12px; text-align: center;">
+                    <i class="fa fa-clock" style="font-size: 48px; color: var(--accent-primary); margin-bottom: 20px;"></i>
+                    <h3 style="margin: 0 0 15px 0;">Ожидайте подтверждения</h3>
+                    <p style="opacity: 0.8; margin-bottom: 20px;">Ваша оплата отправлена на проверку. После подтверждения вы получите ключ.</p>
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                        <p style="margin: 0;"><strong>Номер заказа:</strong> <span id="waiting-order-id" style="color: var(--accent-primary);"></span></p>
+                    </div>
+                    <button id="check-status-btn" class="button" style="padding: 12px 30px;">
+                        <i class="fa fa-sync"></i> Проверить статус
+                    </button>
+                    <p id="order-status-text" style="margin-top: 15px; font-weight: 500;"></p>
+                </div>
+            </div>
+
+            <!-- Шаг 4: Получение ключа -->
+            <div id="order-step-4" class="order-step" style="display: none;">
+                <div style="background: var(--section-bg); padding: 30px; border-radius: 12px; text-align: center;">
+                    <i class="fa fa-check-circle" style="font-size: 48px; color: #28a745; margin-bottom: 20px;"></i>
+                    <h3 style="margin: 0 0 15px 0; color: #28a745;">Оплата подтверждена!</h3>
+                    <p style="opacity: 0.8; margin-bottom: 20px;">Ваш ключ готов. Скопируйте его и импортируйте в приложение.</p>
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; word-break: break-all;">
+                        <textarea id="vless-key" readonly style="width: 100%; height: 80px; border: none; background: transparent; color: var(--text-primary); font-size: 12px; resize: none; box-sizing: border-box;"></textarea>
+                    </div>
+                    <div id="qr-code-container" style="background: white; padding: 15px; border-radius: 12px; margin-bottom: 20px; display: inline-block;">
+                        <div id="qr-code"></div>
+                    </div>
+                    <p style="opacity: 0.7; font-size: 12px; margin-bottom: 15px;">Отсканируйте QR-код или скопируйте ключ</p>
+                    <button id="copy-key-btn" class="button" style="padding: 12px 30px; background: #28a745;">
+                        <i class="fa fa-copy"></i> Скопировать ключ
+                    </button>
+                    <button id="new-order-btn" class="button" style="padding: 12px 30px; margin-top: 10px; background: var(--accent-primary);">
+                        <i class="fa fa-plus"></i> Новый заказ
+                    </button>
+                </div>
+            </div>
+
+            <!-- Проверка существующего заказа -->
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-top: 15px;">
+                <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-search"></i> Проверить заказ</h3>
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="check-order-id" placeholder="Номер заказа"
+                           style="flex: 1; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--secondary-bg); color: var(--text-primary); font-size: 16px; text-transform: uppercase;">
+                    <button id="check-existing-order-btn" class="button" style="padding: 12px 20px;">
+                        <i class="fa fa-search"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- Ссылка на браузерную версию -->
         <div style="background: var(--section-bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center;">
             <i class="fa fa-globe" style="margin-right: 8px;"></i> <strong>Открыть в браузере:</strong>
@@ -470,6 +610,6 @@
         </div>
     </div>
 
-    <script src="static/js/script.js?v=4"></script>
+    <script src="static/js/script.js?v=7"></script>
 </body>
 </html>

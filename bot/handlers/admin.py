@@ -73,6 +73,11 @@ class SearchKeyStates(StatesGroup):
     waiting_for_search_query = State()
 
 
+class WebOrderRejectStates(StatesGroup):
+    """Состояния для отказа веб-заказа"""
+    waiting_for_reject_reason = State()
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -1554,3 +1559,539 @@ async def new_search(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+# ==================== УПРАВЛЕНИЕ ВЕБ-ЗАКАЗАМИ И РЕКВИЗИТАМИ ====================
+
+import json
+import aiosqlite
+from pathlib import Path
+
+PAYMENT_FILE = Path(__file__).parent.parent.parent / 'payment_details.json'
+ORDERS_DB = Path(__file__).parent.parent.parent / 'web_orders.db'
+
+
+class PaymentSettingsStates(StatesGroup):
+    """Состояния для настройки реквизитов"""
+    waiting_for_card = State()
+    waiting_for_sbp = State()
+    waiting_for_holder = State()
+
+
+def load_payment_details():
+    """Загрузить реквизиты"""
+    if PAYMENT_FILE.exists():
+        with open(PAYMENT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"active": False}
+
+
+def save_payment_details(data):
+    """Сохранить реквизиты"""
+    with open(PAYMENT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@router.message(F.text == "💳 Реквизиты")
+async def show_payment_settings(message: Message):
+    """Показать настройки реквизитов"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    details = load_payment_details()
+    
+    status = "✅ Активно" if details.get("active") else "❌ Неактивно"
+    card = details.get("card", {})
+    sbp = details.get("sbp", {})
+    
+    text = (
+        f"💳 <b>РЕКВИЗИТЫ ОПЛАТЫ</b>\n\n"
+        f"Статус: {status}\n\n"
+        f"<b>Карта:</b>\n"
+        f"• Номер: <code>{card.get('number', 'не указан')}</code>\n"
+        f"• Банк: {card.get('bank', 'не указан')}\n"
+        f"• Получатель: {card.get('holder', 'не указан')}\n\n"
+        f"<b>СБП:</b>\n"
+        f"• Телефон: <code>{sbp.get('phone', 'не указан')}</code>\n"
+        f"• Банк: {sbp.get('bank', 'не указан')}\n\n"
+        f"<b>Команды:</b>\n"
+        f"/set_card <номер> - Установить номер карты\n"
+        f"/set_sbp <телефон> - Установить телефон СБП\n"
+        f"/set_holder <имя> - Установить получателя\n"
+        f"/set_bank <банк> - Установить банк\n"
+        f"/payment_on - Включить оплату\n"
+        f"/payment_off - Выключить оплату"
+    )
+    
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(F.text.startswith("/set_card"))
+async def set_card_number(message: Message):
+    """Установить номер карты"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /set_card 2200 0000 0000 0000")
+        return
+    
+    card_number = parts[1].strip()
+    details = load_payment_details()
+    if "card" not in details:
+        details["card"] = {}
+    details["card"]["number"] = card_number
+    save_payment_details(details)
+    
+    await message.answer(f"✅ Номер карты установлен: <code>{card_number}</code>", parse_mode="HTML")
+
+
+@router.message(F.text.startswith("/set_sbp"))
+async def set_sbp_phone(message: Message):
+    """Установить телефон СБП"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /set_sbp +7 900 000 00 00")
+        return
+    
+    phone = parts[1].strip()
+    details = load_payment_details()
+    if "sbp" not in details:
+        details["sbp"] = {}
+    details["sbp"]["phone"] = phone
+    save_payment_details(details)
+    
+    await message.answer(f"✅ Телефон СБП установлен: <code>{phone}</code>", parse_mode="HTML")
+
+
+@router.message(F.text.startswith("/set_holder"))
+async def set_card_holder(message: Message):
+    """Установить получателя"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /set_holder IVAN IVANOV")
+        return
+    
+    holder = parts[1].strip().upper()
+    details = load_payment_details()
+    if "card" not in details:
+        details["card"] = {}
+    details["card"]["holder"] = holder
+    save_payment_details(details)
+    
+    await message.answer(f"✅ Получатель установлен: {holder}")
+
+
+@router.message(F.text.startswith("/set_bank"))
+async def set_bank(message: Message):
+    """Установить банк"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /set_bank Сбербанк")
+        return
+    
+    bank = parts[1].strip()
+    details = load_payment_details()
+    if "card" not in details:
+        details["card"] = {}
+    if "sbp" not in details:
+        details["sbp"] = {}
+    details["card"]["bank"] = bank
+    details["sbp"]["bank"] = bank
+    save_payment_details(details)
+    
+    await message.answer(f"✅ Банк установлен: {bank}")
+
+
+@router.message(F.text == "/payment_on")
+async def payment_on(message: Message):
+    """Включить оплату"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    details = load_payment_details()
+    details["active"] = True
+    save_payment_details(details)
+    
+    await message.answer("✅ Оплата на сайте включена!")
+
+
+@router.message(F.text == "/payment_off")
+async def payment_off(message: Message):
+    """Выключить оплату"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    details = load_payment_details()
+    details["active"] = False
+    save_payment_details(details)
+    
+    await message.answer("❌ Оплата на сайте выключена!")
+
+
+@router.message(F.text.startswith("/web_approve"))
+async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
+    """Подтвердить веб-заказ и выдать ключ"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /web_approve ORDER_ID")
+        return
+    
+    order_id = parts[1].strip().upper()
+    
+    async with aiosqlite.connect(ORDERS_DB) as db_orders:
+        db_orders.row_factory = aiosqlite.Row
+        cursor = await db_orders.execute('SELECT * FROM web_orders WHERE id = ?', (order_id,))
+        order = await cursor.fetchone()
+        
+        if not order:
+            await message.answer(f"❌ Заказ {order_id} не найден")
+            return
+        
+        if order["status"] == "completed":
+            await message.answer(f"⚠️ Заказ {order_id} уже выполнен")
+            return
+        
+        order_dict = dict(order)
+    
+    # Генерируем ключ через X-UI
+    try:
+        status_msg = await message.answer("⏳ Генерирую ключ...")
+
+        # Используем контакт как email/имя клиента
+        client_name = f"web_{order_id}_{order_dict['contact'].replace('@', '').replace('+', '')[:15]}"
+
+        # Создаем клиента в X-UI
+        client_data = await xui_client.add_client(
+            inbound_id=12,  # Используем inbound 12 по умолчанию
+            email=client_name,
+            phone=client_name,
+            expire_days=order_dict["days"],
+            ip_limit=2
+        )
+
+        if client_data and not client_data.get('error'):
+            # Получаем VLESS ссылку
+            vless_key = await xui_client.get_client_link(
+                inbound_id=12,
+                client_email=client_name
+            )
+
+            if vless_key:
+                # Сохраняем ключ в заказ
+                async with aiosqlite.connect(ORDERS_DB) as db_orders:
+                    await db_orders.execute('''
+                        UPDATE web_orders
+                        SET status = 'completed', vless_key = ?, confirmed_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (vless_key, order_id))
+                    await db_orders.commit()
+                await status_msg.edit_text(
+                    f"✅ <b>Заказ {order_id} выполнен!</b>\n\n"
+                    f"📦 Тариф: {order_dict['tariff_name']}\n"
+                    f"📱 Контакт: {order_dict['contact']}\n"
+                    f"📅 Дней: {order_dict['days']}\n\n"
+                    f"🔑 Ключ:\n<code>{vless_key}</code>\n\n"
+                    f"Клиент может проверить статус заказа на сайте.",
+                    parse_mode="HTML"
+                )
+            else:
+                await status_msg.edit_text("❌ Ошибка: не удалось получить ссылку на ключ")
+        else:
+            error_msg = client_data.get('message', 'Неизвестная ошибка') if client_data else 'Не удалось создать клиента'
+            await status_msg.edit_text(f"❌ Ошибка создания клиента: {error_msg}")
+            
+    except Exception as e:
+        logger.error(f"Error generating key for web order: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(F.text == "/web_orders")
+async def list_web_orders(message: Message):
+    """Показать список веб-заказов"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if not ORDERS_DB.exists():
+        await message.answer("📋 Веб-заказов пока нет")
+        return
+    
+    async with aiosqlite.connect(ORDERS_DB) as db_orders:
+        db_orders.row_factory = aiosqlite.Row
+        cursor = await db_orders.execute(
+            'SELECT * FROM web_orders ORDER BY created_at DESC LIMIT 20'
+        )
+        orders = await cursor.fetchall()
+    
+    if not orders:
+        await message.answer("📋 Веб-заказов пока нет")
+        return
+    
+    text = "📋 <b>ПОСЛЕДНИЕ ВЕБ-ЗАКАЗЫ:</b>\n\n"
+    
+    status_emoji = {
+        "pending": "⏳",
+        "paid": "💰", 
+        "completed": "✅",
+        "cancelled": "❌"
+    }
+    
+    for order in orders:
+        emoji = status_emoji.get(order["status"], "❓")
+        text += (
+            f"{emoji} <b>{order['id']}</b> - {order['tariff_name']} ({order['price']}₽)\n"
+            f"   📱 {order['contact']} | {order['created_at'][:10]}\n"
+        )
+        if order["status"] == "paid":
+            text += f"   ➡️ /web_approve {order['id']}\n"
+        text += "\n"
+    
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(F.text == "📋 Веб-заказы")
+async def show_web_orders_button(message: Message):
+    """Показать веб-заказы через кнопку"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    # Переиспользуем логику list_web_orders
+    if not ORDERS_DB.exists():
+        await message.answer("📋 Веб-заказов пока нет")
+        return
+    
+    async with aiosqlite.connect(ORDERS_DB) as db_orders:
+        db_orders.row_factory = aiosqlite.Row
+        cursor = await db_orders.execute(
+            'SELECT * FROM web_orders ORDER BY created_at DESC LIMIT 20'
+        )
+        orders = await cursor.fetchall()
+    
+    if not orders:
+        await message.answer("📋 Веб-заказов пока нет")
+        return
+    
+    text = "📋 <b>ПОСЛЕДНИЕ ВЕБ-ЗАКАЗЫ:</b>\n\n"
+    
+    status_emoji = {
+        "pending": "⏳",
+        "paid": "💰", 
+        "completed": "✅",
+        "cancelled": "❌"
+    }
+    
+    for order in orders:
+        emoji = status_emoji.get(order["status"], "❓")
+        text += (
+            f"{emoji} <b>{order['id']}</b> - {order['tariff_name']} ({order['price']}₽)\n"
+            f"   📱 {order['contact']} | {order['created_at'][:10]}\n"
+        )
+        if order["status"] == "paid":
+            text += f"   ➡️ /web_approve {order['id']}\n"
+        text += "\n"
+    
+    await message.answer(text, parse_mode="HTML")
+
+
+# ============== CALLBACK HANDLERS FOR WEB ORDERS ==============
+
+@router.callback_query(F.data.startswith("web_approve_"))
+async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManager, xui_client):
+    """Подтвердить веб-заказ через кнопку"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+
+    order_id = callback.data.replace("web_approve_", "")
+
+    async with aiosqlite.connect(ORDERS_DB) as db_orders:
+        db_orders.row_factory = aiosqlite.Row
+        cursor = await db_orders.execute('SELECT * FROM web_orders WHERE id = ?', (order_id,))
+        order = await cursor.fetchone()
+
+        if not order:
+            await callback.answer("Заказ не найден")
+            return
+
+        if order["status"] == "completed":
+            await callback.answer("Заказ уже выполнен")
+            return
+
+        order_dict = dict(order)
+
+    await callback.answer("Генерирую ключ...")
+
+    # Редактируем сообщение
+    try:
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=callback.message.caption + "\n\n⏳ <b>Генерация ключа...</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text(
+                text=callback.message.text + "\n\n⏳ <b>Генерация ключа...</b>",
+                parse_mode="HTML"
+            )
+    except:
+        pass
+
+    # Генерируем ключ через X-UI (по умолчанию inbound 12)
+    try:
+        client_name = f"web_{order_id}_{order_dict['contact'].replace('@', '').replace('+', '')[:15]}"
+
+        # Создаем клиента в X-UI
+        client_data = await xui_client.add_client(
+            inbound_id=12,  # Используем inbound 12 по умолчанию
+            email=client_name,
+            phone=client_name,
+            expire_days=order_dict["days"],
+            ip_limit=2
+        )
+
+        if client_data and not client_data.get('error'):
+            # Получаем VLESS ссылку
+            vless_key = await xui_client.get_client_link(
+                inbound_id=12,
+                client_email=client_name
+            )
+
+            if vless_key:
+                # Сохраняем ключ в заказ
+                async with aiosqlite.connect(ORDERS_DB) as db_orders:
+                    await db_orders.execute('''
+                        UPDATE web_orders
+                        SET status = 'completed', vless_key = ?, confirmed_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (vless_key, order_id))
+                    await db_orders.commit()
+
+                success_text = (
+                    f"✅ <b>Заказ {order_id} выполнен!</b>\n\n"
+                    f"📦 Тариф: {order_dict['tariff_name']}\n"
+                    f"📱 Контакт: {order_dict['contact']}\n"
+                    f"📅 Дней: {order_dict['days']}\n\n"
+                    f"🔑 Ключ:\n<code>{vless_key}</code>\n\n"
+                    f"Клиент может проверить статус заказа на сайте."
+                )
+
+                try:
+                    if callback.message.photo or callback.message.document:
+                        await callback.message.edit_caption(caption=success_text, parse_mode="HTML")
+                    else:
+                        await callback.message.edit_text(text=success_text, parse_mode="HTML")
+                except:
+                    await callback.message.answer(success_text, parse_mode="HTML")
+            else:
+                await callback.message.answer("❌ Ошибка: не удалось получить ссылку на ключ")
+        else:
+            error_msg = client_data.get('message', 'Неизвестная ошибка') if client_data else 'Не удалось создать клиента'
+            await callback.message.answer(f"❌ Ошибка создания клиента: {error_msg}")
+
+    except Exception as e:
+        logger.error(f"Error generating key for web order: {e}")
+        await callback.message.answer(f"❌ Ошибка: {e}")
+
+
+@router.callback_query(F.data.startswith("web_reject_"))
+async def callback_reject_web_order(callback: CallbackQuery, state: FSMContext):
+    """Начать отказ веб-заказа через кнопку"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+
+    order_id = callback.data.replace("web_reject_", "")
+
+    # Сохраняем ID заказа и сообщения для последующего редактирования
+    await state.update_data(
+        reject_order_id=order_id,
+        reject_message_id=callback.message.message_id,
+        reject_chat_id=callback.message.chat.id
+    )
+    await state.set_state(WebOrderRejectStates.waiting_for_reject_reason)
+
+    await callback.answer()
+    await callback.message.answer(
+        f"❌ <b>Отказ заказа {order_id}</b>\n\n"
+        f"Напишите причину отказа (она будет видна клиенту):\n\n"
+        f"Или отправьте /cancel для отмены",
+        parse_mode="HTML"
+    )
+
+
+@router.message(WebOrderRejectStates.waiting_for_reject_reason, F.text == "/cancel")
+async def cancel_reject_order(message: Message, state: FSMContext):
+    """Отмена отказа заказа"""
+    await state.clear()
+    await message.answer("Отказ заказа отменён.", reply_markup=Keyboards.admin_menu())
+
+
+@router.message(WebOrderRejectStates.waiting_for_reject_reason)
+async def process_reject_reason(message: Message, state: FSMContext):
+    """Обработка причины отказа"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    data = await state.get_data()
+    order_id = data.get("reject_order_id")
+
+    if not order_id:
+        await state.clear()
+        await message.answer("Ошибка: заказ не найден")
+        return
+
+    reject_reason = message.text.strip()
+
+    # Обновляем статус заказа
+    async with aiosqlite.connect(ORDERS_DB) as db_orders:
+        db_orders.row_factory = aiosqlite.Row
+        cursor = await db_orders.execute('SELECT * FROM web_orders WHERE id = ?', (order_id,))
+        order = await cursor.fetchone()
+
+        if not order:
+            await state.clear()
+            await message.answer("Заказ не найден")
+            return
+
+        order_dict = dict(order)
+
+        await db_orders.execute('''
+            UPDATE web_orders
+            SET status = 'cancelled', admin_comment = ?
+            WHERE id = ?
+        ''', (reject_reason, order_id))
+        await db_orders.commit()
+
+    await state.clear()
+
+    await message.answer(
+        f"❌ <b>Заказ {order_id} отклонён</b>\n\n"
+        f"📦 Тариф: {order_dict['tariff_name']}\n"
+        f"📱 Контакт: {order_dict['contact']}\n"
+        f"💬 Причина: {reject_reason}",
+        parse_mode="HTML",
+        reply_markup=Keyboards.admin_menu()
+    )
+
+    # Пытаемся отредактировать оригинальное сообщение
+    try:
+        bot = message.bot
+        original_msg_id = data.get("reject_message_id")
+        chat_id = data.get("reject_chat_id")
+        if original_msg_id and chat_id:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_msg_id, reply_markup=None)
+    except:
+        pass

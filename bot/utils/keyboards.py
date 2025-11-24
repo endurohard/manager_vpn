@@ -43,6 +43,7 @@ class Keyboards:
             [KeyboardButton(text="🗑️ Удалить ключ")],
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
+            [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(
