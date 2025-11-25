@@ -47,3 +47,10 @@ logs/
 .DS_Store
 Thumbs.db
 uploads/
+
+# Payment details (sensitive)
+payment_details.json
+data/payment_details.json
+
+# Watchdog log
+watchdog.log
