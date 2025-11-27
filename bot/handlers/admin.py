@@ -5,13 +5,14 @@ import logging
 import asyncio
 from functools import wraps
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from bot.config import ADMIN_ID
+from bot.config import ADMIN_ID, INBOUND_ID, DOMAIN
 from bot.database import DatabaseManager
-from bot.utils import Keyboards
+from bot.api.xui_client import XUIClient
+from bot.utils import Keyboards, generate_user_id, generate_qr_code, notify_admin_xui_error
 from bot.price_config import PriceManager, get_subscription_periods
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,14 @@ class WebOrderRejectStates(StatesGroup):
     waiting_for_reject_reason = State()
 
 
+class AdminCreateKeyStates(StatesGroup):
+    """Состояния для создания ключа с выбором inbound (только для админа)"""
+    waiting_for_phone = State()
+    waiting_for_inbound = State()
+    waiting_for_period = State()
+    confirming = State()
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -98,6 +107,264 @@ async def show_admin_panel(message: Message, **kwargs):
         "Управление менеджерами и просмотр статистики.",
         reply_markup=Keyboards.admin_menu()
     )
+
+
+# ============ СОЗДАНИЕ КЛЮЧА С ВЫБОРОМ INBOUND ============
+
+@router.message(F.text == "🔑 Создать ключ (выбор inbound)")
+@admin_only
+async def admin_start_create_key(message: Message, state: FSMContext, **kwargs):
+    """Начало создания ключа с выбором inbound (только для админа)"""
+    await state.set_state(AdminCreateKeyStates.waiting_for_phone)
+    await message.answer(
+        "🔑 <b>Создание ключа с выбором inbound</b>\n\n"
+        "Введите идентификатор клиента или нажмите кнопку для генерации:",
+        reply_markup=Keyboards.phone_input(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminCreateKeyStates.waiting_for_phone, F.text == "Отмена")
+async def admin_cancel_create_key(message: Message, state: FSMContext):
+    """Отмена создания ключа"""
+    await state.clear()
+    await message.answer(
+        "Создание ключа отменено.",
+        reply_markup=Keyboards.admin_menu()
+    )
+
+
+@router.message(AdminCreateKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
+async def admin_generate_id(message: Message, state: FSMContext, xui_client: XUIClient):
+    """Генерация ID и показ выбора inbound"""
+    user_id_value = generate_user_id()
+    await state.update_data(phone=user_id_value)
+
+    # Получаем список inbound'ов
+    inbounds = await xui_client.list_inbounds()
+
+    if not inbounds:
+        await message.answer(
+            "❌ Не удалось получить список inbound'ов.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        await state.clear()
+        return
+
+    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+    await message.answer(
+        f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
+        f"🔌 <b>Выберите inbound для создания ключа:</b>",
+        reply_markup=Keyboards.inbound_selection(inbounds),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminCreateKeyStates.waiting_for_phone)
+async def admin_process_phone(message: Message, state: FSMContext, xui_client: XUIClient):
+    """Обработка введенного ID и показ выбора inbound"""
+    user_input = message.text.strip()
+
+    if len(user_input) < 3:
+        await message.answer("Идентификатор слишком короткий. Минимум 3 символа.")
+        return
+
+    await state.update_data(phone=user_input)
+
+    # Получаем список inbound'ов
+    inbounds = await xui_client.list_inbounds()
+
+    if not inbounds:
+        await message.answer(
+            "❌ Не удалось получить список inbound'ов.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        await state.clear()
+        return
+
+    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+    await message.answer(
+        f"🆔 ID клиента: <code>{user_input}</code>\n\n"
+        f"🔌 <b>Выберите inbound для создания ключа:</b>",
+        reply_markup=Keyboards.inbound_selection(inbounds),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(AdminCreateKeyStates.waiting_for_inbound, F.data.startswith("inbound_"))
+async def admin_process_inbound(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора inbound"""
+    inbound_id = int(callback.data.split("_", 1)[1])
+    await state.update_data(inbound_id=inbound_id)
+
+    await state.set_state(AdminCreateKeyStates.waiting_for_period)
+    await callback.message.edit_text(
+        f"✅ Выбран inbound: <b>{inbound_id}</b>\n\n"
+        "Выберите срок действия ключа:",
+        reply_markup=Keyboards.subscription_periods(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminCreateKeyStates.waiting_for_period, F.data.startswith("period_"))
+async def admin_process_period(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора периода"""
+    period_key = callback.data.split("_", 1)[1]
+    periods = get_subscription_periods()
+
+    if period_key not in periods:
+        await callback.answer("Неверный период", show_alert=True)
+        return
+
+    period_data = periods[period_key]
+    await state.update_data(
+        period_key=period_key,
+        period_name=period_data['name'],
+        period_days=period_data['days'],
+        period_price=period_data['price']
+    )
+
+    data = await state.get_data()
+
+    await state.set_state(AdminCreateKeyStates.confirming)
+    await callback.message.edit_text(
+        f"📋 <b>Подтверждение создания ключа:</b>\n\n"
+        f"🆔 ID: <code>{data['phone']}</code>\n"
+        f"🔌 Inbound: <b>{data['inbound_id']}</b>\n"
+        f"⏰ Период: {period_data['name']}\n"
+        f"💰 Цена: {period_data['price']} ₽\n\n"
+        f"Создать ключ?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Создать", callback_data="admin_confirm_key")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_key")]
+        ]),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_cancel_key")
+async def admin_cancel_key_callback(callback: CallbackQuery, state: FSMContext):
+    """Отмена создания ключа"""
+    await state.clear()
+    await callback.message.edit_text("Создание ключа отменено.")
+    await callback.message.answer(
+        "Панель администратора:",
+        reply_markup=Keyboards.admin_menu()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_confirm_key")
+async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
+                           xui_client: XUIClient, bot):
+    """Создание ключа с выбранным inbound"""
+    data = await state.get_data()
+    phone = data.get("phone")
+    inbound_id = data.get("inbound_id")
+    period_name = data.get("period_name")
+    period_days = data.get("period_days")
+    period_price = data.get("period_price", 0)
+
+    await callback.message.edit_text("⏳ Создание ключа...")
+
+    try:
+        # Создаем клиента
+        client_data = await xui_client.add_client(
+            inbound_id=inbound_id,
+            email=phone,
+            phone=phone,
+            expire_days=period_days,
+            ip_limit=2
+        )
+
+        if not client_data:
+            await callback.message.edit_text("❌ Ошибка при создании ключа в X-UI панели.")
+            await state.clear()
+            return
+
+        if client_data.get('error'):
+            error_message = client_data.get('message', 'Неизвестная ошибка')
+            if client_data.get('is_duplicate'):
+                await callback.message.edit_text(
+                    f"⚠️ Клиент с ID <code>{phone}</code> уже существует!",
+                    parse_mode="HTML"
+                )
+            else:
+                await callback.message.edit_text(f"❌ Ошибка: {error_message}")
+            await state.clear()
+            await callback.message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
+            return
+
+        # Получаем VLESS ссылку
+        vless_link_original = await xui_client.get_client_link(
+            inbound_id=inbound_id,
+            client_email=phone,
+            use_domain=None
+        )
+
+        if not vless_link_original:
+            await callback.message.edit_text("Ключ создан, но не удалось сформировать VLESS ссылку.")
+            await state.clear()
+            return
+
+        # Заменяем IP на домен
+        vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
+
+        # Сохраняем в БД
+        await db.add_key_to_history(
+            manager_id=callback.from_user.id,
+            client_email=phone,
+            phone_number=phone,
+            period=period_name,
+            expire_days=period_days,
+            client_id=client_data['client_id'],
+            price=period_price
+        )
+
+        # Ссылка подписки
+        client_uuid = client_data['client_id']
+        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
+        # QR код
+        try:
+            qr_code = generate_qr_code(vless_link_for_user)
+            await callback.message.answer_photo(
+                BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+                caption=(
+                    f"✅ Ключ создан!\n\n"
+                    f"🆔 ID: {phone}\n"
+                    f"🔌 Inbound: {inbound_id}\n"
+                    f"⏰ Срок: {period_name}\n"
+                    f"💰 Цена: {period_price} ₽"
+                )
+            )
+        except Exception as e:
+            logger.error(f"QR generation error: {e}")
+
+        # Текстовый ключ и подписка
+        await callback.message.answer(
+            f"📋 VLESS ключ:\n\n`{vless_link_for_user}`\n\n"
+            f"🔄 Ссылка подписки (мульти-сервер):\n`{subscription_url}`\n\n"
+            f"💡 Подписка включает все серверы и автоматически обновляется.",
+            parse_mode="Markdown"
+        )
+
+        await callback.message.delete()
+
+    except Exception as e:
+        logger.error(f"Error creating key: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)}")
+
+    finally:
+        await state.clear()
+        await callback.message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
+
+    await callback.answer()
+
+
+# ============ КОНЕЦ СОЗДАНИЯ КЛЮЧА С ВЫБОРОМ INBOUND ============
 
 
 @router.message(F.text == "Добавить менеджера")
@@ -1279,7 +1546,7 @@ async def cancel_sni_edit(message: Message, state: FSMContext):
 
 
 @router.message(ManageSNIStates.waiting_for_sni_domains)
-async def process_new_sni_domains(message: Message, state: FSMContext):
+async def process_new_sni_domains(message: Message, state: FSMContext, xui_client):
     """Обработка новых SNI доменов"""
     from bot.api.xui_client import XUIClient
     from bot.config import XUI_HOST, XUI_USERNAME, XUI_PASSWORD
@@ -1375,7 +1642,11 @@ async def process_new_sni_domains(message: Message, state: FSMContext):
         )
 
         if restart_result.returncode == 0:
-            await asyncio.sleep(2)
+            # Даём x-ui время на инициализацию и очистку базы
+            await asyncio.sleep(5)
+
+            # Сбрасываем сессию основного xui_client для переавторизации
+            xui_client.session_cookie = None
 
             # Проверяем статус
             status_result = subprocess.run(
@@ -1791,6 +2062,10 @@ async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
             )
 
             if vless_key:
+                # Формируем ссылку подписки
+                client_uuid = client_data.get('client_id', '')
+                subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
+
                 # Сохраняем ключ в заказ
                 async with aiosqlite.connect(ORDERS_DB) as db_orders:
                     await db_orders.execute('''
@@ -1799,12 +2074,14 @@ async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
                         WHERE id = ?
                     ''', (vless_key, order_id))
                     await db_orders.commit()
+
+                sub_text = f"\n🔄 Подписка:\n<code>{subscription_url}</code>\n" if subscription_url else ""
                 await status_msg.edit_text(
                     f"✅ <b>Заказ {order_id} выполнен!</b>\n\n"
                     f"📦 Тариф: {order_dict['tariff_name']}\n"
                     f"📱 Контакт: {order_dict['contact']}\n"
                     f"📅 Дней: {order_dict['days']}\n\n"
-                    f"🔑 Ключ:\n<code>{vless_key}</code>\n\n"
+                    f"🔑 Ключ:\n<code>{vless_key}</code>{sub_text}\n"
                     f"Клиент может проверить статус заказа на сайте.",
                     parse_mode="HTML"
                 )
@@ -1970,6 +2247,10 @@ async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManage
             )
 
             if vless_key:
+                # Формируем ссылку подписки
+                client_uuid = client_data.get('client_id', '')
+                subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
+
                 # Сохраняем ключ в заказ
                 async with aiosqlite.connect(ORDERS_DB) as db_orders:
                     await db_orders.execute('''
@@ -1979,12 +2260,13 @@ async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManage
                     ''', (vless_key, order_id))
                     await db_orders.commit()
 
+                sub_text = f"\n🔄 Подписка:\n<code>{subscription_url}</code>\n" if subscription_url else ""
                 success_text = (
                     f"✅ <b>Заказ {order_id} выполнен!</b>\n\n"
                     f"📦 Тариф: {order_dict['tariff_name']}\n"
                     f"📱 Контакт: {order_dict['contact']}\n"
                     f"📅 Дней: {order_dict['days']}\n\n"
-                    f"🔑 Ключ:\n<code>{vless_key}</code>\n\n"
+                    f"🔑 Ключ:\n<code>{vless_key}</code>{sub_text}\n"
                     f"Клиент может проверить статус заказа на сайте."
                 )
 

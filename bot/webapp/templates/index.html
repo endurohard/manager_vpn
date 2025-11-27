@@ -49,6 +49,7 @@
             <button class="tab-btn" data-target="pricing-tab"><i class="fa fa-ruble-sign" aria-hidden="true"></i> Тарифы</button>
             <button class="tab-btn" data-target="apps-tab"><i class="fa fa-download" aria-hidden="true"></i> Программы</button>
             <button class="tab-btn" data-target="order-tab"><i class="fa fa-shopping-cart" aria-hidden="true"></i> Заказать</button>
+            <button class="tab-btn" data-target="fix-key-tab"><i class="fa fa-wrench" aria-hidden="true"></i> Исправить</button>
         </div>
 
         <!-- Вкладка: Инструкции -->
@@ -583,6 +584,17 @@
                     <button id="copy-key-btn" class="button" style="padding: 12px 30px; background: #28a745;">
                         <i class="fa fa-copy"></i> Скопировать ключ
                     </button>
+
+                    <!-- Блок подписки -->
+                    <div id="subscription-block" style="display: none; margin-top: 20px; background: var(--secondary-bg); padding: 15px; border-radius: 8px;">
+                        <p style="margin: 0 0 10px 0; font-size: 14px; color: var(--accent-primary);"><i class="fa fa-sync"></i> Ссылка подписки (автообновление)</p>
+                        <input type="text" id="subscription-url" readonly style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--section-bg); color: var(--text-primary); font-size: 12px; box-sizing: border-box;">
+                        <button id="copy-subscription-btn" class="button" style="margin-top: 10px; padding: 10px 20px; background: var(--accent-primary);">
+                            <i class="fa fa-copy"></i> Скопировать подписку
+                        </button>
+                        <p style="opacity: 0.6; font-size: 11px; margin-top: 10px;">Подписка автоматически обновит ключ при изменениях на сервере</p>
+                    </div>
+
                     <button id="new-order-btn" class="button" style="padding: 12px 30px; margin-top: 10px; background: var(--accent-primary);">
                         <i class="fa fa-plus"></i> Новый заказ
                     </button>
@@ -602,6 +614,68 @@
             </div>
         </div>
 
+        <!-- Вкладка: Исправить ключ -->
+        <div class="tab-content" id="fix-key-tab" style="display: none;">
+            <div class="section-title"><i class="fa fa-wrench" aria-hidden="true"></i> Исправить ключ</div>
+
+            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-key"></i> Введите ваш ключ</h3>
+                <p style="opacity: 0.8; margin-bottom: 15px; font-size: 14px;">
+                    Если ваш ключ перестал работать, вставьте его сюда. Система проверит его по базе данных и выдаст исправленную версию.
+                </p>
+                <div style="margin-bottom: 15px;">
+                    <textarea id="fix-key-input" placeholder="vless://..."
+                              style="width: 100%; height: 100px; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--secondary-bg); color: var(--text-primary); font-size: 14px; box-sizing: border-box; resize: vertical; font-family: monospace;"></textarea>
+                </div>
+                <button id="fix-key-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px;">
+                    <i class="fa fa-magic"></i> Исправить ключ
+                </button>
+            </div>
+
+            <!-- Результат исправления -->
+            <div id="fix-key-result" style="display: none;">
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                    <h3 style="margin-top: 0; color: #28a745;"><i class="fa fa-check-circle"></i> Ключ исправлен!</h3>
+                    <p style="opacity: 0.8; margin-bottom: 15px; font-size: 14px;">
+                        Скопируйте исправленный ключ и добавьте его в приложение.
+                    </p>
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                        <textarea id="fixed-key-output" readonly
+                                  style="width: 100%; height: 80px; border: none; background: transparent; color: var(--text-primary); font-size: 12px; resize: none; box-sizing: border-box; font-family: monospace;"></textarea>
+                    </div>
+                    <div id="fix-key-qr" style="background: white; padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center; display: inline-block; width: 100%; box-sizing: border-box;">
+                        <div id="fix-key-qr-code" style="display: inline-block;"></div>
+                    </div>
+                    <button id="copy-fixed-key-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px; background: #28a745;">
+                        <i class="fa fa-copy"></i> Скопировать ключ
+                    </button>
+                </div>
+
+                <!-- Информация о ключе -->
+                <div id="fix-key-info" style="background: var(--section-bg); padding: 20px; border-radius: 12px;">
+                    <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-info-circle"></i> Информация о ключе</h3>
+                    <div id="fix-key-details" style="font-size: 14px;"></div>
+                </div>
+            </div>
+
+            <!-- Ошибка -->
+            <div id="fix-key-error" style="display: none; background: #f8d7da; color: #721c24; padding: 20px; border-radius: 12px; border-left: 4px solid #f5c6cb;">
+                <h3 style="margin-top: 0;"><i class="fa fa-exclamation-triangle"></i> Ошибка</h3>
+                <p id="fix-key-error-text" style="margin: 0;"></p>
+            </div>
+
+            <!-- Инструкция -->
+            <div style="background: #fff3cd; color: #856404; padding: 15px; border-radius: 12px; margin-top: 15px; border-left: 4px solid #ffc107;">
+                <h3 style="margin-top: 0;"><i class="fa fa-lightbulb"></i> Как использовать</h3>
+                <ol style="padding-left: 20px; margin: 10px 0;">
+                    <li style="margin-bottom: 8px;">Скопируйте ваш текущий ключ (начинается с <code>vless://</code>)</li>
+                    <li style="margin-bottom: 8px;">Вставьте его в поле выше</li>
+                    <li style="margin-bottom: 8px;">Нажмите "Исправить ключ"</li>
+                    <li style="margin-bottom: 8px;">Скопируйте исправленный ключ в приложение</li>
+                </ol>
+            </div>
+        </div>
+
         <!-- Ссылка на браузерную версию -->
         <div style="background: var(--section-bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center;">
             <i class="fa fa-globe" style="margin-right: 8px;"></i> <strong>Открыть в браузере:</strong>
@@ -617,6 +691,6 @@
         </div>
     </div>
 
-    <script src="static/js/script.js?v=7"></script>
+    <script src="static/js/script.js?v=8"></script>
 </body>
 </html>

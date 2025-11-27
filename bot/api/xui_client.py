@@ -246,7 +246,8 @@ class XUIClient:
                 "expiryTime": expire_time,
                 "enable": True,
                 "tgId": phone,
-                "subId": ""
+                "subId": "",
+                "flow": "xtls-rprx-vision"  # XTLS Vision для Reality
             }]
         }
 
@@ -285,6 +286,22 @@ class XUIClient:
 
                             if data.get('success'):
                                 logger.info(f"Клиент {email} успешно создан")
+                                # Перезапускаем xray для применения изменений конфига
+                                await self.restart_xray()
+
+                                # Создаём клиента на всех удалённых серверах
+                                try:
+                                    from bot.api.remote_xui import create_client_on_all_remote_servers
+                                    remote_results = await create_client_on_all_remote_servers(
+                                        client_uuid=client_id,
+                                        email=email,
+                                        expire_days=expire_days,
+                                        ip_limit=ip_limit
+                                    )
+                                    logger.info(f"Результаты создания на удалённых серверах: {remote_results}")
+                                except Exception as e:
+                                    logger.error(f"Ошибка создания на удалённых серверах: {e}")
+
                                 return {
                                     "client_id": client_id,
                                     "email": email,
@@ -410,6 +427,11 @@ class XUIClient:
             if security == 'reality':
                 reality_settings = stream_settings.get('realitySettings', {})
 
+                # Flow для XTLS Vision (для новых клиентов)
+                client_flow = client.get('flow', '')
+                if client_flow:
+                    params.append(f"flow={client_flow}")
+
                 # Public Key (pbk)
                 public_key = reality_settings.get('settings', {}).get('publicKey', '')
                 if public_key:
@@ -445,7 +467,13 @@ class XUIClient:
                 ws_host = ws_settings.get('headers', {}).get('Host', use_domain if use_domain else host)
                 params.append(f"host={ws_host}")
 
-            vless_link += "?" + "&".join(params) + f"#{client_email}"
+            # Добавляем префикс для LTE inbound (ID=28, порт 8449)
+            if inbound_id == 28:
+                link_name = f"LTE-Все операторы {client_email}"
+            else:
+                link_name = client_email
+
+            vless_link += "?" + "&".join(params) + f"#{link_name}"
 
             logger.info(f"Успешно сформирована VLESS ссылка для клиента {client_email}")
             return vless_link
@@ -553,6 +581,27 @@ class XUIClient:
 
         logger.error(f"Не удалось получить список inbound'ов после {max_retries} попыток")
         return []
+
+    async def restart_xray(self) -> bool:
+        """
+        Перезапустить xray для применения изменений конфига
+        """
+        try:
+            if not await self._ensure_logged_in():
+                logger.error("Не удалось авторизоваться для рестарта xray")
+                return False
+
+            url = f"{self.host}/panel/api/inbounds/restartPanel"
+            async with self.session.post(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('success'):
+                        logger.info("Xray успешно перезапущен")
+                        return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка при рестарте xray: {e}")
+            return False
 
     async def update_reality_settings(self, inbound_id: int, dest: str, server_names: list, max_retries: int = 3) -> bool:
         """

@@ -642,6 +642,11 @@ function openApp(appType, subscriptionUrl) {
             if (data.status === 'completed' && data.vless_key) {
                 document.getElementById('vless-key').value = data.vless_key;
                 generateQRCode(data.vless_key);
+                // Показываем подписку если есть
+                if (data.subscription_url) {
+                    document.getElementById('subscription-url').value = data.subscription_url;
+                    document.getElementById('subscription-block').style.display = 'block';
+                }
                 showStep(4);
             } else if (data.status === 'paid') {
                 document.getElementById('waiting-order-id').textContent = orderId;
@@ -701,6 +706,36 @@ function openApp(appType, subscriptionUrl) {
         });
     }
 
+    // Копирование подписки
+    const copySubBtn = document.getElementById('copy-subscription-btn');
+    if (copySubBtn) {
+        copySubBtn.addEventListener('click', async () => {
+            const subUrl = document.getElementById('subscription-url')?.value;
+            if (!subUrl) return;
+
+            try {
+                await navigator.clipboard.writeText(subUrl);
+                copySubBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copySubBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать подписку';
+                }, 2000);
+            } catch (e) {
+                const ta = document.createElement('textarea');
+                ta.value = subUrl;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                copySubBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copySubBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать подписку';
+                }, 2000);
+            }
+        });
+    }
+
     // Новый заказ
     const newOrderBtn = document.getElementById('new-order-btn');
     if (newOrderBtn) {
@@ -726,5 +761,167 @@ function openApp(appType, subscriptionUrl) {
         document.querySelectorAll('.order-step').forEach(s => s.style.display = 'none');
         const stepEl = document.getElementById(`order-step-${step}`);
         if (stepEl) stepEl.style.display = 'block';
+    }
+})();
+
+// ============== FIX KEY SYSTEM ==============
+(function initFixKeySystem() {
+    const fixKeyBtn = document.getElementById('fix-key-btn');
+    const fixKeyInput = document.getElementById('fix-key-input');
+    const fixKeyResult = document.getElementById('fix-key-result');
+    const fixKeyError = document.getElementById('fix-key-error');
+    const fixKeyErrorText = document.getElementById('fix-key-error-text');
+    const fixedKeyOutput = document.getElementById('fixed-key-output');
+    const fixKeyDetails = document.getElementById('fix-key-details');
+    const copyFixedKeyBtn = document.getElementById('copy-fixed-key-btn');
+    const fixKeyQrCode = document.getElementById('fix-key-qr-code');
+
+    if (!fixKeyBtn || !fixKeyInput) return;
+
+    // Исправление ключа
+    fixKeyBtn.addEventListener('click', async () => {
+        const key = fixKeyInput.value.trim();
+
+        if (!key) {
+            showError('Введите ключ для исправления');
+            return;
+        }
+
+        if (!key.startsWith('vless://')) {
+            showError('Ключ должен начинаться с vless://');
+            return;
+        }
+
+        fixKeyBtn.disabled = true;
+        fixKeyBtn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Проверка...';
+        hideResults();
+
+        try {
+            const response = await fetch('/api/fix-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key: key })
+            });
+
+            const data = await response.json();
+
+            if (data.error) {
+                showError(data.error);
+                fixKeyBtn.disabled = false;
+                fixKeyBtn.innerHTML = '<i class="fa fa-magic"></i> Исправить ключ';
+                return;
+            }
+
+            // Показываем результат
+            const fixedKey = data.fixed || data.fixed_key;
+            fixedKeyOutput.value = fixedKey;
+
+            // Генерируем QR код
+            if (fixKeyQrCode && typeof QRCode !== 'undefined') {
+                fixKeyQrCode.innerHTML = '';
+                new QRCode(fixKeyQrCode, {
+                    text: fixedKey,
+                    width: 180,
+                    height: 180,
+                    colorDark: '#000000',
+                    colorLight: '#ffffff',
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+            }
+
+            // Показываем информацию об изменениях
+            let detailsHtml = '<ul style="padding-left: 20px; margin: 10px 0;">';
+            const fixes = data.fixes || data.changes || [];
+
+            if (fixes.length > 0) {
+                fixes.forEach(fix => {
+                    detailsHtml += `<li style="margin-bottom: 8px;"><i class="fa fa-check" style="color: #28a745;"></i> ${escapeHtml(fix)}</li>`;
+                });
+            } else {
+                detailsHtml += '<li style="margin-bottom: 8px;"><i class="fa fa-info-circle" style="color: var(--accent-primary);"></i> Ключ уже актуален</li>';
+            }
+
+            // Показываем предупреждения
+            if (data.issues && data.issues.length > 0) {
+                data.issues.forEach(issue => {
+                    detailsHtml += `<li style="margin-bottom: 8px;"><i class="fa fa-exclamation-triangle" style="color: #ffc107;"></i> ${escapeHtml(issue)}</li>`;
+                });
+            }
+
+            // Показываем email клиента
+            const clientEmail = data.client_email || (data.client_info && data.client_info.email);
+            if (clientEmail) {
+                detailsHtml += `<li style="margin-bottom: 8px;"><i class="fa fa-user" style="color: var(--accent-primary);"></i> Клиент: ${escapeHtml(clientEmail)}</li>`;
+            }
+
+            // Статус в базе
+            if (data.found_in_db === true) {
+                detailsHtml += `<li style="margin-bottom: 8px;"><i class="fa fa-database" style="color: #28a745;"></i> Найден в базе данных</li>`;
+            } else if (data.found_in_db === false) {
+                detailsHtml += `<li style="margin-bottom: 8px;"><i class="fa fa-database" style="color: #ff6b6b;"></i> Не найден в базе данных</li>`;
+            }
+
+            detailsHtml += '</ul>';
+            fixKeyDetails.innerHTML = detailsHtml;
+
+            fixKeyResult.style.display = 'block';
+            fixKeyError.style.display = 'none';
+
+        } catch (e) {
+            showError('Ошибка соединения с сервером');
+            console.error('Fix key error:', e);
+        }
+
+        fixKeyBtn.disabled = false;
+        fixKeyBtn.innerHTML = '<i class="fa fa-magic"></i> Исправить ключ';
+    });
+
+    // Копирование исправленного ключа
+    if (copyFixedKeyBtn) {
+        copyFixedKeyBtn.addEventListener('click', async () => {
+            const key = fixedKeyOutput?.value;
+            if (!key) return;
+
+            try {
+                await navigator.clipboard.writeText(key);
+                copyFixedKeyBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyFixedKeyBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать ключ';
+                }, 2000);
+            } catch (e) {
+                // Fallback
+                const ta = document.createElement('textarea');
+                ta.value = key;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                copyFixedKeyBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyFixedKeyBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать ключ';
+                }, 2000);
+            }
+        });
+    }
+
+    function showError(message) {
+        if (fixKeyError && fixKeyErrorText) {
+            fixKeyErrorText.textContent = message;
+            fixKeyError.style.display = 'block';
+            fixKeyResult.style.display = 'none';
+        }
+    }
+
+    function hideResults() {
+        if (fixKeyResult) fixKeyResult.style.display = 'none';
+        if (fixKeyError) fixKeyError.style.display = 'none';
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
     }
 })();

@@ -61,47 +61,15 @@ async def generate_user_identifier(message: Message, state: FSMContext, xui_clie
     user_id_value = generate_user_id()
     await state.update_data(phone=user_id_value)
 
-    # Проверяем, является ли пользователь админом
-    telegram_user_id = message.from_user.id
-    is_admin = telegram_user_id == ADMIN_ID
+    # Используем дефолтный inbound для всех
+    await state.update_data(inbound_id=INBOUND_ID)
+    await state.set_state(CreateKeyStates.waiting_for_period)
 
-    # Для админа показываем выбор inbound
-    if is_admin:
-        await state.set_state(CreateKeyStates.waiting_for_inbound)
-
-        # Получаем список inbound'ов
-        inbounds = await xui_client.list_inbounds()
-
-        if not inbounds:
-            await message.answer(
-                "❌ Не удалось получить список inbound'ов.\n"
-                "Используется inbound по умолчанию."
-            )
-            await state.update_data(inbound_id=INBOUND_ID)
-            await state.set_state(CreateKeyStates.waiting_for_period)
-            await message.answer(
-                f"Сгенерирован ID: {user_id_value}\n\n"
-                "Выберите срок действия ключа:",
-                reply_markup=Keyboards.subscription_periods()
-            )
-            return
-
-        await message.answer(
-            f"Сгенерирован ID: <code>{user_id_value}</code>\n\n"
-            f"🔌 <b>Выберите inbound для создания ключа:</b>",
-            reply_markup=Keyboards.inbound_selection(inbounds),
-            parse_mode="HTML"
-        )
-    else:
-        # Для обычных менеджеров используем дефолтный inbound
-        await state.update_data(inbound_id=INBOUND_ID)
-        await state.set_state(CreateKeyStates.waiting_for_period)
-
-        await message.answer(
-            f"Сгенерирован ID: {user_id_value}\n\n"
-            "Выберите срок действия ключа:",
-            reply_markup=Keyboards.subscription_periods()
-        )
+    await message.answer(
+        f"Сгенерирован ID: {user_id_value}\n\n"
+        "Выберите срок действия ключа:",
+        reply_markup=Keyboards.subscription_periods()
+    )
 
 
 @router.message(CreateKeyStates.waiting_for_phone, F.text == "Отмена")
@@ -130,50 +98,16 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
     if 'генерир' in user_input.lower() or 'generate' in user_input.lower():
         # Автоматически генерируем ID
         generated_id = generate_user_id()
-        await state.update_data(phone=generated_id)
+        await state.update_data(phone=generated_id, inbound_id=INBOUND_ID)
+        await state.set_state(CreateKeyStates.waiting_for_period)
 
-        # Для админа показываем выбор inbound
-        if is_admin:
-            await state.set_state(CreateKeyStates.waiting_for_inbound)
-
-            # Получаем список inbound'ов
-            inbounds = await xui_client.list_inbounds()
-
-            if not inbounds:
-                await message.answer(
-                    "❌ Не удалось получить список inbound'ов.\n"
-                    "Используется inbound по умолчанию."
-                )
-                await state.update_data(inbound_id=INBOUND_ID)
-                await state.set_state(CreateKeyStates.waiting_for_period)
-                await message.answer(
-                    f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
-                    f"🆔 <code>{generated_id}</code>\n\n"
-                    "Выберите срок действия ключа:",
-                    reply_markup=Keyboards.subscription_periods(),
-                    parse_mode="HTML"
-                )
-                return
-
-            await message.answer(
-                f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
-                f"🆔 <code>{generated_id}</code>\n\n"
-                f"🔌 <b>Выберите inbound для создания ключа:</b>",
-                reply_markup=Keyboards.inbound_selection(inbounds),
-                parse_mode="HTML"
-            )
-        else:
-            # Для обычных менеджеров используем дефолтный inbound
-            await state.update_data(inbound_id=INBOUND_ID)
-            await state.set_state(CreateKeyStates.waiting_for_period)
-
-            await message.answer(
-                f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
-                f"🆔 <code>{generated_id}</code>\n\n"
-                "Выберите срок действия ключа:",
-                reply_markup=Keyboards.subscription_periods(),
-                parse_mode="HTML"
-            )
+        await message.answer(
+            f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
+            f"🆔 <code>{generated_id}</code>\n\n"
+            "Выберите срок действия ключа:",
+            reply_markup=Keyboards.subscription_periods(),
+            parse_mode="HTML"
+        )
         return
 
     # Проверяем минимальную длину
@@ -203,43 +137,13 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
             f"Идентификатор клиента: <code>{user_input}</code>\n\n"
         )
 
-    await state.update_data(phone=user_input)
+    await state.update_data(phone=user_input, inbound_id=INBOUND_ID)
+    await state.set_state(CreateKeyStates.waiting_for_period)
 
-    # Для админа показываем выбор inbound
-    if is_admin:
-        await state.set_state(CreateKeyStates.waiting_for_inbound)
-
-        # Получаем список inbound'ов
-        inbounds = await xui_client.list_inbounds()
-
-        if not inbounds:
-            await message.answer(
-                "❌ Не удалось получить список inbound'ов.\n"
-                "Используется inbound по умолчанию."
-            )
-            await state.update_data(inbound_id=INBOUND_ID)
-            await state.set_state(CreateKeyStates.waiting_for_period)
-            await message.answer(
-                format_message + "Выберите срок действия ключа:",
-                reply_markup=Keyboards.subscription_periods(),
-                parse_mode="HTML"
-            )
-            return
-
-        await message.answer(
-            format_message + "🔌 <b>Выберите inbound для создания ключа:</b>",
-            reply_markup=Keyboards.inbound_selection(inbounds),
-            parse_mode="HTML"
-        )
-    else:
-        # Для обычных менеджеров используем дефолтный inbound
-        await state.update_data(inbound_id=INBOUND_ID)
-        await state.set_state(CreateKeyStates.waiting_for_period)
-
-        await message.answer(
-            format_message + "Выберите срок действия ключа:",
-            reply_markup=Keyboards.subscription_periods(),
-            parse_mode="HTML"
+    await message.answer(
+        format_message + "Выберите срок действия ключа:",
+        reply_markup=Keyboards.subscription_periods(),
+        parse_mode="HTML"
     )
 
 
@@ -635,6 +539,10 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
             price=period_price
         )
 
+        # Формируем ссылку подписки
+        client_uuid = client_data['client_id']
+        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
         # Генерируем QR код для ссылки с ДОМЕНОМ (для пользователя)
         try:
             qr_code = generate_qr_code(vless_link_for_user)
@@ -656,6 +564,8 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
             # Отправляем текстовый ключ с ДОМЕНОМ
             await callback.message.answer(
                 f"📋 VLESS ключ:\n\n`{vless_link_for_user}`\n\n"
+                f"🔄 Ссылка подписки (автообновление):\n`{subscription_url}`\n\n"
+                f"💡 Подписка автоматически обновит ключ при изменениях на сервере.\n"
                 f"Скопируйте и отправьте клиенту.",
                 parse_mode="Markdown"
             )
@@ -673,6 +583,7 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                 f"💰 Стоимость: {period_price} ₽\n"
                 f"🌐 Лимит IP: 2\n\n"
                 f"📋 VLESS ключ:\n`{vless_link_for_user}`\n\n"
+                f"🔄 Ссылка подписки:\n`{subscription_url}`\n\n"
                 f"Скопируйте и отправьте клиенту.",
                 parse_mode="Markdown"
             )

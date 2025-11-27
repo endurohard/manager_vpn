@@ -34,6 +34,7 @@ class Keyboards:
     def admin_menu():
         """Меню администратора"""
         buttons = [
+            [KeyboardButton(text="🔑 Создать ключ (выбор inbound)")],
             [KeyboardButton(text="Добавить менеджера")],
             [KeyboardButton(text="Список менеджеров")],
             [KeyboardButton(text="Общая статистика")],

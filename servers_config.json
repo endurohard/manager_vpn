@@ -1,0 +1,48 @@
+{
+  "servers": [
+    {
+      "name": "ZoVGoR",
+      "domain": "raphaelvpn.ru",
+      "ip": "185.128.104.219",
+      "port": 443,
+      "enabled": true,
+      "local": true,
+      "description": "Основной сервер",
+      "inbounds": {
+        "main": {
+          "security": "reality",
+          "sni": "sun6-21.userapi.com",
+          "pbk": "Y8_zzWnZuBehpWXbyN6ZkPw9DUUwqoAkaBFuaTUW7gw",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "📶 LTE - Все операторы"
+        }
+      }
+    },
+    {
+      "name": "VpnPulse",
+      "domain": "app.vpnpulse.ru",
+      "ip": "85.239.151.89",
+      "port": 443,
+      "enabled": true,
+      "local": false,
+      "description": "Резервный сервер",
+      "ssh": {
+        "user": "root",
+        "password": "7Fs7NX1eHb4w"
+      },
+      "inbounds": {
+        "main": {
+          "security": "reality",
+          "sni": "yandex.ru",
+          "pbk": "z_b2JzFsH3bPOmbRRybh6Yw0vaaZdG8SqGqud1cIcH0",
+          "sid": "0d899b231d",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "🇳🇱 Резервный"
+        }
+      }
+    }
+  ]
+}
