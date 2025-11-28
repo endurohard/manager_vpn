@@ -17,6 +17,33 @@
           "flow": "xtls-rprx-vision",
           "fp": "chrome",
           "name_prefix": "📶 LTE - Все операторы"
+        },
+        "megafon3": {
+          "security": "reality",
+          "sni": "appldnld.apple.com",
+          "pbk": "K-bMKKspPy47oFqs81DR6NftQq_H1Sa2s6VzhMWiOTA",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "🍎 Megafon 3"
+        },
+        "megafon4": {
+          "security": "reality",
+          "sni": "yandex.com.tr",
+          "pbk": "4gKuvX-wKOXNIZmTtKhqA4TRlJwkfu_GasIr3JRTDBk",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "🇹🇷 Megafon 4"
+        },
+        "megafon5": {
+          "security": "reality",
+          "sni": "yandex.fi",
+          "pbk": "rGMC2j5fdWn2LkPPwRxWopdoc9faFycvewDw7QazA3M",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "🇫🇮 Megafon 5"
         }
       }
     },
@@ -35,12 +62,30 @@
       "inbounds": {
         "main": {
           "security": "reality",
-          "sni": "yandex.ru",
+          "sni": "m.vk.com",
           "pbk": "z_b2JzFsH3bPOmbRRybh6Yw0vaaZdG8SqGqud1cIcH0",
           "sid": "0d899b231d",
           "flow": "xtls-rprx-vision",
           "fp": "chrome",
           "name_prefix": "🇳🇱 Резервный"
+        },
+        "megafon": {
+          "security": "reality",
+          "sni": "yandex.ru",
+          "pbk": "4ZScXltZg-6xW_Shhx0AMqSrBMbEXXMwEjoC8GJ8tTY",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "📶 LTE-Megafon"
+        },
+        "megafon2": {
+          "security": "reality",
+          "sni": "www.cloudflare.com",
+          "pbk": "YnYd6vc2Pi7JDe8CfpnY03qXH2p4dckV8wAoQXhe6yE",
+          "sid": "0e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "📶 Megafon 2"
         }
       }
     }

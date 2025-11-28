@@ -45,6 +45,7 @@ class Keyboards:
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
+            [KeyboardButton(text="🖥 Статус серверов")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(

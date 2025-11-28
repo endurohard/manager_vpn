@@ -681,54 +681,287 @@ async def subscription_handler(request):
     if not client_keys:
         return web.Response(text="Client not found", status=404)
 
-    # Получаем email клиента для именования
+    # Получаем email клиента для именования и данные о подписке
     client_email = client_keys[0]['client'].get('email', 'client') if client_keys else 'client'
 
+    # Получаем данные клиента из базы данных (срок, трафик)
+    upload_bytes = 0
+    download_bytes = 0
+    total_bytes = 0
+    expire_timestamp = 0
+    try:
+        import sqlite3
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT up, down, total, expiry_time FROM client_traffics WHERE email = ?", (client_email,))
+        row = cursor.fetchone()
+        if row:
+            upload_bytes = row[0] or 0
+            download_bytes = row[1] or 0
+            total_bytes = row[2] or 0  # 0 = безлимит
+            expire_time = row[3] or 0
+            if expire_time:
+                # Конвертируем из миллисекунд в секунды для заголовка
+                expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error getting client data from DB: {e}")
+
     # Генерируем ссылки для локального сервера
+    # Исключаем inbounds которые определены в servers_config (они будут добавлены отдельно)
+    servers_config_inbound_tags = set()
+    servers_config = load_servers_config()
+    local_server = next((s for s in servers_config.get('servers', []) if s.get('local')), None)
+    if local_server:
+        for inbound_name in local_server.get('inbounds', {}).keys():
+            if inbound_name != 'main':
+                # Эти inbounds будут добавлены через generate_vless_link_for_server
+                servers_config_inbound_tags.add(f"inbound-8452")  # megafon3 на порту 8452
+                servers_config_inbound_tags.add(f"inbound-8453")  # megafon4 на порту 8453
+                servers_config_inbound_tags.add(f"inbound-8454")  # megafon5 на порту 8454
+
     links = []
     for item in client_keys:
+        # Пропускаем inbounds которые обрабатываются через servers_config
+        tag = item['inbound'].get('tag', '')
+        if tag in servers_config_inbound_tags:
+            continue
         link = generate_vless_link(item['client'], item['inbound'])
         links.append(link)
 
-    # Загружаем конфиг внешних серверов и добавляем их ключи
+    # Загружаем конфиг серверов
     servers_config = load_servers_config()
+
+    # Обрабатываем ВСЕ серверы включая локальный для дополнительных inbounds
     for server in servers_config.get('servers', []):
         if not server.get('enabled', True):
             continue
-        if server.get('local', False):
-            continue  # Пропускаем локальный сервер - уже обработан
 
-        # Генерируем ключи для каждого inbound внешнего сервера
-        for inbound_name in server.get('inbounds', {}).keys():
-            link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
-            if link:
-                links.append(link)
+        if server.get('local', False):
+            # Для локального сервера - генерируем ключи только для НЕ-main inbounds
+            # (main уже обработан через generate_vless_link выше)
+            for inbound_name, inbound_config in server.get('inbounds', {}).items():
+                if inbound_name == 'main':
+                    continue  # main уже добавлен
+                link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
+                if link:
+                    links.append(link)
+        else:
+            # Для внешних серверов - генерируем ключи для всех inbounds
+            for inbound_name in server.get('inbounds', {}).keys():
+                link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
+                if link:
+                    links.append(link)
 
     # Кодируем в base64 (стандартный формат подписки)
     import base64
 
-    # Название подписки
-    profile_name = "ZoVGoR"
+    # Название подписки с именем клиента
+    profile_name = f"ZoVGoR - {client_email}"
     profile_name_b64 = base64.b64encode(profile_name.encode()).decode()
 
     subscription_content = '\n'.join(links)
     encoded = base64.b64encode(subscription_content.encode()).decode()
 
     # Возвращаем с правильными заголовками для VPN клиентов
+    # Announce с поддержкой для v2RayTun
+    import base64
+    announce_text = "Тех. поддержка: @bagamedovit"
+    announce_b64 = "base64:" + base64.b64encode(announce_text.encode()).decode()
+
+    # URL иконки
+    icon_url = 'https://zov-gor.ru/static/logo.png'
+
     return web.Response(
         text=encoded,
         content_type='text/plain',
         headers={
             'Content-Disposition': f'attachment; filename="{profile_name}.txt"',
-            'Profile-Title': profile_name_b64,
-            'Profile-Update-Interval': '12',  # Обновление каждые 12 часов
-            'Subscription-Userinfo': f'upload=0; download=0; total=0; expire=0',
+            'Profile-Title': f'base64:{profile_name_b64}',
+            'Profile-Update-Interval': '12',
+            'Subscription-Userinfo': f'upload={upload_bytes}; download={download_bytes}; total={total_bytes}; expire={expire_timestamp}',
+            # v2RayTun specific
+            'Announce': announce_b64,
+            'Announce-URL': 'https://t.me/bagamedovit',
+            # Icon in different formats (try all)
+            'Icon': icon_url,
+            'Icon-URL': icon_url,
+            'Profile-Icon': icon_url,
+            'Profile-Icon-URL': icon_url,
+            # Other clients
             'Support-URL': 'https://t.me/bagamedovit',
             'Profile-Web-Page-URL': 'https://zov-gor.ru/static/profile.html',
-            'Homepage': 'https://zov-gor.ru',
-            'Profile-Icon': 'https://zov-gor.ru/static/logo.png'
+            'Homepage': 'https://zov-gor.ru'
         }
     )
+
+
+async def subscription_deeplink_handler(request):
+    """Deep link для открытия подписки в v2RayTun"""
+    client_id = request.match_info.get('client_id', '')
+
+    if not client_id:
+        return web.Response(text="Client ID required", status=400)
+
+    import re
+    uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+    if not uuid_pattern.match(client_id):
+        return web.Response(text="Invalid client ID format", status=400)
+
+    # Формируем ссылку на подписку
+    import urllib.parse
+    sub_url = f"https://zov-gor.ru/sub/{client_id}"
+    encoded_url = urllib.parse.quote(sub_url, safe='')
+
+    # Deep link для v2RayTun
+    v2raytun_link = f"v2raytun://import/{sub_url}"
+
+    # HTML страница с автоматическим редиректом и кнопками для разных клиентов
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZoVGoR VPN - Подключение</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: white;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }}
+        .container {{
+            max-width: 400px;
+            text-align: center;
+        }}
+        .logo {{
+            width: 100px;
+            height: 100px;
+            margin-bottom: 20px;
+        }}
+        h1 {{
+            margin: 0 0 10px 0;
+            font-size: 28px;
+        }}
+        .subtitle {{
+            color: #888;
+            margin-bottom: 30px;
+        }}
+        .btn {{
+            display: block;
+            width: 100%;
+            padding: 16px 24px;
+            margin: 10px 0;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            text-decoration: none;
+            cursor: pointer;
+            transition: transform 0.2s, opacity 0.2s;
+        }}
+        .btn:active {{
+            transform: scale(0.98);
+        }}
+        .btn-primary {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .btn-secondary {{
+            background: rgba(255,255,255,0.1);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.2);
+        }}
+        .copy-link {{
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 20px;
+            word-break: break-all;
+            font-size: 12px;
+            color: #888;
+        }}
+        .copy-btn {{
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            margin-top: 10px;
+            cursor: pointer;
+        }}
+        .status {{
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 8px;
+            display: none;
+        }}
+        .status.success {{
+            background: rgba(76, 175, 80, 0.2);
+            color: #4CAF50;
+            display: block;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="/static/logo.png" alt="ZoVGoR" class="logo">
+        <h1>ZoVGoR VPN</h1>
+        <p class="subtitle">Выберите приложение для подключения</p>
+
+        <a href="{v2raytun_link}" class="btn btn-primary" id="v2raytun-btn">
+            📱 Открыть в v2RayTun
+        </a>
+
+        <a href="streisand://import/{sub_url}" class="btn btn-secondary">
+            🎭 Открыть в Streisand
+        </a>
+
+        <a href="v2rayng://install-sub?url={encoded_url}" class="btn btn-secondary">
+            🤖 Открыть в v2rayNG (Android)
+        </a>
+
+        <a href="clash://install-config?url={encoded_url}" class="btn btn-secondary">
+            ⚡ Открыть в Clash
+        </a>
+
+        <div class="copy-link">
+            <div>Ссылка на подписку:</div>
+            <code id="sub-url">{sub_url}</code>
+            <br>
+            <button class="copy-btn" onclick="copyLink()">📋 Скопировать</button>
+        </div>
+
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        function copyLink() {{
+            const url = document.getElementById('sub-url').textContent;
+            navigator.clipboard.writeText(url).then(() => {{
+                const status = document.getElementById('status');
+                status.textContent = '✅ Ссылка скопирована!';
+                status.className = 'status success';
+                setTimeout(() => {{ status.className = 'status'; }}, 3000);
+            }});
+        }}
+
+        // Автоматически пытаемся открыть v2RayTun через 1 секунду
+        setTimeout(() => {{
+            window.location.href = '{v2raytun_link}';
+        }}, 1000);
+    </script>
+</body>
+</html>'''
+
+    return web.Response(text=html, content_type='text/html')
 
 
 async def subscription_json_handler(request):
@@ -812,6 +1045,8 @@ async def create_webapp():
     # Subscription endpoints
     app.router.add_get('/sub/{client_id}', subscription_handler)
     app.router.add_get('/sub/{client_id}/json', subscription_json_handler)
+    app.router.add_get('/sub/{client_id}/open', subscription_deeplink_handler)
+    app.router.add_get('/open/{client_id}', subscription_deeplink_handler)
 
     # Статические файлы
     app.router.add_static('/static', STATIC_DIR, name='static')

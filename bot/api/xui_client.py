@@ -584,20 +584,45 @@ class XUIClient:
 
     async def restart_xray(self) -> bool:
         """
-        Перезапустить xray для применения изменений конфига
+        Перезапустить xray для применения изменений конфига.
+        Использует системный рестарт x-ui для гарантированного обновления конфига.
         """
         try:
-            if not await self._ensure_logged_in():
-                logger.error("Не удалось авторизоваться для рестарта xray")
+            import subprocess
+
+            # Системный рестарт x-ui - гарантирует обновление config.json
+            result = subprocess.run(
+                ['systemctl', 'restart', 'x-ui'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                logger.info("X-UI успешно перезапущен через systemctl")
+                # Даём время на запуск xray и генерацию конфига
+                await asyncio.sleep(2)
+                return True
+            else:
+                logger.error(f"Ошибка systemctl restart x-ui: {result.stderr}")
+
+                # Fallback на API если systemctl не сработал
+                if not await self._ensure_logged_in():
+                    logger.error("Не удалось авторизоваться для рестарта xray через API")
+                    return False
+
+                url = f"{self.host}/panel/api/inbounds/restartPanel"
+                async with self.session.post(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('success'):
+                            logger.info("Xray перезапущен через API (fallback)")
+                            await asyncio.sleep(2)
+                            return True
                 return False
 
-            url = f"{self.host}/panel/api/inbounds/restartPanel"
-            async with self.session.post(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('success'):
-                        logger.info("Xray успешно перезапущен")
-                        return True
+        except subprocess.TimeoutExpired:
+            logger.error("Таймаут при перезапуске x-ui")
             return False
         except Exception as e:
             logger.error(f"Ошибка при рестарте xray: {e}")

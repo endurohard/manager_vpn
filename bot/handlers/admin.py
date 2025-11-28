@@ -2377,3 +2377,243 @@ async def process_reject_reason(message: Message, state: FSMContext):
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_msg_id, reply_markup=None)
     except:
         pass
+
+
+# ===== СТАТУС СЕРВЕРОВ =====
+
+@router.message(F.text == "🖥 Статус серверов")
+@admin_only
+async def check_servers_status(message: Message, **kwargs):
+    """Проверка доступности всех VPN серверов"""
+    import json
+    import asyncio
+    from pathlib import Path
+
+    await message.answer("⏳ Проверяю доступность серверов...")
+
+    # Загружаем конфигурацию серверов
+    config_path = Path('/root/manager_vpn/servers_config.json')
+    if not config_path.exists():
+        await message.answer(
+            "❌ Файл конфигурации серверов не найден.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    servers = config.get('servers', [])
+    if not servers:
+        await message.answer(
+            "❌ Серверы не настроены.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
+    results = []
+
+    for server in servers:
+        server_name = server.get('name', 'Unknown')
+        server_ip = server.get('ip', '')
+        server_domain = server.get('domain', '')
+        is_local = server.get('local', False)
+        is_enabled = server.get('enabled', True)
+
+        if not is_enabled:
+            results.append({
+                'name': server_name,
+                'status': 'disabled',
+                'details': 'Сервер отключен в конфиге'
+            })
+            continue
+
+        server_result = {
+            'name': server_name,
+            'ip': server_ip,
+            'domain': server_domain,
+            'local': is_local,
+            'checks': {}
+        }
+
+        if is_local:
+            # Проверка локального сервера
+            try:
+                # Проверяем X-UI
+                proc = await asyncio.create_subprocess_shell(
+                    "systemctl is-active x-ui",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                xui_status = stdout.decode().strip() == 'active'
+                server_result['checks']['x-ui'] = xui_status
+
+                # Проверяем xray процесс
+                proc = await asyncio.create_subprocess_shell(
+                    "pgrep -f 'xray' > /dev/null && echo 'ok'",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                xray_status = 'ok' in stdout.decode()
+                server_result['checks']['xray'] = xray_status
+
+                # Проверяем порт 443
+                proc = await asyncio.create_subprocess_shell(
+                    "ss -tlnp | grep ':443 ' > /dev/null && echo 'ok'",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                port_status = 'ok' in stdout.decode()
+                server_result['checks']['port_443'] = port_status
+
+                # Считаем клиентов
+                proc = await asyncio.create_subprocess_shell(
+                    "sqlite3 /etc/x-ui/x-ui.db \"SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND expiry_time > strftime('%s','now')*1000;\"",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                try:
+                    clients_count = int(stdout.decode().strip())
+                except:
+                    clients_count = 0
+                server_result['clients'] = clients_count
+
+                server_result['status'] = 'ok' if all(server_result['checks'].values()) else 'warning'
+
+            except asyncio.TimeoutError:
+                server_result['status'] = 'error'
+                server_result['details'] = 'Таймаут при проверке'
+            except Exception as e:
+                server_result['status'] = 'error'
+                server_result['details'] = str(e)
+
+        else:
+            # Проверка удалённого сервера через SSH
+            ssh_config = server.get('ssh', {})
+            ssh_user = ssh_config.get('user', 'root')
+            ssh_password = ssh_config.get('password', '')
+
+            if not ssh_password:
+                server_result['status'] = 'error'
+                server_result['details'] = 'Нет SSH пароля в конфиге'
+                results.append(server_result)
+                continue
+
+            try:
+                # Проверяем доступность по SSH и статус x-ui
+                cmd = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} 'systemctl is-active x-ui && pgrep -c xray && ss -tlnp | grep -c \":443 \"'"
+
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+
+                output_lines = stdout.decode().strip().split('\n')
+
+                if len(output_lines) >= 1:
+                    xui_status = output_lines[0] == 'active'
+                    server_result['checks']['x-ui'] = xui_status
+
+                    if len(output_lines) >= 2:
+                        try:
+                            xray_count = int(output_lines[1])
+                            server_result['checks']['xray'] = xray_count > 0
+                        except:
+                            server_result['checks']['xray'] = False
+
+                    if len(output_lines) >= 3:
+                        try:
+                            port_count = int(output_lines[2])
+                            server_result['checks']['port_443'] = port_count > 0
+                        except:
+                            server_result['checks']['port_443'] = False
+
+                    server_result['status'] = 'ok' if all(server_result['checks'].values()) else 'warning'
+                else:
+                    server_result['status'] = 'error'
+                    server_result['details'] = 'Некорректный ответ сервера'
+
+                # Получаем количество клиентов
+                cmd_clients = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} \"sqlite3 /etc/x-ui/x-ui.db \\\"SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND expiry_time > strftime('%s','now')*1000;\\\"\""
+
+                proc = await asyncio.create_subprocess_shell(
+                    cmd_clients,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                try:
+                    server_result['clients'] = int(stdout.decode().strip())
+                except:
+                    server_result['clients'] = 0
+
+            except asyncio.TimeoutError:
+                server_result['status'] = 'error'
+                server_result['details'] = 'Таймаут подключения SSH'
+            except Exception as e:
+                server_result['status'] = 'error'
+                server_result['details'] = str(e)
+
+        results.append(server_result)
+
+    # Формируем ответ
+    text = "🖥 <b>СТАТУС VPN СЕРВЕРОВ</b>\n\n"
+
+    for r in results:
+        if r.get('status') == 'disabled':
+            text += f"⚫ <b>{r['name']}</b>\n"
+            text += f"   └ {r.get('details', 'Отключен')}\n\n"
+            continue
+
+        status_emoji = {
+            'ok': '🟢',
+            'warning': '🟡',
+            'error': '🔴'
+        }.get(r.get('status'), '⚪')
+
+        text += f"{status_emoji} <b>{r['name']}</b>"
+        if r.get('local'):
+            text += " (локальный)"
+        text += "\n"
+
+        if r.get('ip'):
+            text += f"   📍 IP: <code>{r['ip']}</code>\n"
+        if r.get('domain'):
+            text += f"   🌐 Домен: <code>{r['domain']}</code>\n"
+
+        checks = r.get('checks', {})
+        if checks:
+            text += "   📊 Службы:\n"
+            for check_name, check_status in checks.items():
+                check_emoji = '✅' if check_status else '❌'
+                check_display = {
+                    'x-ui': 'X-UI панель',
+                    'xray': 'Xray процесс',
+                    'port_443': 'Порт 443'
+                }.get(check_name, check_name)
+                text += f"      {check_emoji} {check_display}\n"
+
+        if 'clients' in r:
+            text += f"   👥 Активных клиентов: {r['clients']}\n"
+
+        if r.get('details'):
+            text += f"   ⚠️ {r['details']}\n"
+
+        text += "\n"
+
+    # Добавляем время проверки
+    from datetime import datetime
+    text += f"━━━━━━━━━━━━━━━━\n"
+    text += f"🕐 Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=Keyboards.admin_menu()
+    )

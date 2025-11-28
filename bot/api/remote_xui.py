@@ -58,7 +58,7 @@ async def create_client_on_remote_server(
     # Вычисляем время истечения в миллисекундах
     expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
-    # Python скрипт для добавления клиента
+    # Python скрипт для добавления клиента во все inbound'ы
     sql_script = f"""
 import json
 import sqlite3
@@ -66,36 +66,51 @@ import sqlite3
 conn = sqlite3.connect('/etc/x-ui/x-ui.db')
 cursor = conn.cursor()
 
-cursor.execute("SELECT settings FROM inbounds WHERE id=1")
-row = cursor.fetchone()
-if row:
-    settings = json.loads(row[0])
-    clients = settings.get('clients', [])
+# Получаем все inbound'ы
+cursor.execute("SELECT id, settings FROM inbounds")
+rows = cursor.fetchall()
 
-    existing = [c for c in clients if c.get('id') == '{client_uuid}']
-    if not existing:
-        new_client = {{
-            "id": "{client_uuid}",
-            "alterId": 0,
-            "email": "{email}",
-            "limitIp": {ip_limit},
-            "totalGB": 0,
-            "expiryTime": {expire_time},
-            "enable": True,
-            "tgId": "",
-            "subId": "",
-            "flow": "xtls-rprx-vision"
-        }}
-        clients.append(new_client)
-        settings['clients'] = clients
-        cursor.execute("UPDATE inbounds SET settings=? WHERE id=1", (json.dumps(settings),))
-        conn.commit()
-        print("OK")
-    else:
-        print("EXISTS")
+added_count = 0
+exists_count = 0
+
+for inbound_id, settings_str in rows:
+    try:
+        settings = json.loads(settings_str)
+        clients = settings.get('clients', [])
+
+        # Проверяем, существует ли клиент
+        existing = [c for c in clients if c.get('id') == '{client_uuid}']
+        if not existing:
+            new_client = {{
+                "id": "{client_uuid}",
+                "alterId": 0,
+                "email": "{email}",
+                "limitIp": {ip_limit},
+                "totalGB": 0,
+                "expiryTime": {expire_time},
+                "enable": True,
+                "tgId": "",
+                "subId": "",
+                "flow": "xtls-rprx-vision"
+            }}
+            clients.append(new_client)
+            settings['clients'] = clients
+            cursor.execute("UPDATE inbounds SET settings=? WHERE id=?", (json.dumps(settings), inbound_id))
+            added_count += 1
+        else:
+            exists_count += 1
+    except Exception as e:
+        pass
+
+conn.commit()
+conn.close()
+
+if added_count > 0:
+    print(f"OK:{{added_count}}")
+elif exists_count > 0:
+    print("EXISTS")
 else:
     print("ERROR")
-conn.close()
 """
 
     try:
@@ -115,8 +130,10 @@ conn.close()
 
         result = stdout.decode().strip()
 
-        if result == "OK":
-            logger.info(f"Клиент {email} создан на сервере {server_config.get('name')}")
+        if result.startswith("OK"):
+            # OK:N где N - количество inbound'ов куда добавлен клиент
+            count = result.split(":")[1] if ":" in result else "1"
+            logger.info(f"Клиент {email} создан на сервере {server_config.get('name')} в {count} inbound(ах)")
             # Перезапускаем x-ui на удалённом сервере
             await restart_remote_xui(server_config)
             return True
@@ -209,20 +226,27 @@ import sqlite3
 conn = sqlite3.connect('/etc/x-ui/x-ui.db')
 cursor = conn.cursor()
 
-cursor.execute("SELECT settings FROM inbounds WHERE id=1")
-row = cursor.fetchone()
-if row:
-    settings = json.loads(row[0])
-    clients = settings.get('clients', [])
-    clients = [c for c in clients if c.get('id') != '{client_uuid}']
-    settings['clients'] = clients
-    cursor.execute("UPDATE inbounds SET settings=? WHERE id=1", (json.dumps(settings),))
-    conn.commit()
-    print("OK")
-else:
-    print("ERROR")
+# Удаляем клиента из всех inbound'ов
+cursor.execute("SELECT id, settings FROM inbounds")
+rows = cursor.fetchall()
 
+deleted_count = 0
+for inbound_id, settings_str in rows:
+    try:
+        settings = json.loads(settings_str)
+        clients = settings.get('clients', [])
+        original_len = len(clients)
+        clients = [c for c in clients if c.get('id') != '{client_uuid}']
+        if len(clients) < original_len:
+            settings['clients'] = clients
+            cursor.execute("UPDATE inbounds SET settings=? WHERE id=?", (json.dumps(settings), inbound_id))
+            deleted_count += 1
+    except:
+        pass
+
+conn.commit()
 conn.close()
+print("OK" if deleted_count > 0 else "NOT_FOUND")
 '''
 
     try:
