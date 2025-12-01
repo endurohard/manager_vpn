@@ -53,6 +53,24 @@ class DatabaseManager:
             except:
                 pass  # Колонка уже существует
 
+            # Таблица внешних серверов X-UI
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS external_servers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    base_path TEXT DEFAULT '',
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    inbound_id INTEGER NOT NULL,
+                    domain TEXT,
+                    server_port INTEGER DEFAULT 443,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             await db.commit()
 
     async def add_manager(self, user_id: int, username: str, full_name: str, added_by: int) -> bool:
@@ -594,3 +612,103 @@ class DatabaseManager:
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    # ========== Методы для внешних серверов ==========
+
+    async def add_external_server(
+        self, name: str, host: str, port: int, base_path: str,
+        username: str, password: str, inbound_id: int,
+        domain: str = None, server_port: int = 443
+    ) -> Optional[int]:
+        """Добавить внешний сервер"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    '''INSERT INTO external_servers
+                       (name, host, port, base_path, username, password, inbound_id, domain, server_port)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (name, host, port, base_path, username, password, inbound_id, domain, server_port)
+                )
+                await db.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            print(f"Error adding external server: {e}")
+            return None
+
+    async def get_external_servers(self, active_only: bool = True) -> List[Dict]:
+        """Получить список внешних серверов"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if active_only:
+                cursor = await db.execute(
+                    'SELECT * FROM external_servers WHERE is_active = 1 ORDER BY name'
+                )
+            else:
+                cursor = await db.execute(
+                    'SELECT * FROM external_servers ORDER BY name'
+                )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_external_server(self, server_id: int) -> Optional[Dict]:
+        """Получить информацию о внешнем сервере"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT * FROM external_servers WHERE id = ?',
+                (server_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def update_external_server(self, server_id: int, **kwargs) -> bool:
+        """Обновить данные внешнего сервера"""
+        try:
+            allowed_fields = ['name', 'host', 'port', 'base_path', 'username', 'password',
+                             'inbound_id', 'domain', 'server_port', 'is_active']
+            updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+
+            if not updates:
+                return False
+
+            set_clause = ', '.join([f'{k} = ?' for k in updates.keys()])
+            values = list(updates.values()) + [server_id]
+
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f'UPDATE external_servers SET {set_clause} WHERE id = ?',
+                    values
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error updating external server: {e}")
+            return False
+
+    async def delete_external_server(self, server_id: int) -> bool:
+        """Удалить внешний сервер"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'DELETE FROM external_servers WHERE id = ?',
+                    (server_id,)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error deleting external server: {e}")
+            return False
+
+    async def toggle_external_server(self, server_id: int) -> bool:
+        """Переключить активность внешнего сервера"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'UPDATE external_servers SET is_active = NOT is_active WHERE id = ?',
+                    (server_id,)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error toggling external server: {e}")
+            return False

@@ -87,6 +87,23 @@ class AdminCreateKeyStates(StatesGroup):
     confirming = State()
 
 
+class ExternalKeyStates(StatesGroup):
+    """Состояния для создания ключа на внешнем сервере"""
+    waiting_for_inbound = State()
+    waiting_for_period = State()
+    waiting_for_phone = State()
+    confirming = State()
+
+
+class AddExternalServerStates(StatesGroup):
+    """Состояния для добавления внешнего сервера"""
+    waiting_for_name = State()
+    waiting_for_url = State()
+    waiting_for_credentials = State()
+    waiting_for_inbound_id = State()
+    waiting_for_domain = State()
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -1389,6 +1406,29 @@ async def process_notification_message(message: Message, state: FSMContext, db: 
     await state.clear()
 
 
+# ===== УПРАВЛЕНИЕ ВНЕШНИМИ СЕРВЕРАМИ (кнопка меню) =====
+
+@router.message(F.text == "🖥 Внешние серверы")
+@admin_only
+async def show_external_servers_menu(message: Message, db: DatabaseManager, state: FSMContext, **kwargs):
+    """Показать меню внешних серверов из кнопки меню"""
+    await state.clear()
+    servers = await db.get_external_servers(active_only=False)
+
+    text = "🌐 <b>Внешние серверы</b>\n\n"
+    if servers:
+        text += f"Найдено серверов: {len(servers)}\n"
+        text += "Выберите сервер для управления:"
+    else:
+        text += "Серверов пока нет.\nНажмите «➕ Добавить сервер» для добавления."
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=Keyboards.external_servers_list(servers)
+    )
+
+
 # ===== УПРАВЛЕНИЕ SNI АДРЕСАМИ =====
 
 @router.message(F.text == "🌐 Управление SNI")
@@ -2377,3 +2417,786 @@ async def process_reject_reason(message: Message, state: FSMContext):
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_msg_id, reply_markup=None)
     except:
         pass
+
+
+
+# ===== СОЗДАНИЕ КЛЮЧЕЙ НА ВНЕШНЕМ СЕРВЕРЕ =====
+
+@router.message(F.text == "🌍 Создать ключ (внешний сервер)")
+@admin_only
+async def start_external_key_creation(message: Message, state: FSMContext, **kwargs):
+    """Начало создания ключа на внешнем сервере"""
+    from bot.api.external_xui import get_external_xui_client, EXTERNAL_SERVER_CONFIG
+
+    await message.answer("⏳ Подключение к внешнему серверу...")
+
+    try:
+        client = get_external_xui_client()
+        async with client:
+            inbounds = await client.list_inbounds()
+
+            if not inbounds:
+                await message.answer(
+                    "❌ Не удалось получить список inbound-ов с внешнего сервера.\n"
+                    "Проверьте настройки подключения.",
+                    reply_markup=Keyboards.admin_menu()
+                )
+                return
+
+            # Сохраняем список inbound-ов для последующего использования
+            await state.update_data(external_inbounds=inbounds)
+            await state.set_state(ExternalKeyStates.waiting_for_inbound)
+
+            text = f"🌍 <b>ВНЕШНИЙ СЕРВЕР</b>\n\n"
+            text += f"📡 Сервер: <code>{EXTERNAL_SERVER_CONFIG['server_address']}</code>\n"
+            text += f"📋 Найдено inbound-ов: {len(inbounds)}\n\n"
+            text += "Выберите inbound для создания ключа:"
+
+            await message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=Keyboards.external_inbound_list(inbounds)
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка подключения к внешнему серверу: {e}")
+        await message.answer(
+            f"❌ Ошибка подключения к внешнему серверу:\n{str(e)}",
+            reply_markup=Keyboards.admin_menu()
+        )
+
+
+@router.callback_query(F.data == "ext_cancel")
+async def cancel_external_key(callback: CallbackQuery, state: FSMContext):
+    """Отмена создания ключа на внешнем сервере"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data.startswith("ext_inbound_"), ExternalKeyStates.waiting_for_inbound)
+async def select_external_inbound(callback: CallbackQuery, state: FSMContext):
+    """Выбор inbound на внешнем сервере"""
+    inbound_id = int(callback.data.replace("ext_inbound_", ""))
+
+    # Получаем данные о выбранном inbound
+    data = await state.get_data()
+    inbounds = data.get('external_inbounds', [])
+    selected_inbound = next((i for i in inbounds if i.get('id') == inbound_id), None)
+
+    if not selected_inbound:
+        await callback.answer("Inbound не найден")
+        return
+
+    await state.update_data(
+        selected_inbound_id=inbound_id,
+        selected_inbound_name=selected_inbound.get('remark', f'Inbound {inbound_id}')
+    )
+    await state.set_state(ExternalKeyStates.waiting_for_period)
+
+    await callback.message.edit_text(
+        f"🌍 <b>ВНЕШНИЙ СЕРВЕР</b>\n\n"
+        f"📍 Выбран inbound: <b>{selected_inbound.get('remark', f'Inbound {inbound_id}')}</b>\n\n"
+        f"Выберите срок подписки:",
+        parse_mode="HTML",
+        reply_markup=Keyboards.external_subscription_periods()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ext_period_"), ExternalKeyStates.waiting_for_period)
+async def select_external_period(callback: CallbackQuery, state: FSMContext):
+    """Выбор периода подписки для внешнего сервера"""
+    period_key = callback.data.replace("ext_period_", "")
+    periods = get_subscription_periods()
+
+    if period_key not in periods:
+        await callback.answer("Неверный период")
+        return
+
+    period_info = periods[period_key]
+
+    await state.update_data(
+        selected_period=period_key,
+        selected_period_name=period_info['name'],
+        selected_period_days=period_info['days'],
+        selected_period_price=period_info['price']
+    )
+    await state.set_state(ExternalKeyStates.waiting_for_phone)
+
+    data = await state.get_data()
+
+    await callback.message.edit_text(
+        f"🌍 <b>ВНЕШНИЙ СЕРВЕР</b>\n\n"
+        f"📍 Inbound: <b>{data.get('selected_inbound_name')}</b>\n"
+        f"📅 Период: <b>{period_info['name']}</b> ({period_info['days']} дней)\n"
+        f"💰 Цена: <b>{period_info['price']} ₽</b>\n\n"
+        f"Теперь введите номер телефона или ID клиента:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(ExternalKeyStates.waiting_for_phone)
+async def process_external_phone(message: Message, state: FSMContext):
+    """Обработка номера телефона для внешнего сервера"""
+    phone = message.text.strip()
+
+    if phone == "Отмена":
+        await state.clear()
+        await message.answer("Создание ключа отменено.", reply_markup=Keyboards.admin_menu())
+        return
+
+    # Генерация ID если нужно
+    if phone == "Сгенерировать ID":
+        phone = generate_user_id()
+
+    # Простая валидация
+    if len(phone) < 3:
+        await message.answer("❌ Слишком короткий ID. Введите минимум 3 символа.")
+        return
+
+    await state.update_data(client_phone=phone)
+    await state.set_state(ExternalKeyStates.confirming)
+
+    data = await state.get_data()
+
+    # Генерируем email для клиента
+    import re
+    clean_phone = re.sub(r'[^\w\d]', '', phone)
+    client_email = f"ext_{clean_phone}_{data.get('selected_period_days')}d"
+    await state.update_data(client_email=client_email)
+
+    text = f"🌍 <b>ПОДТВЕРЖДЕНИЕ СОЗДАНИЯ КЛЮЧА</b>\n\n"
+    text += f"📡 Сервер: <b>Внешний</b>\n"
+    text += f"📍 Inbound: <b>{data.get('selected_inbound_name')}</b>\n"
+    text += f"📅 Период: <b>{data.get('selected_period_name')}</b> ({data.get('selected_period_days')} дней)\n"
+    text += f"💰 Цена: <b>{data.get('selected_period_price')} ₽</b>\n"
+    text += f"📱 Клиент: <b>{phone}</b>\n"
+    text += f"📧 Email: <code>{client_email}</code>\n\n"
+    text += "Подтвердите создание ключа:"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Создать", callback_data="ext_confirm_create"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")
+        ]
+    ])
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "ext_confirm_create", ExternalKeyStates.confirming)
+async def confirm_external_key_creation(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Подтверждение и создание ключа на внешнем сервере"""
+    from bot.api.external_xui import ExternalXUIClient, get_external_xui_client, EXTERNAL_SERVER_CONFIG
+
+    data = await state.get_data()
+    period_days = data.get('selected_period_days')
+    client_email = data.get('client_email')
+    client_phone = data.get('client_phone')
+    period_name = data.get('selected_period_name')
+    price = data.get('selected_period_price')
+
+    # Проверяем, используется ли внешний сервер из БД или старый конфиг
+    ext_server_id = data.get('ext_server_id')
+    if ext_server_id:
+        # Используем данные из БД
+        inbound_id = data.get('ext_inbound_id')
+        server_name = data.get('ext_server_name')
+        server_address = data.get('ext_domain') or data.get('ext_host')
+        server_port = data.get('ext_server_port', 443)
+        client = ExternalXUIClient(
+            host=f"https://{data.get('ext_host')}:{data.get('ext_port')}",
+            username=data.get('ext_username'),
+            password=data.get('ext_password'),
+            base_path=data.get('ext_base_path')
+        )
+    else:
+        # Старый режим - из EXTERNAL_SERVER_CONFIG
+        inbound_id = data.get('selected_inbound_id')
+        server_name = f"Внешний ({EXTERNAL_SERVER_CONFIG.get('server_address')})"
+        server_address = EXTERNAL_SERVER_CONFIG.get('server_address')
+        server_port = EXTERNAL_SERVER_CONFIG.get('server_port', 443)
+        client = get_external_xui_client()
+
+    await callback.message.edit_text("⏳ Создание ключа на внешнем сервере...")
+
+    try:
+        async with client:
+            # Создаём клиента
+            result = await client.add_client(
+                inbound_id=inbound_id,
+                email=client_email,
+                phone=client_phone,
+                expire_days=period_days,
+                ip_limit=2
+            )
+
+            if not result:
+                await callback.message.edit_text(
+                    "❌ Не удалось создать ключ на внешнем сервере.\n"
+                    "Проверьте логи для подробностей.",
+                    reply_markup=Keyboards.admin_menu()
+                )
+                await state.clear()
+                return
+
+            if result.get('error'):
+                error_msg = result.get('message', 'Неизвестная ошибка')
+                if result.get('is_duplicate'):
+                    await callback.message.edit_text(
+                        f"❌ Клиент с таким email уже существует.\n\n"
+                        f"Email: <code>{client_email}</code>\n"
+                        f"Ошибка: {error_msg}",
+                        parse_mode="HTML",
+                        reply_markup=Keyboards.admin_menu()
+                    )
+                else:
+                    await callback.message.edit_text(
+                        f"❌ Ошибка создания ключа:\n{error_msg}",
+                        reply_markup=Keyboards.admin_menu()
+                    )
+                await state.clear()
+                return
+
+            # Получаем VLESS ссылку
+            vless_link = await client.get_client_link(
+                inbound_id=inbound_id,
+                client_email=client_email,
+                server_address=server_address,
+                server_port=server_port
+            )
+
+            # Сохраняем в базу данных (для статистики)
+            await db.add_key_to_history(
+                manager_id=callback.from_user.id,
+                client_email=client_email,
+                phone_number=client_phone,
+                period=period_name,
+                expire_days=period_days,
+                client_id=result.get('client_id', ''),
+                price=price
+            )
+
+            # Генерируем QR код
+            qr_image = None
+            if vless_link:
+                qr_image = generate_qr_code(vless_link)
+
+            # Формируем сообщение
+            text = f"✅ <b>КЛЮЧ УСПЕШНО СОЗДАН</b>\n\n"
+            text += f"📡 Сервер: <b>{server_name}</b>\n"
+            text += f"📍 Inbound ID: <b>{inbound_id}</b>\n"
+            text += f"📱 Клиент: <b>{client_phone}</b>\n"
+            text += f"📅 Срок: <b>{period_name}</b>\n"
+            text += f"💰 Цена: <b>{price} ₽</b>\n\n"
+
+            if vless_link:
+                text += f"🔗 <b>VLESS ссылка:</b>\n<code>{vless_link}</code>\n\n"
+            else:
+                text += "⚠️ Не удалось получить VLESS ссылку\n\n"
+
+            text += "━━━━━━━━━━━━━━━━"
+
+            # Отправляем сообщение с QR кодом если есть
+            if qr_image:
+                await callback.message.delete()
+                await callback.message.answer_photo(
+                    photo=BufferedInputFile(qr_image, filename="qr.png"),
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=Keyboards.admin_menu()
+                )
+            else:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=Keyboards.admin_menu()
+                )
+
+            logger.info(f"Ключ создан на внешнем сервере {server_name}: {client_email} для {client_phone}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании ключа на внешнем сервере: {e}")
+        import traceback
+        traceback.print_exc()
+        await callback.message.edit_text(
+            f"❌ Произошла ошибка:\n{str(e)}",
+            reply_markup=Keyboards.admin_menu()
+        )
+
+    await state.clear()
+    await callback.answer()
+
+
+# ========== Управление внешними серверами ==========
+
+@router.callback_query(F.data == "ext_servers")
+async def show_external_servers(callback: CallbackQuery, db: DatabaseManager, state: FSMContext):
+    """Показать список внешних серверов"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    await state.clear()
+    servers = await db.get_external_servers(active_only=False)
+
+    text = "🌐 <b>Внешние серверы</b>\n\n"
+    if servers:
+        text += f"Найдено серверов: {len(servers)}\n"
+        text += "Выберите сервер для управления:"
+    else:
+        text += "Серверов пока нет.\nНажмите «➕ Добавить сервер» для добавления."
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=Keyboards.external_servers_list(servers)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ext_srv_") & ~F.data.startswith("ext_srv_add") & ~F.data.startswith("ext_srv_key_") & ~F.data.startswith("ext_srv_test_") & ~F.data.startswith("ext_srv_toggle_") & ~F.data.startswith("ext_srv_edit_") & ~F.data.startswith("ext_srv_del_"))
+async def show_external_server_details(callback: CallbackQuery, db: DatabaseManager):
+    """Показать детали внешнего сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+    server = await db.get_external_server(server_id)
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    status = "✅ Активен" if server['is_active'] else "❌ Отключен"
+    domain_info = server['domain'] if server['domain'] else "Не указан (используется IP)"
+
+    text = f"🌐 <b>Сервер: {server['name']}</b>\n\n"
+    text += f"📍 Статус: {status}\n"
+    text += f"🖥 Хост: <code>{server['host']}:{server['port']}</code>\n"
+    text += f"📁 Путь: <code>{server['base_path']}</code>\n"
+    text += f"👤 Логин: <code>{server['username']}</code>\n"
+    text += f"🔗 Inbound ID: <code>{server['inbound_id']}</code>\n"
+    text += f"🌍 Домен: <code>{domain_info}</code>\n"
+    text += f"🔌 Порт клиента: <code>{server['server_port']}</code>\n"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=Keyboards.external_server_actions(server_id, server['is_active'])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ext_srv_add")
+async def start_add_external_server(callback: CallbackQuery, state: FSMContext):
+    """Начать добавление внешнего сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AddExternalServerStates.waiting_for_name)
+
+    text = "➕ <b>Добавление внешнего сервера</b>\n\n"
+    text += "Шаг 1/5: Введите название сервера\n"
+    text += "Например: <code>EU Server</code> или <code>LTE Germany</code>"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="ext_servers")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.message(AddExternalServerStates.waiting_for_name)
+async def process_server_name(message: Message, state: FSMContext):
+    """Обработка имени сервера"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    server_name = message.text.strip()
+    if not server_name or len(server_name) < 2:
+        await message.answer("❌ Имя слишком короткое. Введите минимум 2 символа.")
+        return
+
+    await state.update_data(server_name=server_name)
+    await state.set_state(AddExternalServerStates.waiting_for_url)
+
+    text = "➕ <b>Добавление внешнего сервера</b>\n\n"
+    text += f"Название: <b>{server_name}</b>\n\n"
+    text += "Шаг 2/5: Введите URL панели в формате:\n"
+    text += "<code>IP:PORT/BASE_PATH</code>\n\n"
+    text += "Пример: <code>38.180.205.196:27450/J6CkyRIalbUZdPd</code>\n"
+    text += "(без https:// и /panel/inbounds)"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="ext_servers")]
+        ])
+    )
+
+
+@router.message(AddExternalServerStates.waiting_for_url)
+async def process_server_url(message: Message, state: FSMContext):
+    """Обработка URL сервера"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    import re
+    url_text = message.text.strip()
+
+    # Парсим URL вида IP:PORT/PATH
+    match = re.match(r'^([^:/]+):(\d+)(/.*)?$', url_text)
+    if not match:
+        await message.answer(
+            "❌ Неверный формат URL\n\n"
+            "Введите в формате: <code>IP:PORT/BASE_PATH</code>\n"
+            "Пример: <code>38.180.205.196:27450/J6CkyRIalbUZdPd</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    host = match.group(1)
+    port = int(match.group(2))
+    base_path = match.group(3) or ""
+
+    data = await state.get_data()
+    await state.update_data(host=host, port=port, base_path=base_path)
+    await state.set_state(AddExternalServerStates.waiting_for_credentials)
+
+    text = "➕ <b>Добавление внешнего сервера</b>\n\n"
+    text += f"Название: <b>{data['server_name']}</b>\n"
+    text += f"Хост: <code>{host}:{port}{base_path}</code>\n\n"
+    text += "Шаг 3/5: Введите логин и пароль через пробел:\n"
+    text += "<code>username password</code>"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="ext_servers")]
+        ])
+    )
+
+
+@router.message(AddExternalServerStates.waiting_for_credentials)
+async def process_server_credentials(message: Message, state: FSMContext):
+    """Обработка логина и пароля"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer(
+            "❌ Введите логин и пароль через пробел:\n"
+            "<code>username password</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    username, password = parts
+
+    data = await state.get_data()
+    await state.update_data(username=username, password=password)
+    await state.set_state(AddExternalServerStates.waiting_for_inbound_id)
+
+    text = "➕ <b>Добавление внешнего сервера</b>\n\n"
+    text += f"Название: <b>{data['server_name']}</b>\n"
+    text += f"Хост: <code>{data['host']}:{data['port']}{data['base_path']}</code>\n"
+    text += f"Логин: <code>{username}</code>\n\n"
+    text += "Шаг 4/5: Введите ID inbound для создания ключей:\n"
+    text += "Например: <code>1</code>"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="ext_servers")]
+        ])
+    )
+
+
+@router.message(AddExternalServerStates.waiting_for_inbound_id)
+async def process_server_inbound_id(message: Message, state: FSMContext):
+    """Обработка ID inbound"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        inbound_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите число (ID inbound)")
+        return
+
+    data = await state.get_data()
+    await state.update_data(inbound_id=inbound_id)
+    await state.set_state(AddExternalServerStates.waiting_for_domain)
+
+    text = "➕ <b>Добавление внешнего сервера</b>\n\n"
+    text += f"Название: <b>{data['server_name']}</b>\n"
+    text += f"Хост: <code>{data['host']}:{data['port']}{data['base_path']}</code>\n"
+    text += f"Логин: <code>{data['username']}</code>\n"
+    text += f"Inbound ID: <code>{inbound_id}</code>\n\n"
+    text += "Шаг 5/5: Введите домен для ключей и порт через пробел\n"
+    text += "или <code>-</code> для использования IP:\n\n"
+    text += "Пример: <code>vpn.example.com 443</code>\n"
+    text += "или просто: <code>-</code>"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="ext_servers")]
+        ])
+    )
+
+
+@router.message(AddExternalServerStates.waiting_for_domain)
+async def process_server_domain(message: Message, state: FSMContext, db: DatabaseManager):
+    """Обработка домена и завершение добавления"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text = message.text.strip()
+
+    domain = None
+    server_port = 443
+
+    if text != "-":
+        parts = text.split()
+        domain = parts[0]
+        if len(parts) > 1:
+            try:
+                server_port = int(parts[1])
+            except ValueError:
+                await message.answer("❌ Неверный формат порта. Введите число.")
+                return
+
+    data = await state.get_data()
+
+    # Сохраняем сервер в БД
+    server_id = await db.add_external_server(
+        name=data['server_name'],
+        host=data['host'],
+        port=data['port'],
+        base_path=data['base_path'],
+        username=data['username'],
+        password=data['password'],
+        inbound_id=data['inbound_id'],
+        domain=domain,
+        server_port=server_port
+    )
+
+    if server_id:
+        await message.answer(
+            f"✅ Сервер <b>{data['server_name']}</b> успешно добавлен!\n\n"
+            f"ID: {server_id}",
+            parse_mode="HTML",
+            reply_markup=Keyboards.external_servers_list(await db.get_external_servers(active_only=False))
+        )
+    else:
+        await message.answer(
+            "❌ Ошибка при добавлении сервера",
+            reply_markup=Keyboards.admin_menu()
+        )
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("ext_srv_test_"))
+async def test_external_server(callback: CallbackQuery, db: DatabaseManager):
+    """Тест подключения к внешнему серверу"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+    server = await db.get_external_server(server_id)
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    await callback.answer("🔄 Тестирую подключение...", show_alert=False)
+
+    from bot.api.external_xui import ExternalXUIClient
+
+    try:
+        client = ExternalXUIClient(
+            host=f"https://{server['host']}:{server['port']}",
+            username=server['username'],
+            password=server['password'],
+            base_path=server['base_path']
+        )
+
+        async with client:
+            inbounds = await client.list_inbounds()
+
+            if inbounds is not None:
+                # Ищем нужный inbound
+                target_inbound = None
+                for inb in inbounds:
+                    if inb.get('id') == server['inbound_id']:
+                        target_inbound = inb
+                        break
+
+                text = f"✅ <b>Подключение успешно!</b>\n\n"
+                text += f"Сервер: {server['name']}\n"
+                text += f"Найдено inbounds: {len(inbounds)}\n\n"
+
+                if target_inbound:
+                    text += f"📌 Целевой inbound (ID {server['inbound_id']}):\n"
+                    text += f"  Название: {target_inbound.get('remark', 'N/A')}\n"
+                    text += f"  Порт: {target_inbound.get('port', 'N/A')}\n"
+                    text += f"  Протокол: {target_inbound.get('protocol', 'N/A')}\n"
+                else:
+                    text += f"⚠️ Inbound с ID {server['inbound_id']} не найден!\n"
+                    text += "Доступные inbounds:\n"
+                    for inb in inbounds[:5]:
+                        text += f"  • ID {inb.get('id')}: {inb.get('remark')} (порт {inb.get('port')})\n"
+
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=Keyboards.external_server_actions(server_id, server['is_active'])
+                )
+            else:
+                await callback.message.edit_text(
+                    f"❌ Не удалось получить список inbounds\n"
+                    f"Проверьте учетные данные.",
+                    reply_markup=Keyboards.external_server_actions(server_id, server['is_active'])
+                )
+
+    except Exception as e:
+        logger.error(f"Ошибка тестирования сервера {server_id}: {e}")
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка подключения</b>\n\n"
+            f"Сервер: {server['name']}\n"
+            f"Ошибка: {str(e)}",
+            parse_mode="HTML",
+            reply_markup=Keyboards.external_server_actions(server_id, server['is_active'])
+        )
+
+
+@router.callback_query(F.data.startswith("ext_srv_toggle_"))
+async def toggle_external_server(callback: CallbackQuery, db: DatabaseManager):
+    """Переключить активность сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+
+    if await db.toggle_external_server(server_id):
+        server = await db.get_external_server(server_id)
+        status = "включен" if server['is_active'] else "отключен"
+        await callback.answer(f"Сервер {status}", show_alert=True)
+
+        # Обновляем меню
+        await show_external_server_details.__wrapped__(callback, db)
+    else:
+        await callback.answer("Ошибка переключения", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("ext_srv_del_"))
+async def confirm_delete_external_server(callback: CallbackQuery, db: DatabaseManager):
+    """Подтверждение удаления сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+    server = await db.get_external_server(server_id)
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"⚠️ <b>Удалить сервер?</b>\n\n"
+        f"Название: {server['name']}\n"
+        f"Хост: {server['host']}:{server['port']}\n\n"
+        f"Это действие нельзя отменить!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"ext_srv_del_confirm_{server_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"ext_srv_{server_id}")
+            ]
+        ])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ext_srv_del_confirm_"))
+async def delete_external_server(callback: CallbackQuery, db: DatabaseManager):
+    """Удаление сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+
+    if await db.delete_external_server(server_id):
+        await callback.answer("Сервер удален", show_alert=True)
+        servers = await db.get_external_servers(active_only=False)
+        await callback.message.edit_text(
+            "🌐 <b>Внешние серверы</b>\n\n"
+            f"Найдено серверов: {len(servers)}\n"
+            "Выберите сервер для управления:",
+            parse_mode="HTML",
+            reply_markup=Keyboards.external_servers_list(servers)
+        )
+    else:
+        await callback.answer("Ошибка удаления", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("ext_srv_key_"))
+async def start_create_key_on_external_server(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Начать создание ключа на выбранном внешнем сервере"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен", show_alert=True)
+        return
+
+    server_id = int(callback.data.split("_")[-1])
+    server = await db.get_external_server(server_id)
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    if not server['is_active']:
+        await callback.answer("Сервер отключен", show_alert=True)
+        return
+
+    # Сохраняем данные сервера в состоянии
+    await state.update_data(
+        ext_server_id=server_id,
+        ext_server_name=server['name'],
+        ext_host=server['host'],
+        ext_port=server['port'],
+        ext_base_path=server['base_path'],
+        ext_username=server['username'],
+        ext_password=server['password'],
+        ext_inbound_id=server['inbound_id'],
+        ext_domain=server['domain'],
+        ext_server_port=server['server_port']
+    )
+    await state.set_state(ExternalKeyStates.waiting_for_period)
+
+    await callback.message.edit_text(
+        f"🔑 <b>Создание ключа на сервере: {server['name']}</b>\n\n"
+        f"Inbound ID: {server['inbound_id']}\n\n"
+        f"Выберите период подписки:",
+        parse_mode="HTML",
+        reply_markup=Keyboards.external_subscription_periods()
+    )
+    await callback.answer()

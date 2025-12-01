@@ -19,6 +19,7 @@ class Keyboards:
         buttons = [
             [KeyboardButton(text="Создать ключ")],
             [KeyboardButton(text="Моя статистика"), KeyboardButton(text="💰 Прайс")],
+            [KeyboardButton(text="🔧 Исправить ключ")],
             [KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
         ]
 
@@ -35,6 +36,8 @@ class Keyboards:
         """Меню администратора"""
         buttons = [
             [KeyboardButton(text="🔑 Создать ключ (выбор inbound)")],
+            [KeyboardButton(text="🌍 Создать ключ (внешний сервер)")],
+            [KeyboardButton(text="🖥 Внешние серверы")],
             [KeyboardButton(text="Добавить менеджера")],
             [KeyboardButton(text="Список менеджеров")],
             [KeyboardButton(text="Общая статистика")],
@@ -270,4 +273,93 @@ class Keyboards:
             ])
 
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sni_cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def external_inbound_list(inbounds: list):
+        """Список inbound-ов внешнего сервера для создания ключей"""
+        buttons = []
+        for inbound in inbounds:
+            inbound_id = inbound.get('id')
+            remark = inbound.get('remark', f'Inbound {inbound_id}')
+            port = inbound.get('port', '?')
+
+            button_text = f"🌍 {remark} (Port {port})"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"ext_inbound_{inbound_id}"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def external_subscription_periods():
+        """Периоды подписки для внешнего сервера"""
+        periods = get_subscription_periods()
+        buttons = []
+        for key, value in periods.items():
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{value['name']} - {value['price']} ₽",
+                    callback_data=f"ext_period_{key}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def external_servers_list(servers: list):
+        """Список внешних серверов для управления"""
+        buttons = []
+        for server in servers:
+            server_id = server.get('id')
+            name = server.get('name', f'Server {server_id}')
+            is_active = server.get('is_active', 1)
+            status = "✅" if is_active else "❌"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{status} {name}",
+                    callback_data=f"ext_srv_{server_id}"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton(text="➕ Добавить сервер", callback_data="ext_srv_add")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def external_server_actions(server_id: int, is_active: bool):
+        """Действия для внешнего сервера"""
+        toggle_text = "❌ Отключить" if is_active else "✅ Включить"
+        buttons = [
+            [InlineKeyboardButton(text="🔑 Создать ключ", callback_data=f"ext_srv_key_{server_id}")],
+            [InlineKeyboardButton(text="🔄 Тест подключения", callback_data=f"ext_srv_test_{server_id}")],
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"ext_srv_toggle_{server_id}")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"ext_srv_edit_{server_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ext_srv_del_{server_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="ext_servers")]
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def external_server_select_for_key(servers: list):
+        """Выбор внешнего сервера для создания ключа"""
+        buttons = []
+        for server in servers:
+            if server.get('is_active', 1):
+                server_id = server.get('id')
+                name = server.get('name', f'Server {server_id}')
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"🌍 {name}",
+                        callback_data=f"ext_key_srv_{server_id}"
+                    )
+                ])
+
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
