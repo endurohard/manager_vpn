@@ -925,3 +925,213 @@ function openApp(appType, subscriptionUrl) {
         return div.innerHTML;
     }
 })();
+
+// ============== MIGRATE KEY SYSTEM ==============
+document.addEventListener("DOMContentLoaded", function() {
+(function initMigrateKeySystem() {
+    // Переключатели режимов
+    const modeFixBtn = document.getElementById('mode-fix-btn');
+    const modeMigrateBtn = document.getElementById('mode-migrate-btn');
+    const fixModePanel = document.getElementById('fix-mode-panel');
+    const migrateModePanel = document.getElementById('migrate-mode-panel');
+
+    // Результаты миграции
+    const migrateResult = document.getElementById('migrate-result');
+    const migrateError = document.getElementById('migrate-error');
+    const migrateErrorText = document.getElementById('migrate-error-text');
+    const migrateErrorHint = document.getElementById('migrate-error-hint');
+
+    // Поля результата
+    const migrateOldEmail = document.getElementById('migrate-old-email');
+    const migrateOldExpiry = document.getElementById('migrate-old-expiry');
+    const migrateNewDays = document.getElementById('migrate-new-days');
+    const migrateNewLimit = document.getElementById('migrate-new-limit');
+    const migrateNewKey = document.getElementById('migrate-new-key');
+    const migrateSubUrl = document.getElementById('migrate-subscription-url');
+    const migrateQrCode = document.getElementById('migrate-qr-code');
+
+    // Кнопки
+    const migrateKeyBtn = document.getElementById('migrate-key-btn');
+    const migrateKeyInput = document.getElementById('migrate-key-input');
+    const copyMigrateKeyBtn = document.getElementById('copy-migrate-key-btn');
+    const copyMigrateSubBtn = document.getElementById('copy-migrate-sub-btn');
+
+    // Переключение режимов
+    if (modeFixBtn && modeMigrateBtn) {
+        modeFixBtn.addEventListener('click', () => {
+            modeFixBtn.style.background = 'var(--accent-primary)';
+            modeFixBtn.style.color = '';
+            modeMigrateBtn.style.background = 'var(--secondary-bg)';
+            modeMigrateBtn.style.color = 'var(--text-primary)';
+            if (fixModePanel) fixModePanel.style.display = 'block';
+            if (migrateModePanel) migrateModePanel.style.display = 'none';
+            hideResults();
+        });
+
+        modeMigrateBtn.addEventListener('click', () => {
+            modeMigrateBtn.style.background = '#17a2b8';
+            modeMigrateBtn.style.color = 'white';
+            modeFixBtn.style.background = 'var(--secondary-bg)';
+            modeFixBtn.style.color = 'var(--text-primary)';
+            if (fixModePanel) fixModePanel.style.display = 'none';
+            if (migrateModePanel) migrateModePanel.style.display = 'block';
+            hideResults();
+        });
+    }
+
+    // Миграция ключа
+    if (migrateKeyBtn && migrateKeyInput) {
+        migrateKeyBtn.addEventListener('click', async () => {
+            const key = migrateKeyInput.value.trim();
+
+            if (!key) {
+                showMigrateError('Введите ключ для переноса', '');
+                return;
+            }
+
+            if (!key.startsWith('vless://')) {
+                showMigrateError('Ключ должен начинаться с vless://', '');
+                return;
+            }
+
+            migrateKeyBtn.disabled = true;
+            migrateKeyBtn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Поиск в базе...';
+            hideResults();
+
+            try {
+                const response = await fetch('/api/migrate-client', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: key })
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    showMigrateError(data.error, data.hint || '');
+                    migrateKeyBtn.disabled = false;
+                    migrateKeyBtn.innerHTML = '<i class="fa fa-rocket"></i> Перенести ключ';
+                    return;
+                }
+
+                // Показываем результат успешной миграции
+                if (data.success && data.new_client) {
+                    // Заполняем информацию о старом клиенте
+                    if (migrateOldEmail) migrateOldEmail.textContent = data.old_client?.email || 'N/A';
+                    if (migrateOldExpiry) migrateOldExpiry.textContent = data.old_client?.expiry || 'N/A';
+
+                    // Заполняем информацию о новом клиенте
+                    if (migrateNewDays) migrateNewDays.textContent = data.new_client?.days || 'N/A';
+                    if (migrateNewLimit) migrateNewLimit.textContent = data.new_client?.limitIp || '2';
+
+                    // Новый ключ
+                    const newKey = data.new_client?.vless_link || '';
+                    if (migrateNewKey) migrateNewKey.value = newKey;
+
+                    // Подписка
+                    const subUrl = data.new_client?.subscription_url || '';
+                    if (migrateSubUrl) migrateSubUrl.value = subUrl;
+
+                    // QR код
+                    if (migrateQrCode && newKey && typeof QRCode !== 'undefined') {
+                        migrateQrCode.innerHTML = '';
+                        new QRCode(migrateQrCode, {
+                            text: newKey,
+                            width: 180,
+                            height: 180,
+                            colorDark: '#000000',
+                            colorLight: '#ffffff',
+                            correctLevel: QRCode.CorrectLevel.M
+                        });
+                    }
+
+                    // Показываем результат
+                    if (migrateResult) migrateResult.style.display = 'block';
+                    if (migrateError) migrateError.style.display = 'none';
+                }
+
+            } catch (e) {
+                showMigrateError('Ошибка соединения с сервером', '');
+                console.error('Migrate key error:', e);
+            }
+
+            migrateKeyBtn.disabled = false;
+            migrateKeyBtn.innerHTML = '<i class="fa fa-rocket"></i> Перенести ключ';
+        });
+    }
+
+    // Копирование нового ключа
+    if (copyMigrateKeyBtn) {
+        copyMigrateKeyBtn.addEventListener('click', async () => {
+            const key = migrateNewKey?.value;
+            if (!key) return;
+
+            try {
+                await navigator.clipboard.writeText(key);
+                copyMigrateKeyBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyMigrateKeyBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать ключ';
+                }, 2000);
+            } catch (e) {
+                fallbackCopy(key);
+                copyMigrateKeyBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyMigrateKeyBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать ключ';
+                }, 2000);
+            }
+        });
+    }
+
+    // Копирование подписки
+    if (copyMigrateSubBtn) {
+        copyMigrateSubBtn.addEventListener('click', async () => {
+            const url = migrateSubUrl?.value;
+            if (!url) return;
+
+            try {
+                await navigator.clipboard.writeText(url);
+                copyMigrateSubBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyMigrateSubBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать подписку';
+                }, 2000);
+            } catch (e) {
+                fallbackCopy(url);
+                copyMigrateSubBtn.innerHTML = '<i class="fa fa-check"></i> Скопировано!';
+                setTimeout(() => {
+                    copyMigrateSubBtn.innerHTML = '<i class="fa fa-copy"></i> Скопировать подписку';
+                }, 2000);
+            }
+        });
+    }
+
+    function showMigrateError(message, hint) {
+        if (migrateError && migrateErrorText) {
+            migrateErrorText.textContent = message;
+            if (migrateErrorHint) migrateErrorHint.textContent = hint || '';
+            migrateError.style.display = 'block';
+            if (migrateResult) migrateResult.style.display = 'none';
+        }
+    }
+
+    function hideResults() {
+        if (migrateResult) migrateResult.style.display = 'none';
+        if (migrateError) migrateError.style.display = 'none';
+        // Также скрываем результаты исправления
+        const fixResult = document.getElementById('fix-key-result');
+        const fixError = document.getElementById('fix-key-error');
+        if (fixResult) fixResult.style.display = 'none';
+        if (fixError) fixError.style.display = 'none';
+    }
+
+    function fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+    }
+})();
+}); // end DOMContentLoaded for migrate system

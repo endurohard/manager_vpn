@@ -29,6 +29,8 @@ DATABASE_PATH = 'bot_database.db'
 WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
 WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', 8080))
 WEBAPP_URL = os.getenv('WEBAPP_URL', f'https://{DOMAIN}:8080')  # URL для доступа к mini app
+SSL_CERT = os.getenv('SSL_CERT', '')
+SSL_KEY = os.getenv('SSL_KEY', '')
 
 # Импортируем функцию для получения актуальных цен
 from bot.price_config import get_subscription_periods

@@ -54,7 +54,7 @@ async def test_connection():
 
                         # Тест 3: Получение inbound
                         print("\n3. Получение информации об inbound 12...")
-                        inbound_url = f"{host}/panel/api/inbounds/get/12"
+                        inbound_url = f"{host}/panel/inbound/get/12"
                         async with session.get(inbound_url) as resp:
                             print(f"   GET {inbound_url}")
                             print(f"   Status: {resp.status}")

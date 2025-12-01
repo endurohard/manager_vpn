@@ -15,7 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import FSInputFile
 
-from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID
+from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, SSL_CERT, SSL_KEY
 from bot.database import DatabaseManager
 from bot.api import XUIClient
 from bot.handlers import common, manager, admin
@@ -175,9 +175,9 @@ async def main():
 
     # Запуск веб-сервера для Mini App
     try:
-        # Передаем бота для уведомлений админу о веб-заказах
-        set_bot_instance(bot, ADMIN_ID)
-        webapp_runner = await start_webapp_server(WEBAPP_HOST, WEBAPP_PORT)
+        # Передаем бота и xui_client для уведомлений и миграции клиентов
+        set_bot_instance(bot, ADMIN_ID, xui_client)
+        webapp_runner = await start_webapp_server(WEBAPP_HOST, WEBAPP_PORT, SSL_CERT, SSL_KEY)
         logger.info("WebApp сервер запущен успешно")
     except Exception as e:
         logger.error(f"Ошибка запуска WebApp сервера: {e}")

@@ -591,7 +591,7 @@ class XUIClient:
                 logger.error("Не удалось авторизоваться для рестарта xray")
                 return False
 
-            url = f"{self.host}/panel/api/inbounds/restartPanel"
+            url = f"{self.host}/server/restartXrayService"
             async with self.session.post(url) as response:
                 if response.status == 200:
                     data = await response.json()

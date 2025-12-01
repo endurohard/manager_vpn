@@ -91,6 +91,8 @@ class ExternalKeyStates(StatesGroup):
     """Состояния для создания ключа на внешнем сервере"""
     waiting_for_inbound = State()
     waiting_for_period = State()
+    waiting_for_custom_days = State()
+    waiting_for_custom_price = State()
     waiting_for_phone = State()
     confirming = State()
 
@@ -2508,6 +2510,30 @@ async def select_external_inbound(callback: CallbackQuery, state: FSMContext):
 async def select_external_period(callback: CallbackQuery, state: FSMContext):
     """Выбор периода подписки для внешнего сервера"""
     period_key = callback.data.replace("ext_period_", "")
+
+    # Обработка бесплатного ключа
+    if period_key == "free":
+        await state.set_state(ExternalKeyStates.waiting_for_custom_days)
+        await callback.message.edit_text(
+            "🆓 <b>Бесплатный ключ</b>\n\n"
+            "Введите количество дней действия ключа:",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    # Обработка своей цены
+    if period_key == "custom":
+        await state.set_state(ExternalKeyStates.waiting_for_custom_days)
+        await state.update_data(custom_price_mode=True)
+        await callback.message.edit_text(
+            "💵 <b>Своя цена</b>\n\n"
+            "Введите количество дней действия ключа:",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
     periods = get_subscription_periods()
 
     if period_key not in periods:
@@ -2525,16 +2551,88 @@ async def select_external_period(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ExternalKeyStates.waiting_for_phone)
 
     data = await state.get_data()
+    server_name = data.get('ext_server_name', 'Внешний сервер')
 
     await callback.message.edit_text(
-        f"🌍 <b>ВНЕШНИЙ СЕРВЕР</b>\n\n"
-        f"📍 Inbound: <b>{data.get('selected_inbound_name')}</b>\n"
+        f"🌍 <b>{server_name}</b>\n\n"
         f"📅 Период: <b>{period_info['name']}</b> ({period_info['days']} дней)\n"
         f"💰 Цена: <b>{period_info['price']} ₽</b>\n\n"
         f"Теперь введите номер телефона или ID клиента:",
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+@router.message(ExternalKeyStates.waiting_for_custom_days)
+async def process_external_custom_days(message: Message, state: FSMContext):
+    """Обработка количества дней для бесплатного/своего ключа"""
+    try:
+        days = int(message.text.strip())
+        if days <= 0 or days > 365:
+            await message.answer("❌ Введите число от 1 до 365")
+            return
+    except ValueError:
+        await message.answer("❌ Введите число (количество дней)")
+        return
+
+    data = await state.get_data()
+
+    await state.update_data(selected_period_days=days)
+
+    # Если это режим своей цены - запрашиваем цену
+    if data.get('custom_price_mode'):
+        await state.set_state(ExternalKeyStates.waiting_for_custom_price)
+        await message.answer(
+            f"Количество дней: <b>{days}</b>\n\n"
+            f"Теперь введите цену в рублях (или 0 для бесплатно):",
+            parse_mode="HTML"
+        )
+    else:
+        # Бесплатный ключ
+        await state.update_data(
+            selected_period_name=f"Бесплатно ({days} дн.)",
+            selected_period_price=0
+        )
+        await state.set_state(ExternalKeyStates.waiting_for_phone)
+        await message.answer(
+            f"🆓 <b>Бесплатный ключ</b>\n\n"
+            f"📅 Срок: <b>{days} дней</b>\n"
+            f"💰 Цена: <b>0 ₽</b>\n\n"
+            f"Теперь введите номер телефона или ID клиента:",
+            parse_mode="HTML"
+        )
+
+
+@router.message(ExternalKeyStates.waiting_for_custom_price)
+async def process_external_custom_price(message: Message, state: FSMContext):
+    """Обработка своей цены"""
+    try:
+        price = int(message.text.strip())
+        if price < 0:
+            await message.answer("❌ Цена не может быть отрицательной")
+            return
+    except ValueError:
+        await message.answer("❌ Введите число (цена в рублях)")
+        return
+
+    data = await state.get_data()
+    days = data.get('selected_period_days')
+
+    await state.update_data(
+        selected_period_name=f"Своя цена ({days} дн.)",
+        selected_period_price=price
+    )
+    await state.set_state(ExternalKeyStates.waiting_for_phone)
+
+    server_name = data.get('ext_server_name', 'Внешний сервер')
+
+    await message.answer(
+        f"💵 <b>{server_name}</b>\n\n"
+        f"📅 Срок: <b>{days} дней</b>\n"
+        f"💰 Цена: <b>{price} ₽</b>\n\n"
+        f"Теперь введите номер телефона или ID клиента:",
+        parse_mode="HTML"
+    )
 
 
 @router.message(ExternalKeyStates.waiting_for_phone)
@@ -2634,7 +2732,8 @@ async def confirm_external_key_creation(callback: CallbackQuery, state: FSMConte
             )
 
             if not result:
-                await callback.message.edit_text(
+                await callback.message.delete()
+                await callback.message.answer(
                     "❌ Не удалось создать ключ на внешнем сервере.\n"
                     "Проверьте логи для подробностей.",
                     reply_markup=Keyboards.admin_menu()
@@ -2644,8 +2743,9 @@ async def confirm_external_key_creation(callback: CallbackQuery, state: FSMConte
 
             if result.get('error'):
                 error_msg = result.get('message', 'Неизвестная ошибка')
+                await callback.message.delete()
                 if result.get('is_duplicate'):
-                    await callback.message.edit_text(
+                    await callback.message.answer(
                         f"❌ Клиент с таким email уже существует.\n\n"
                         f"Email: <code>{client_email}</code>\n"
                         f"Ошибка: {error_msg}",
@@ -2653,7 +2753,7 @@ async def confirm_external_key_creation(callback: CallbackQuery, state: FSMConte
                         reply_markup=Keyboards.admin_menu()
                     )
                 else:
-                    await callback.message.edit_text(
+                    await callback.message.answer(
                         f"❌ Ошибка создания ключа:\n{error_msg}",
                         reply_markup=Keyboards.admin_menu()
                     )
@@ -2703,13 +2803,14 @@ async def confirm_external_key_creation(callback: CallbackQuery, state: FSMConte
             if qr_image:
                 await callback.message.delete()
                 await callback.message.answer_photo(
-                    photo=BufferedInputFile(qr_image, filename="qr.png"),
+                    photo=BufferedInputFile(qr_image.read(), filename="qr.png"),
                     caption=text,
                     parse_mode="HTML",
                     reply_markup=Keyboards.admin_menu()
                 )
             else:
-                await callback.message.edit_text(
+                await callback.message.delete()
+                await callback.message.answer(
                     text,
                     parse_mode="HTML",
                     reply_markup=Keyboards.admin_menu()
@@ -2721,7 +2822,8 @@ async def confirm_external_key_creation(callback: CallbackQuery, state: FSMConte
         logger.error(f"Ошибка при создании ключа на внешнем сервере: {e}")
         import traceback
         traceback.print_exc()
-        await callback.message.edit_text(
+        await callback.message.delete()
+        await callback.message.answer(
             f"❌ Произошла ошибка:\n{str(e)}",
             reply_markup=Keyboards.admin_menu()
         )

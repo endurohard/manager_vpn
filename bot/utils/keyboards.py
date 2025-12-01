@@ -308,6 +308,9 @@ class Keyboards:
                     callback_data=f"ext_period_{key}"
                 )
             ])
+        # Добавляем специальные опции для админа
+        buttons.append([InlineKeyboardButton(text="🆓 Бесплатно", callback_data="ext_period_free")])
+        buttons.append([InlineKeyboardButton(text="💵 Своя цена", callback_data="ext_period_custom")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 

@@ -24,6 +24,7 @@ PRICES_FILE = BASE_DIR / 'prices.json'
 PAYMENT_FILE = BASE_DIR / 'payment_details.json'
 ORDERS_DB = BASE_DIR / 'web_orders.db'
 UPLOADS_DIR = BASE_DIR / 'uploads'
+OLD_XUI_BACKUP = BASE_DIR / 'backups' / 'x-ui_backup_2025-12-01_02-00.db'
 
 # Создаём директорию для загрузок
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -31,13 +32,21 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 # Глобальная ссылка на бота для уведомлений
 bot_instance = None
 admin_id = None
+xui_client = None
 
 
-def set_bot_instance(bot, admin):
-    """Установить экземпляр бота для уведомлений"""
-    global bot_instance, admin_id
+def set_bot_instance(bot, admin, xui=None):
+    """Установить экземпляр бота и xui клиента для уведомлений"""
+    global bot_instance, admin_id, xui_client
     bot_instance = bot
     admin_id = admin
+    xui_client = xui
+
+
+def set_xui_client(xui):
+    """Установить экземпляр XUI клиента"""
+    global xui_client
+    xui_client = xui
 
 
 async def init_orders_db():
@@ -288,12 +297,37 @@ async def api_confirm_payment(request):
 
 
 def load_xray_config():
-    """Загрузить конфиг xray"""
-    xray_config_path = Path('/usr/local/x-ui/bin/config.json')
-    if xray_config_path.exists():
-        with open(xray_config_path, 'r') as f:
-            return json.load(f)
-    return None
+    """Загрузить конфиг xray из базы данных X-UI"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, port, protocol, settings, stream_settings, tag, sniffing FROM inbounds WHERE enable = 1")
+        rows = cursor.fetchall()
+        conn.close()
+
+        inbounds = []
+        for row in rows:
+            inbound_id, port, protocol, settings_str, stream_str, tag, sniffing_str = row
+
+            settings = json.loads(settings_str) if settings_str else {}
+            stream_settings = json.loads(stream_str) if stream_str else {}
+            sniffing = json.loads(sniffing_str) if sniffing_str else {}
+
+            inbounds.append({
+                'id': inbound_id,
+                'port': port,
+                'protocol': protocol,
+                'settings': settings,
+                'streamSettings': stream_settings,
+                'tag': tag or f'inbound-{port}',
+                'sniffing': sniffing
+            })
+
+        return {'inbounds': inbounds}
+    except Exception as e:
+        logger.error(f"Error loading xray config from DB: {e}")
+        return None
 
 
 def find_client_in_xray(uuid_str):
@@ -326,6 +360,38 @@ def generate_public_key(private_key):
                 return line.split(':', 1)[1].strip()
     except:
         pass
+    return None
+
+
+def get_reality_public_key(reality_settings):
+    """Получить публичный ключ из настроек REALITY"""
+    # Сначала ищем в settings (X-UI хранит там)
+    settings = reality_settings.get('settings', {})
+    public_key = settings.get('publicKey', '')
+    if public_key:
+        return public_key
+
+    # Если нет - генерируем из приватного
+    private_key = reality_settings.get('privateKey', '')
+    if private_key:
+        return generate_public_key(private_key)
+
+    return None
+
+
+def load_inbound_settings_from_db(inbound_id=12):
+    """Загрузить настройки inbound из базы данных X-UI"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inbound_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0])
+    except Exception as e:
+        logger.error(f"Error loading inbound from DB: {e}")
     return None
 
 
@@ -391,8 +457,13 @@ async def api_fix_key(request):
             }
 
             stream = inbound.get('streamSettings') or {}
-            reality = stream.get('realitySettings') or {}
             security = stream.get('security', 'none')
+
+            # Загружаем настройки из БД для более точных данных REALITY
+            db_stream = load_inbound_settings_from_db(12)
+            reality = stream.get('realitySettings') or {}
+            if db_stream:
+                reality = db_stream.get('realitySettings') or reality
 
             # Исправляем security
             if params.get('security') != security:
@@ -403,11 +474,19 @@ async def api_fix_key(request):
             if security == 'reality':
                 # Исправляем flow из настроек клиента
                 client_flow = client.get('flow', '')
+                current_flow = params.get('flow', '')
+
                 if client_flow:
-                    if params.get('flow') != client_flow:
-                        old_flow = params.get('flow', 'отсутствует')
+                    # Если flow установлен в базе - применяем его
+                    if current_flow != client_flow:
+                        old_flow = current_flow or 'отсутствует'
                         params['flow'] = client_flow
                         fixes.append(f"Исправлен flow: {old_flow} → {client_flow}")
+                else:
+                    # Если flow пустой в базе - убираем из ключа
+                    if current_flow:
+                        del params['flow']
+                        fixes.append(f"Убран flow: {current_flow} (отключен на сервере)")
 
                 # Исправляем SNI
                 server_names = reality.get('serverNames', [])
@@ -416,14 +495,12 @@ async def api_fix_key(request):
                     params['sni'] = server_names[0]
                     fixes.append(f"Исправлен SNI: {current_sni} → {server_names[0]}")
 
-                # Исправляем public key
-                private_key = reality.get('privateKey', '')
-                if private_key:
-                    public_key = generate_public_key(private_key)
-                    if public_key and params.get('pbk') != public_key:
-                        old_pbk = params.get('pbk', 'отсутствует')[:10] + '...'
-                        params['pbk'] = public_key
-                        fixes.append(f"Исправлен pbk: {old_pbk} → {public_key[:10]}...")
+                # Исправляем public key (используем новую функцию)
+                public_key = get_reality_public_key(reality)
+                if public_key and params.get('pbk') != public_key:
+                    old_pbk = params.get('pbk', 'отсутствует')[:10] + '...' if params.get('pbk') else 'отсутствует'
+                    params['pbk'] = public_key
+                    fixes.append(f"Исправлен pbk: {old_pbk} → {public_key[:10]}...")
 
                 # Исправляем short id
                 short_ids = reality.get('shortIds', [])
@@ -436,6 +513,11 @@ async def api_fix_key(request):
                 if params.get('fp') == 'random':
                     params['fp'] = 'chrome'
                     fixes.append("Исправлен fp: random → chrome")
+
+                # Убеждаемся что spx есть
+                if 'spx' not in params:
+                    params['spx'] = '%2F'
+                    fixes.append("Добавлен spx: /")
 
             # Исправляем порт на 443
             if port != "443":
@@ -450,15 +532,91 @@ async def api_fix_key(request):
                 fixes.append(f"Исправлен хост: {old_host} → raphaelvpn.ru")
 
         else:
-            issues.append("UUID не найден в базе xray! Ключ может быть недействительным.")
-            # Базовые исправления без базы
-            if params.get('security') == 'reality':
-                if 'flow' not in params:
-                    params['flow'] = 'xtls-rprx-vision'
-                    fixes.append("Добавлен flow=xtls-rprx-vision (стандартный)")
-                if params.get('fp') == 'random':
-                    params['fp'] = 'chrome'
-                    fixes.append("Исправлен fp: random → chrome")
+            # UUID не найден - попробуем найти по email/фрагменту
+            search_term = None
+            found_by_email = None
+
+            # Пробуем поискать по фрагменту ключа (часто содержит номер телефона)
+            if fragment:
+                import urllib.parse
+                import re
+                decoded_fragment = urllib.parse.unquote(fragment)
+
+                # Ищем номер телефона в фрагменте (+7..., 7..., 8...)
+                phone_match = re.search(r'[\+]?[78][\d\s\-]{9,}', decoded_fragment)
+                if phone_match:
+                    search_term = phone_match.group(0)
+                    # Нормализуем: оставляем только цифры
+                    search_digits = re.sub(r'[^\d]', '', search_term)
+                    if len(search_digits) >= 10:
+                        # Ищем по последним 10 цифрам
+                        search_term = search_digits[-10:]
+                else:
+                    # Пробуем найти по частям фрагмента
+                    parts = re.split(r'[-_\s]', decoded_fragment)
+                    for part in parts:
+                        if len(part) >= 4 and part not in ['VPNPULSE', 'VPN', 'PULSE', 'direct', 'lte']:
+                            search_term = part
+                            break
+
+                if search_term and len(search_term) >= 3:
+                    email_results = find_client_by_email(search_term)
+                    if email_results:
+                        found_by_email = email_results[0]
+
+            if found_by_email:
+                # Нашли клиента по email - генерируем правильный ключ
+                real_client = found_by_email['client']
+                real_inbound = found_by_email['inbound']
+
+                issues.append(f"UUID в ключе неверный! Найден клиент по email '{search_term}'")
+                fixes.append(f"UUID заменён на актуальный: {real_client.get('id')[:8]}...")
+
+                # Генерируем полностью новый правильный ключ
+                correct_link = generate_vless_link(real_client, real_inbound)
+
+                client_info = {
+                    "email": real_client.get('email', 'N/A'),
+                    "inbound": real_inbound.get('tag', 'N/A'),
+                    "port": real_inbound.get('port', 'N/A'),
+                    "found_by": "email_search"
+                }
+
+                result = {
+                    "original": vless_link,
+                    "fixed": correct_link,
+                    "changed": True,
+                    "fixes": fixes,
+                    "issues": issues,
+                    "found_in_db": True,
+                    "found_by_email": True,
+                    "search_term": search_term,
+                    "client_info": client_info,
+                    "subscription_url": f"https://zov-gor.ru/sub/{real_client.get('id', '')}",
+                    "params": {
+                        "uuid": real_client.get('id', '')[:8] + "...",
+                        "host": "raphaelvpn.ru",
+                        "port": "443",
+                        "security": "reality",
+                        "sni": "mirror.yandex.ru",
+                        "flow": real_client.get('flow', 'xtls-rprx-vision')
+                    }
+                }
+
+                return web.json_response(result)
+            else:
+                issues.append("UUID не найден в базе xray! Ключ может быть недействительным.")
+                if fragment:
+                    issues.append(f"Также не удалось найти клиента по email из фрагмента '{search_term}'")
+
+                # Базовые исправления без базы
+                if params.get('security') == 'reality':
+                    if 'flow' not in params:
+                        params['flow'] = 'xtls-rprx-vision'
+                        fixes.append("Добавлен flow=xtls-rprx-vision (стандартный)")
+                    if params.get('fp') == 'random':
+                        params['fp'] = 'chrome'
+                        fixes.append("Исправлен fp: random → chrome")
 
         # Собираем исправленную ссылку
         new_query = '&'.join([f"{k}={v}" for k, v in params.items()])
@@ -526,6 +684,251 @@ async def api_order_status(request):
         return web.json_response(response)
 
 
+async def api_find_key(request):
+    """API: Найти клиента по email и сгенерировать vless ключ"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    query = data.get("query", data.get("email", "")).strip()
+
+    if not query:
+        return web.json_response({"error": "Укажите email клиента"}, status=400)
+
+    if len(query) < 3:
+        return web.json_response({"error": "Минимум 3 символа для поиска"}, status=400)
+
+    # Ищем клиентов по email
+    results = find_client_by_email(query)
+
+    if not results:
+        return web.json_response({
+            "found": False,
+            "error": f"Клиент с email '{query}' не найден в базе",
+            "clients": []
+        })
+
+    # Генерируем vless ссылки для найденных клиентов
+    clients_data = []
+    for item in results:
+        client = item['client']
+        inbound = item['inbound']
+
+        # Генерируем ссылку
+        vless_link = generate_vless_link(client, inbound)
+
+        clients_data.append({
+            "email": client.get('email', ''),
+            "uuid": client.get('id', ''),
+            "flow": client.get('flow', ''),
+            "inbound_tag": inbound.get('tag', ''),
+            "vless_link": vless_link,
+            "subscription_url": f"https://zov-gor.ru/sub/{client.get('id', '')}"
+        })
+
+    return web.json_response({
+        "found": True,
+        "count": len(clients_data),
+        "query": query,
+        "clients": clients_data
+    })
+
+
+async def api_migrate_client(request):
+    """
+    API: Миграция клиента из старой базы X-UI
+    Ищет клиента по старому ключу/UUID в бэкапе, создаёт нового клиента с теми же параметрами
+    """
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    vless_link = data.get("key", data.get("vless_link", "")).strip()
+
+    if not vless_link:
+        return web.json_response({"error": "Укажите VLESS ключ"}, status=400)
+
+    if not vless_link.startswith("vless://"):
+        return web.json_response({"error": "Неверный формат ключа. Должен начинаться с vless://"}, status=400)
+
+    # Парсим UUID из ключа
+    try:
+        link_without_proto = vless_link[8:]
+        if '@' in link_without_proto:
+            uuid_part = link_without_proto.split('@')[0]
+        else:
+            return web.json_response({"error": "Неверный формат ключа: отсутствует UUID"}, status=400)
+    except Exception as e:
+        return web.json_response({"error": f"Ошибка парсинга ключа: {str(e)}"}, status=400)
+
+    # Ищем клиента в старом бэкапе
+    old_client = find_client_in_old_backup(uuid_part)
+
+    if not old_client:
+        return web.json_response({
+            "error": "Клиент не найден в старой базе",
+            "uuid": uuid_part[:8] + "...",
+            "hint": "Возможно, ключ от другого сервера или уже был перенесён"
+        }, status=404)
+
+    # Проверяем что xui_client доступен
+    if not xui_client:
+        return web.json_response({"error": "XUI клиент не инициализирован"}, status=500)
+
+    # Вычисляем оставшееся время подписки
+    import time
+    from datetime import datetime, timedelta
+
+    expiry_time_ms = old_client.get('expiryTime', 0)
+
+    # Если срок <= 0 или в прошлом - ставим 30 дней по умолчанию
+    if expiry_time_ms <= 0:
+        # Безлимит или не установлено - ставим 1 год
+        days_left = 365
+        expiry_date = datetime.now() + timedelta(days=365)
+    else:
+        expiry_timestamp = expiry_time_ms / 1000
+        expiry_date = datetime.fromtimestamp(expiry_timestamp)
+        now = datetime.now()
+
+        if expiry_date > now:
+            days_left = (expiry_date - now).days + 1
+        else:
+            # Подписка истекла - даём 7 дней
+            days_left = 7
+            expiry_date = now + timedelta(days=7)
+
+    # Получаем данные клиента
+    client_email = old_client.get('email', '')
+    limit_ip = old_client.get('limitIp', 2)
+    if limit_ip <= 0:
+        limit_ip = 2  # Минимум 2 устройства
+
+    # Создаём нового клиента через XUI API
+    try:
+        # Используем inbound_id = 1 (новый сервер)
+        inbound_id = 1
+
+        result = await xui_client.add_client(
+            inbound_id=inbound_id,
+            email=client_email,
+            phone="",  # Нет телефона при миграции
+            expire_days=days_left,
+            ip_limit=limit_ip
+        )
+
+        if result and result.get('client_id'):
+            new_uuid = result.get('client_id', '')
+
+            # Генерируем VLESS ссылку
+            new_vless_link = await xui_client.get_client_link(inbound_id, client_email)
+
+            # Заменяем IP на домен
+            if new_vless_link:
+                new_vless_link = xui_client.replace_ip_with_domain(new_vless_link, 'raphaelvpn.ru', 443)
+
+            return web.json_response({
+                "success": True,
+                "message": f"Клиент {client_email} успешно перенесён!",
+                "old_client": {
+                    "email": old_client.get('email'),
+                    "uuid": old_client.get('uuid', '')[:8] + "...",
+                    "expiry": expiry_date.strftime("%Y-%m-%d"),
+                    "limitIp": old_client.get('limitIp', 2)
+                },
+                "new_client": {
+                    "email": client_email,
+                    "uuid": new_uuid[:8] + "..." if new_uuid else "N/A",
+                    "days": days_left,
+                    "limitIp": limit_ip,
+                    "vless_link": new_vless_link,
+                    "subscription_url": f"https://zov-gor.ru:8080/sub/{new_uuid}" if new_uuid else None
+                }
+            })
+        elif result and result.get('error'):
+            error_msg = result.get('message', 'Неизвестная ошибка')
+            if result.get('is_duplicate'):
+                return web.json_response({
+                    "error": f"Клиент с таким именем уже существует: {client_email}",
+                    "hint": "Возможно, вы уже переносили этот ключ ранее"
+                }, status=409)
+            return web.json_response({
+                "error": f"Ошибка создания клиента: {error_msg}",
+                "old_client": {
+                    "email": old_client.get('email'),
+                    "uuid": old_client.get('uuid', '')[:8] + "..."
+                }
+            }, status=500)
+        else:
+            return web.json_response({
+                "error": "Не удалось создать клиента. Попробуйте позже.",
+                "old_client": {
+                    "email": old_client.get('email'),
+                    "uuid": old_client.get('uuid', '')[:8] + "..."
+                }
+            }, status=500)
+
+    except Exception as e:
+        logger.error(f"Ошибка миграции клиента: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.json_response({"error": f"Ошибка миграции: {str(e)}"}, status=500)
+
+
+async def api_search_old_clients(request):
+    """
+    API: Поиск клиентов в старой базе по email/телефону
+    """
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    query = data.get("query", "").strip()
+
+    if not query:
+        return web.json_response({"error": "Укажите email или номер телефона"}, status=400)
+
+    if len(query) < 3:
+        return web.json_response({"error": "Минимум 3 символа для поиска"}, status=400)
+
+    results = search_client_in_old_backup(query)
+
+    if not results:
+        return web.json_response({
+            "found": False,
+            "query": query,
+            "clients": []
+        })
+
+    # Форматируем результаты
+    from datetime import datetime
+    clients_data = []
+    for client in results[:20]:  # Максимум 20 результатов
+        expiry_ms = client.get('expiryTime', 0)
+        if expiry_ms > 0:
+            expiry_date = datetime.fromtimestamp(expiry_ms / 1000).strftime("%Y-%m-%d")
+        else:
+            expiry_date = "Безлимит"
+
+        clients_data.append({
+            "email": client.get('email', ''),
+            "uuid": client.get('uuid', ''),
+            "expiry": expiry_date,
+            "limitIp": client.get('limitIp', 2),
+            "enable": client.get('enable', True)
+        })
+
+    return web.json_response({
+        "found": True,
+        "count": len(clients_data),
+        "query": query,
+        "clients": clients_data
+    })
+
+
 def load_servers_config():
     """Загрузить конфигурацию серверов"""
     servers_file = BASE_DIR / 'servers_config.json'
@@ -555,6 +958,160 @@ def find_all_client_keys(uuid_str):
                 break
 
     return results
+
+
+def find_client_by_email(email_query):
+    """Найти клиента по email (точное или частичное совпадение, включая поиск по цифрам телефона)"""
+    import re
+    config = load_xray_config()
+    if not config:
+        return []
+
+    results = []
+    email_query_lower = email_query.lower().strip()
+
+    # Если запрос состоит только из цифр - это поиск по телефону
+    query_digits = re.sub(r'[^\d]', '', email_query)
+    is_phone_search = len(query_digits) >= 7
+
+    for inbound in config.get('inbounds', []):
+        settings = inbound.get('settings') or {}
+        clients = settings.get('clients') or []
+
+        for client in clients:
+            client_email = client.get('email', '').lower()
+
+            # Точное совпадение или частичное по строке
+            if client_email == email_query_lower or email_query_lower in client_email:
+                results.append({
+                    'client': client,
+                    'inbound': inbound
+                })
+                continue
+
+            # Поиск по цифрам телефона
+            if is_phone_search:
+                client_digits = re.sub(r'[^\d]', '', client_email)
+                # Совпадение по последним N цифрам
+                if len(client_digits) >= 10 and len(query_digits) >= 7:
+                    if client_digits[-10:] == query_digits[-10:] or query_digits in client_digits:
+                        results.append({
+                            'client': client,
+                            'inbound': inbound
+                        })
+
+    return results
+
+
+def find_client_in_old_backup(uuid_str):
+    """
+    Найти клиента по UUID в старой резервной копии X-UI
+    Возвращает данные клиента: email, expiryTime, limitIp
+    """
+    import sqlite3
+
+    if not OLD_XUI_BACKUP.exists():
+        logger.error(f"Файл бэкапа не найден: {OLD_XUI_BACKUP}")
+        return None
+
+    try:
+        conn = sqlite3.connect(OLD_XUI_BACKUP)
+        cursor = conn.cursor()
+
+        # Получаем settings из inbounds
+        cursor.execute("SELECT settings FROM inbounds WHERE id = 12")
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        settings = json.loads(row[0])
+        clients = settings.get('clients', [])
+
+        # Ищем клиента по UUID
+        for client in clients:
+            if client.get('id') == uuid_str:
+                return {
+                    'email': client.get('email', ''),
+                    'uuid': client.get('id', ''),
+                    'expiryTime': client.get('expiryTime', 0),
+                    'limitIp': client.get('limitIp', 2),
+                    'flow': client.get('flow', ''),
+                    'enable': client.get('enable', True),
+                    'totalGB': client.get('totalGB', 0)
+                }
+
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска в старом бэкапе: {e}")
+        return None
+
+
+def search_client_in_old_backup(search_term):
+    """
+    Поиск клиента в старом бэкапе по email или номеру телефона
+    """
+    import sqlite3
+    import re
+
+    if not OLD_XUI_BACKUP.exists():
+        logger.error(f"Файл бэкапа не найден: {OLD_XUI_BACKUP}")
+        return []
+
+    try:
+        conn = sqlite3.connect(OLD_XUI_BACKUP)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT settings FROM inbounds WHERE id = 12")
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return []
+
+        settings = json.loads(row[0])
+        clients = settings.get('clients', [])
+
+        results = []
+        search_lower = search_term.lower().strip()
+        search_digits = re.sub(r'[^\d]', '', search_term)
+        is_phone_search = len(search_digits) >= 7
+
+        for client in clients:
+            client_email = client.get('email', '').lower()
+
+            # Точное или частичное совпадение по email
+            if search_lower in client_email or client_email == search_lower:
+                results.append({
+                    'email': client.get('email', ''),
+                    'uuid': client.get('id', ''),
+                    'expiryTime': client.get('expiryTime', 0),
+                    'limitIp': client.get('limitIp', 2),
+                    'flow': client.get('flow', ''),
+                    'enable': client.get('enable', True),
+                    'totalGB': client.get('totalGB', 0)
+                })
+                continue
+
+            # Поиск по цифрам телефона
+            if is_phone_search:
+                client_digits = re.sub(r'[^\d]', '', client_email)
+                if len(client_digits) >= 7 and (search_digits in client_digits or client_digits in search_digits):
+                    results.append({
+                        'email': client.get('email', ''),
+                        'uuid': client.get('id', ''),
+                        'expiryTime': client.get('expiryTime', 0),
+                        'limitIp': client.get('limitIp', 2),
+                        'flow': client.get('flow', ''),
+                        'enable': client.get('enable', True),
+                        'totalGB': client.get('totalGB', 0)
+                    })
+
+        return results
+    except Exception as e:
+        logger.error(f"Ошибка поиска в старом бэкапе: {e}")
+        return []
 
 
 def generate_vless_link_for_server(uuid, email, server_config, inbound_name='main'):
@@ -618,15 +1175,14 @@ def generate_vless_link(client, inbound):
         reality = stream.get('realitySettings') or {}
         server_names = reality.get('serverNames', [])
         short_ids = reality.get('shortIds', [])
-        private_key = reality.get('privateKey', '')
 
         if server_names:
             params.append(f"sni={server_names[0]}")
 
-        if private_key:
-            public_key = generate_public_key(private_key)
-            if public_key:
-                params.append(f"pbk={public_key}")
+        # Получаем публичный ключ из settings (X-UI хранит его там)
+        public_key = get_reality_public_key(reality)
+        if public_key:
+            params.append(f"pbk={public_key}")
 
         if short_ids:
             params.append(f"sid={short_ids[0]}")
@@ -808,6 +1364,9 @@ async def create_webapp():
     app.router.add_post('/api/confirm', api_confirm_payment)
     app.router.add_get('/api/order/{order_id}', api_order_status)
     app.router.add_post('/api/fix-key', api_fix_key)
+    app.router.add_post('/api/find-key', api_find_key)
+    app.router.add_post('/api/migrate-client', api_migrate_client)
+    app.router.add_post('/api/search-old-clients', api_search_old_clients)
 
     # Subscription endpoints
     app.router.add_get('/sub/{client_id}', subscription_handler)
@@ -822,16 +1381,27 @@ async def create_webapp():
     return app
 
 
-async def start_webapp_server(host='0.0.0.0', port=9090):
+async def start_webapp_server(host='0.0.0.0', port=9090, ssl_cert=None, ssl_key=None):
     """Запуск веб-сервера"""
+    import ssl as ssl_module
+
     app = await create_webapp()
     runner = web.AppRunner(app)
     await runner.setup()
 
-    site = web.TCPSite(runner, host, port)
+    ssl_context = None
+    if ssl_cert and ssl_key:
+        import os
+        if os.path.exists(ssl_cert) and os.path.exists(ssl_key):
+            ssl_context = ssl_module.create_default_context(ssl_module.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(ssl_cert, ssl_key)
+            logger.info(f"SSL enabled with cert: {ssl_cert}")
+
+    site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
     await site.start()
 
-    logger.info(f"WebApp server started on http://{host}:{port}")
+    protocol = "https" if ssl_context else "http"
+    logger.info(f"WebApp server started on {protocol}://{host}:{port}")
 
     return runner
 

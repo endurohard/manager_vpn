@@ -618,7 +618,18 @@
         <div class="tab-content" id="fix-key-tab" style="display: none;">
             <div class="section-title"><i class="fa fa-wrench" aria-hidden="true"></i> Исправить ключ</div>
 
-            <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+            <!-- Переключатель режимов -->
+            <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                <button id="mode-fix-btn" class="button" style="flex: 1; padding: 12px; background: var(--accent-primary);">
+                    <i class="fa fa-magic"></i> Исправить
+                </button>
+                <button id="mode-migrate-btn" class="button" style="flex: 1; padding: 12px; background: var(--secondary-bg); color: var(--text-primary);">
+                    <i class="fa fa-exchange-alt"></i> Перенести
+                </button>
+            </div>
+
+            <!-- Режим исправления -->
+            <div id="fix-mode-panel" style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
                 <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-key"></i> Введите ваш ключ</h3>
                 <p style="opacity: 0.8; margin-bottom: 15px; font-size: 14px;">
                     Если ваш ключ перестал работать, вставьте его сюда. Система проверит его по базе данных и выдаст исправленную версию.
@@ -630,6 +641,72 @@
                 <button id="fix-key-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px;">
                     <i class="fa fa-magic"></i> Исправить ключ
                 </button>
+            </div>
+
+            <!-- Режим миграции -->
+            <div id="migrate-mode-panel" style="display: none; background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                <h3 style="margin-top: 0; color: var(--accent-primary);"><i class="fa fa-exchange-alt"></i> Перенос со старого сервера</h3>
+                <p style="opacity: 0.8; margin-bottom: 15px; font-size: 14px;">
+                    Если у вас был ключ со старого сервера, вставьте его сюда. Система найдёт вашу подписку и создаст новый ключ с сохранением срока действия.
+                </p>
+                <div style="margin-bottom: 15px;">
+                    <textarea id="migrate-key-input" placeholder="vless://... (старый ключ)"
+                              style="width: 100%; height: 100px; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--secondary-bg); color: var(--text-primary); font-size: 14px; box-sizing: border-box; resize: vertical; font-family: monospace;"></textarea>
+                </div>
+                <button id="migrate-key-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px; background: #17a2b8;">
+                    <i class="fa fa-rocket"></i> Перенести ключ
+                </button>
+            </div>
+
+            <!-- Результат миграции -->
+            <div id="migrate-result" style="display: none;">
+                <div style="background: var(--section-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px;">
+                    <h3 style="margin-top: 0; color: #28a745;"><i class="fa fa-check-circle"></i> Ключ успешно перенесён!</h3>
+
+                    <!-- Информация о старом клиенте -->
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                        <h4 style="margin: 0 0 10px 0; color: #ffc107;"><i class="fa fa-history"></i> Старая подписка</h4>
+                        <p style="margin: 0; font-size: 14px;"><strong>Имя:</strong> <span id="migrate-old-email"></span></p>
+                        <p style="margin: 5px 0 0 0; font-size: 14px;"><strong>Срок до:</strong> <span id="migrate-old-expiry"></span></p>
+                    </div>
+
+                    <!-- Информация о новом клиенте -->
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                        <h4 style="margin: 0 0 10px 0; color: #28a745;"><i class="fa fa-star"></i> Новая подписка</h4>
+                        <p style="margin: 0; font-size: 14px;"><strong>Дней осталось:</strong> <span id="migrate-new-days"></span></p>
+                        <p style="margin: 5px 0 0 0; font-size: 14px;"><strong>Устройств:</strong> <span id="migrate-new-limit"></span></p>
+                    </div>
+
+                    <!-- Новый ключ -->
+                    <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                        <textarea id="migrate-new-key" readonly
+                                  style="width: 100%; height: 80px; border: none; background: transparent; color: var(--text-primary); font-size: 12px; resize: none; box-sizing: border-box; font-family: monospace;"></textarea>
+                    </div>
+
+                    <div id="migrate-qr" style="background: white; padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center;">
+                        <div id="migrate-qr-code" style="display: inline-block;"></div>
+                    </div>
+
+                    <button id="copy-migrate-key-btn" class="button" style="width: 100%; padding: 15px; font-size: 16px; background: #28a745;">
+                        <i class="fa fa-copy"></i> Скопировать ключ
+                    </button>
+
+                    <!-- Подписка -->
+                    <div id="migrate-subscription-block" style="margin-top: 15px; background: var(--secondary-bg); padding: 15px; border-radius: 8px;">
+                        <p style="margin: 0 0 10px 0; font-size: 14px; color: var(--accent-primary);"><i class="fa fa-sync"></i> Ссылка подписки</p>
+                        <input type="text" id="migrate-subscription-url" readonly style="width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--section-bg); color: var(--text-primary); font-size: 12px; box-sizing: border-box;">
+                        <button id="copy-migrate-sub-btn" class="button" style="margin-top: 10px; padding: 10px 20px; background: var(--accent-primary);">
+                            <i class="fa fa-copy"></i> Скопировать подписку
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Ошибка миграции -->
+            <div id="migrate-error" style="display: none; background: #f8d7da; color: #721c24; padding: 20px; border-radius: 12px; border-left: 4px solid #f5c6cb; margin-bottom: 15px;">
+                <h3 style="margin-top: 0;"><i class="fa fa-exclamation-triangle"></i> Ошибка</h3>
+                <p id="migrate-error-text" style="margin: 0;"></p>
+                <p id="migrate-error-hint" style="margin: 10px 0 0 0; opacity: 0.8; font-size: 13px;"></p>
             </div>
 
             <!-- Результат исправления -->
@@ -680,7 +757,7 @@
         <div style="background: var(--section-bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; text-align: center;">
             <i class="fa fa-globe" style="margin-right: 8px;"></i> <strong>Открыть в браузере:</strong>
             <br>
-            <a href="https://www.zov-gor.ru" target="_blank" style="color: var(--accent-primary); font-size: 16px;">www.zov-gor.ru</a>
+            <a href="https://zov-gor.ru:8080" target="_blank" style="color: var(--accent-primary); font-size: 16px;">zov-gor.ru:8080</a>
         </div>
 
         <div class="support-link">
@@ -691,6 +768,6 @@
         </div>
     </div>
 
-    <script src="static/js/script.js?v=8"></script>
+    <script src="static/js/script.js?v=9"></script>
 </body>
 </html>
