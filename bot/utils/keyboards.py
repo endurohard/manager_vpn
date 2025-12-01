@@ -311,6 +311,7 @@ class Keyboards:
         # Добавляем специальные опции для админа
         buttons.append([InlineKeyboardButton(text="🆓 Бесплатно", callback_data="ext_period_free")])
         buttons.append([InlineKeyboardButton(text="💵 Своя цена", callback_data="ext_period_custom")])
+        buttons.append([InlineKeyboardButton(text="📅 Указать вручную", callback_data="ext_period_manual")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="ext_cancel")])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 

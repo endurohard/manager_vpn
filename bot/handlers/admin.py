@@ -93,6 +93,7 @@ class ExternalKeyStates(StatesGroup):
     waiting_for_period = State()
     waiting_for_custom_days = State()
     waiting_for_custom_price = State()
+    waiting_for_manual_period = State()  # Ручной ввод даты или дней
     waiting_for_phone = State()
     confirming = State()
 
@@ -2534,6 +2535,20 @@ async def select_external_period(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    # Обработка ручного ввода даты/дней
+    if period_key == "manual":
+        await state.set_state(ExternalKeyStates.waiting_for_manual_period)
+        await callback.message.edit_text(
+            "📅 <b>Ручной ввод срока</b>\n\n"
+            "Введите срок одним из способов:\n"
+            "• Количество дней (например: <code>90</code>)\n"
+            "• Дату окончания (например: <code>31.12.2025</code>)\n\n"
+            "Формат даты: ДД.ММ.ГГГГ",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
     periods = get_subscription_periods()
 
     if period_key not in periods:
@@ -2568,8 +2583,8 @@ async def process_external_custom_days(message: Message, state: FSMContext):
     """Обработка количества дней для бесплатного/своего ключа"""
     try:
         days = int(message.text.strip())
-        if days <= 0 or days > 365:
-            await message.answer("❌ Введите число от 1 до 365")
+        if days <= 0:
+            await message.answer("❌ Количество дней должно быть больше 0")
             return
     except ValueError:
         await message.answer("❌ Введите число (количество дней)")
@@ -2635,6 +2650,64 @@ async def process_external_custom_price(message: Message, state: FSMContext):
     )
 
 
+@router.message(ExternalKeyStates.waiting_for_manual_period)
+async def process_external_manual_period(message: Message, state: FSMContext):
+    """Обработка ручного ввода срока (дней или даты)"""
+    from datetime import datetime, date
+
+    text = message.text.strip()
+    days = None
+    period_name = None
+
+    # Пробуем распарсить как число (дни)
+    try:
+        days = int(text)
+        if days <= 0:
+            await message.answer("❌ Количество дней должно быть больше 0")
+            return
+        period_name = f"{days} дн."
+    except ValueError:
+        # Пробуем распарсить как дату
+        try:
+            # Формат ДД.ММ.ГГГГ
+            end_date = datetime.strptime(text, "%d.%m.%Y").date()
+            today = date.today()
+
+            if end_date <= today:
+                await message.answer("❌ Дата должна быть в будущем")
+                return
+
+            days = (end_date - today).days
+            period_name = f"до {text}"
+        except ValueError:
+            await message.answer(
+                "❌ Неверный формат.\n\n"
+                "Введите:\n"
+                "• Число дней (например: <code>90</code>)\n"
+                "• Или дату в формате ДД.ММ.ГГГГ (например: <code>31.12.2025</code>)",
+                parse_mode="HTML"
+            )
+            return
+
+    await state.update_data(
+        selected_period_days=days,
+        selected_period_name=period_name,
+        selected_period_price=0  # По умолчанию бесплатно для ручного ввода
+    )
+    await state.set_state(ExternalKeyStates.waiting_for_phone)
+
+    data = await state.get_data()
+    server_name = data.get('ext_server_name', 'Внешний сервер')
+
+    await message.answer(
+        f"📅 <b>{server_name}</b>\n\n"
+        f"📅 Срок: <b>{period_name}</b> ({days} дней)\n"
+        f"💰 Цена: <b>0 ₽</b> (бесплатно)\n\n"
+        f"Теперь введите номер телефона или ID клиента:",
+        parse_mode="HTML"
+    )
+
+
 @router.message(ExternalKeyStates.waiting_for_phone)
 async def process_external_phone(message: Message, state: FSMContext):
     """Обработка номера телефона для внешнего сервера"""
@@ -2659,10 +2732,10 @@ async def process_external_phone(message: Message, state: FSMContext):
 
     data = await state.get_data()
 
-    # Генерируем email для клиента
+    # Генерируем email для клиента (только телефон, без суффиксов)
     import re
     clean_phone = re.sub(r'[^\w\d]', '', phone)
-    client_email = f"ext_{clean_phone}_{data.get('selected_period_days')}d"
+    client_email = clean_phone
     await state.update_data(client_email=client_email)
 
     text = f"🌍 <b>ПОДТВЕРЖДЕНИЕ СОЗДАНИЯ КЛЮЧА</b>\n\n"

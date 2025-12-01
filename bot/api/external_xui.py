@@ -479,7 +479,7 @@ EXTERNAL_SERVER_CONFIG = {
     "username": "itadmin",
     "password": "20TQNF_Srld",
     "server_name": "External Server",
-    "server_address": "38.180.205.196",
+    "server_address": "lte.vpnpulse.ru",  # Домен вместо IP для VLESS ссылок
     "server_port": 443
 }
 
