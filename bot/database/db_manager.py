@@ -53,6 +53,21 @@ class DatabaseManager:
             except:
                 pass  # Колонка уже существует
 
+            # Таблица замен ключей (без цены)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS key_replacements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manager_id INTEGER,
+                    client_email TEXT,
+                    phone_number TEXT,
+                    period TEXT,
+                    expire_days INTEGER,
+                    client_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (manager_id) REFERENCES managers (user_id)
+                )
+            ''')
+
             await db.commit()
 
     async def add_manager(self, user_id: int, username: str, full_name: str, added_by: int) -> bool:
@@ -207,7 +222,7 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                '''SELECT client_email, phone_number, period, created_at
+                '''SELECT client_email, phone_number, period, created_at, expire_days
                    FROM keys_history
                    WHERE manager_id = ?
                    ORDER BY created_at DESC
@@ -591,6 +606,99 @@ class DatabaseManager:
                    ORDER BY k.created_at DESC
                    LIMIT ?''',
                 (search_pattern, search_pattern, limit)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    # ==================== МЕТОДЫ ДЛЯ ЗАМЕНЫ КЛЮЧЕЙ ====================
+
+    async def add_key_replacement(self, manager_id: int, client_email: str, phone_number: str,
+                                   period: str, expire_days: int, client_id: str) -> bool:
+        """Добавить запись о замене ключа"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    '''INSERT INTO key_replacements
+                       (manager_id, client_email, phone_number, period, expire_days, client_id)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (manager_id, client_email, phone_number, period, expire_days, client_id)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error adding key replacement: {e}")
+            return False
+
+    async def get_replacement_stats(self, manager_id: int) -> Dict:
+        """Получить статистику замен менеджера"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Общее количество замен
+            cursor = await db.execute(
+                'SELECT COUNT(*) as total FROM key_replacements WHERE manager_id = ?',
+                (manager_id,)
+            )
+            total = (await cursor.fetchone())[0]
+
+            # Замены за сегодня
+            cursor = await db.execute(
+                '''SELECT COUNT(*) as today FROM key_replacements
+                   WHERE manager_id = ? AND DATE(created_at) = DATE('now')''',
+                (manager_id,)
+            )
+            today = (await cursor.fetchone())[0]
+
+            # Замены за месяц
+            cursor = await db.execute(
+                '''SELECT COUNT(*) as month FROM key_replacements
+                   WHERE manager_id = ? AND DATE(created_at) >= DATE('now', '-30 days')''',
+                (manager_id,)
+            )
+            month = (await cursor.fetchone())[0]
+
+            return {
+                'total': total,
+                'today': today,
+                'month': month
+            }
+
+    async def get_all_replacement_stats(self) -> Dict:
+        """Получить общую статистику по всем заменам"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Общее количество замен
+            cursor = await db.execute('SELECT COUNT(*) as total FROM key_replacements')
+            total = (await cursor.fetchone())[0]
+
+            # Замены за сегодня
+            cursor = await db.execute(
+                '''SELECT COUNT(*) as today FROM key_replacements
+                   WHERE DATE(created_at) = DATE('now')'''
+            )
+            today = (await cursor.fetchone())[0]
+
+            # Замены за месяц
+            cursor = await db.execute(
+                '''SELECT COUNT(*) as month FROM key_replacements
+                   WHERE DATE(created_at) >= DATE('now', '-30 days')'''
+            )
+            month = (await cursor.fetchone())[0]
+
+            return {
+                'total': total,
+                'today': today,
+                'month': month
+            }
+
+    async def get_replacement_history(self, manager_id: int, limit: int = 10) -> List[Dict]:
+        """Получить историю замен ключей менеджера"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                '''SELECT client_email, phone_number, period, created_at, expire_days
+                   FROM key_replacements
+                   WHERE manager_id = ?
+                   ORDER BY created_at DESC
+                   LIMIT ?''',
+                (manager_id, limit)
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

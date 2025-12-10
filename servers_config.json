@@ -6,6 +6,7 @@
       "ip": "185.128.104.219",
       "port": 443,
       "enabled": true,
+      "active_for_new": false,
       "local": true,
       "description": "Основной сервер",
       "inbounds": {
@@ -14,7 +15,7 @@
           "sni": "sun6-21.userapi.com",
           "pbk": "Y8_zzWnZuBehpWXbyN6ZkPw9DUUwqoAkaBFuaTUW7gw",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "📶 LTE - Все операторы"
         },
@@ -23,7 +24,7 @@
           "sni": "appldnld.apple.com",
           "pbk": "K-bMKKspPy47oFqs81DR6NftQq_H1Sa2s6VzhMWiOTA",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "🍎 Megafon 3"
         },
@@ -32,7 +33,7 @@
           "sni": "yandex.com.tr",
           "pbk": "4gKuvX-wKOXNIZmTtKhqA4TRlJwkfu_GasIr3JRTDBk",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "🇹🇷 Megafon 4"
         },
@@ -41,7 +42,7 @@
           "sni": "yandex.fi",
           "pbk": "rGMC2j5fdWn2LkPPwRxWopdoc9faFycvewDw7QazA3M",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "🇫🇮 Megafon 5"
         }
@@ -53,6 +54,7 @@
       "ip": "85.239.151.89",
       "port": 443,
       "enabled": true,
+      "active_for_new": false,
       "local": false,
       "description": "Резервный сервер",
       "ssh": {
@@ -65,7 +67,7 @@
           "sni": "m.vk.com",
           "pbk": "z_b2JzFsH3bPOmbRRybh6Yw0vaaZdG8SqGqud1cIcH0",
           "sid": "0d899b231d",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "🇳🇱 Резервный"
         },
@@ -74,7 +76,7 @@
           "sni": "yandex.ru",
           "pbk": "4ZScXltZg-6xW_Shhx0AMqSrBMbEXXMwEjoC8GJ8tTY",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "📶 LTE-Megafon"
         },
@@ -83,9 +85,38 @@
           "sni": "www.cloudflare.com",
           "pbk": "YnYd6vc2Pi7JDe8CfpnY03qXH2p4dckV8wAoQXhe6yE",
           "sid": "0e",
-          "flow": "xtls-rprx-vision",
+          "flow": "",
           "fp": "chrome",
           "name_prefix": "📶 Megafon 2"
+        }
+      }
+    },
+    {
+      "name": "Germany",
+      "domain": "www.peakvip.ru",
+      "ip": "80.76.43.74",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер Germany",
+      "panel": {
+        "url": "https://80.76.43.74:1020/AMYmhoyf5gRI0qS",
+        "port": 1020,
+        "path": "/AMYmhoyf5gRI0qS",
+        "username": "itadmin",
+        "password": "5TQNF_Srld"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "p01-content.icloud.com",
+          "pbk": "HXNuA3woMvkSZbrJ2qiuKSwI2mksCvb1owrWHYuE4Uo",
+          "sid": "2672b3",
+          "flow": "",
+          "fp": "chrome",
+          "name_prefix": "🇩🇪 Germany"
         }
       }
     }

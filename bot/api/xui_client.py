@@ -220,6 +220,7 @@ class XUIClient:
                         expire_days: int, ip_limit: int = 2, max_retries: int = 3) -> Optional[Dict]:
         """
         Добавить клиента (создать ключ VLESS) с автоматическим переподключением
+        Учитывает настройку active_for_new для серверов
 
         :param inbound_id: ID inbound
         :param email: Email клиента (будет использоваться номер телефона)
@@ -235,6 +236,12 @@ class XUIClient:
         # Вычисляем время истечения в миллисекундах
         expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
+        # Проверяем, активен ли локальный сервер для новых подписок
+        from bot.api.remote_xui import load_servers_config
+        servers_config = load_servers_config()
+        local_server = next((s for s in servers_config.get('servers', []) if s.get('local')), None)
+        local_active = local_server.get('active_for_new', True) if local_server else True
+
         # Настройки клиента
         client_settings = {
             "clients": [{
@@ -247,33 +254,126 @@ class XUIClient:
                 "enable": True,
                 "tgId": phone,
                 "subId": "",
-                "flow": "xtls-rprx-vision"  # XTLS Vision для Reality
+                "flow": ""  # Пустой flow для совместимости
+            }]
+        }
+
+        # Создаём клиента на локальном сервере только если он активен
+        local_created = False
+        if local_active:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Проверяем авторизацию
+                    if not await self._ensure_logged_in():
+                        logger.error("Не удалось авторизоваться для создания клиента")
+                        break
+
+                    url = f"{self.host}/panel/api/inbounds/addClient"
+                    payload = {
+                        "id": inbound_id,
+                        "settings": json.dumps(client_settings)
+                    }
+
+                    async with self.session.post(url, json=payload) as response:
+                        logger.info(f"Создание клиента на локальном сервере, статус: {response.status}")
+
+                        if response.status == 200:
+                            content_type = response.headers.get('Content-Type', '')
+                            if 'application/json' not in content_type:
+                                logger.warning(f"Получен ответ с Content-Type: {content_type}. Сессия истекла.")
+                                self.session_cookie = None
+                                if attempt < max_retries:
+                                    await asyncio.sleep(1)
+                                    continue
+                                break
+
+                            try:
+                                data = await response.json()
+                                if data.get('success'):
+                                    logger.info(f"Клиент {email} создан на локальном сервере")
+                                    await self.restart_xray()
+                                    local_created = True
+                                    break
+                                else:
+                                    error_msg = data.get('msg', 'Unknown error')
+                                    if "Duplicate email" in error_msg:
+                                        return {"error": True, "message": error_msg, "is_duplicate": True}
+                                    logger.warning(f"Ошибка создания на локальном: {error_msg}")
+                                    break
+                            except:
+                                self.session_cookie = None
+                                if attempt < max_retries:
+                                    await asyncio.sleep(1)
+                                    continue
+                                break
+                        elif response.status in [401, 403]:
+                            self.session_cookie = None
+                            if attempt < max_retries:
+                                await asyncio.sleep(1)
+                                continue
+                        break
+                except Exception as e:
+                    logger.error(f"Ошибка создания на локальном (попытка {attempt}): {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+        else:
+            logger.info(f"Локальный сервер отключен для новых подписок, пропускаем")
+
+        # Создаём клиента на активных удалённых серверах
+        try:
+            from bot.api.remote_xui import create_client_on_active_servers
+            remote_results = await create_client_on_active_servers(
+                client_uuid=client_id,
+                email=email,
+                expire_days=expire_days,
+                ip_limit=ip_limit
+            )
+            logger.info(f"Результаты создания на удалённых серверах: {remote_results}")
+
+            # Проверяем, создан ли клиент хотя бы на одном сервере
+            any_created = local_created or any(remote_results.values())
+            if not any_created:
+                logger.error("Клиент не создан ни на одном сервере!")
+                return None
+
+        except Exception as e:
+            logger.error(f"Ошибка создания на удалённых серверах: {e}")
+            if not local_created:
+                return None
+
+        return {
+            "client_id": client_id,
+            "email": email,
+            "phone": phone,
+            "expire_time": expire_time,
+            "ip_limit": ip_limit,
+            "local_created": local_created
+        }
+
+    async def _add_client_old_logic(self, inbound_id: int, email: str, phone: str,
+                        expire_days: int, ip_limit: int = 2, max_retries: int = 3) -> Optional[Dict]:
+        """Старая логика создания клиента (не используется)"""
+        client_id = str(uuid.uuid4())
+        expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
+        client_settings = {
+            "clients": [{
+                "id": client_id, "alterId": 0, "email": email, "limitIp": ip_limit,
+                "totalGB": 0, "expiryTime": expire_time, "enable": True,
+                "tgId": phone, "subId": "", "flow": ""
             }]
         }
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Проверяем авторизацию
                 if not await self._ensure_logged_in():
-                    logger.error("Не удалось авторизоваться для создания клиента")
                     return None
-
                 url = f"{self.host}/panel/api/inbounds/addClient"
-                payload = {
-                    "id": inbound_id,
-                    "settings": json.dumps(client_settings)
-                }
+                payload = {"id": inbound_id, "settings": json.dumps(client_settings)}
 
                 async with self.session.post(url, json=payload) as response:
-                    logger.info(f"Создание клиента, статус ответа: {response.status}")
-
                     if response.status == 200:
-                        # Проверяем Content-Type перед парсингом JSON
                         content_type = response.headers.get('Content-Type', '')
-
-                        # Если получили HTML вместо JSON - сессия истекла
                         if 'application/json' not in content_type:
-                            logger.warning(f"Получен ответ с Content-Type: {content_type} вместо JSON. Сессия истекла.")
                             self.session_cookie = None
                             if attempt < max_retries:
                                 await asyncio.sleep(1)
@@ -282,37 +382,22 @@ class XUIClient:
 
                         try:
                             data = await response.json()
-                            logger.info(f"Ответ при создании клиента: {data}")
-
                             if data.get('success'):
-                                logger.info(f"Клиент {email} успешно создан")
-                                # Перезапускаем xray для применения изменений конфига
                                 await self.restart_xray()
-
-                                # Создаём клиента на всех удалённых серверах
                                 try:
                                     from bot.api.remote_xui import create_client_on_all_remote_servers
-                                    remote_results = await create_client_on_all_remote_servers(
-                                        client_uuid=client_id,
-                                        email=email,
-                                        expire_days=expire_days,
-                                        ip_limit=ip_limit
+                                    await create_client_on_all_remote_servers(
+                                        client_uuid=client_id, email=email,
+                                        expire_days=expire_days, ip_limit=ip_limit
                                     )
-                                    logger.info(f"Результаты создания на удалённых серверах: {remote_results}")
                                 except Exception as e:
-                                    logger.error(f"Ошибка создания на удалённых серверах: {e}")
-
+                                    logger.error(f"Ошибка на удалённых: {e}")
                                 return {
-                                    "client_id": client_id,
-                                    "email": email,
-                                    "phone": phone,
-                                    "expire_time": expire_time,
-                                    "ip_limit": ip_limit
+                                    "client_id": client_id, "email": email, "phone": phone,
+                                    "expire_time": expire_time, "ip_limit": ip_limit
                                 }
                             else:
                                 error_msg = data.get('msg', 'Unknown error')
-                                logger.warning(f"Не удалось создать клиента: {error_msg}")
-                                # Возвращаем информацию об ошибке (не retry для дубликатов)
                                 return {
                                     "error": True,
                                     "message": error_msg,
@@ -356,6 +441,73 @@ class XUIClient:
 
         logger.error(f"Не удалось создать клиента {email} после {max_retries} попыток")
         return None
+
+    async def find_client_by_uuid(self, client_uuid: str) -> Optional[dict]:
+        """
+        Найти клиента по UUID во всех inbound'ах локальной базы
+
+        :param client_uuid: UUID клиента
+        :return: Данные клиента или None
+        """
+        try:
+            # Используем локальную базу x-ui
+            import subprocess
+            result = subprocess.run([
+                'sqlite3', '/etc/x-ui/x-ui.db',
+                'SELECT settings FROM inbounds WHERE enable=1'
+            ], capture_output=True, text=True, timeout=10)
+
+            if result.returncode != 0:
+                return None
+
+            for settings_str in result.stdout.strip().split('\n'):
+                if not settings_str:
+                    continue
+                try:
+                    settings = json.loads(settings_str)
+                    for client in settings.get('clients', []):
+                        if client.get('id') == client_uuid:
+                            return client
+                except:
+                    continue
+
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка поиска клиента по UUID: {e}")
+            return None
+
+    async def find_client_by_email(self, email: str) -> Optional[dict]:
+        """
+        Найти клиента по email во всех inbound'ах локальной базы
+
+        :param email: Email клиента
+        :return: Данные клиента или None
+        """
+        try:
+            import subprocess
+            result = subprocess.run([
+                'sqlite3', '/etc/x-ui/x-ui.db',
+                'SELECT settings FROM inbounds WHERE enable=1'
+            ], capture_output=True, text=True, timeout=10)
+
+            if result.returncode != 0:
+                return None
+
+            for settings_str in result.stdout.strip().split('\n'):
+                if not settings_str:
+                    continue
+                try:
+                    settings = json.loads(settings_str)
+                    for client in settings.get('clients', []):
+                        if client.get('email') == email:
+                            return client
+                except:
+                    continue
+
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка поиска клиента по email: {e}")
+            return None
 
     async def get_client_link(self, inbound_id: int, client_email: str, use_domain: str = None, max_retries: int = 3) -> Optional[str]:
         """

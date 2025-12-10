@@ -1,12 +1,16 @@
 """
 Обработчики для менеджеров (создание ключей, статистика)
 """
+import logging
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from datetime import datetime, timedelta
 
 from bot.config import ADMIN_ID, INBOUND_ID, DOMAIN
+
+logger = logging.getLogger(__name__)
 from bot.database import DatabaseManager
 from bot.api.xui_client import XUIClient
 from bot.utils import Keyboards, validate_phone, format_phone, generate_user_id, generate_qr_code, notify_admin_xui_error
@@ -31,6 +35,18 @@ class EditRealityStates(StatesGroup):
     waiting_for_dest = State()
     waiting_for_sni = State()
     confirm = State()
+
+
+class ReplaceKeyStates(StatesGroup):
+    """Состояния для замены ключа"""
+    waiting_for_phone = State()
+    waiting_for_period = State()
+    confirm = State()
+
+
+class FixKeyStates(StatesGroup):
+    """Состояния для исправления ключа"""
+    waiting_for_key = State()
 
 
 @router.message(F.text == "Создать ключ")
@@ -508,39 +524,83 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                 await state.clear()
             return
 
-        # Получаем VLESS ссылку с реальным IP сервера
-        vless_link_original = await xui_client.get_client_link(
-            inbound_id=inbound_id,  # Используем выбранный inbound
-            client_email=phone,
-            use_domain=None  # Получаем с IP сервера
-        )
+        # Проверяем, создан ли клиент локально
+        local_created = client_data.get('local_created', True)
+        client_uuid = client_data['client_id']
 
-        if not vless_link_original:
+        # Получаем VLESS ссылку
+        vless_link_for_user = None
+
+        if local_created:
+            # Если создан локально - получаем с локального сервера
+            vless_link_original = await xui_client.get_client_link(
+                inbound_id=inbound_id,
+                client_email=phone,
+                use_domain=None
+            )
+            if vless_link_original:
+                vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
+
+        # Если локально не создан или не получилось - генерируем из конфига активного сервера
+        if not vless_link_for_user:
+            from bot.api.remote_xui import load_servers_config
+            import urllib.parse
+
+            servers_config = load_servers_config()
+            # Ищем первый активный сервер
+            for server in servers_config.get('servers', []):
+                if not server.get('enabled', True):
+                    continue
+                if not server.get('active_for_new', True):
+                    continue
+
+                # Генерируем VLESS ссылку из конфига
+                main_inbound = server.get('inbounds', {}).get('main', {})
+                if main_inbound:
+                    domain = server.get('domain', server.get('ip', ''))
+                    port = server.get('port', 443)
+
+                    params = ["type=tcp", f"security={main_inbound.get('security', 'reality')}"]
+
+                    if main_inbound.get('security') == 'reality':
+                        if main_inbound.get('sni'):
+                            params.append(f"sni={main_inbound['sni']}")
+                        if main_inbound.get('pbk'):
+                            params.append(f"pbk={main_inbound['pbk']}")
+                        if main_inbound.get('sid'):
+                            params.append(f"sid={main_inbound['sid']}")
+                        params.append(f"fp={main_inbound.get('fp', 'chrome')}")
+                        if main_inbound.get('flow'):
+                            params.append(f"flow={main_inbound['flow']}")
+
+                    query = '&'.join(params)
+                    name_prefix = main_inbound.get('name_prefix', server.get('name', 'VPN'))
+                    encoded_name = urllib.parse.quote(name_prefix)
+
+                    vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
+                    break
+
+        if not vless_link_for_user:
             await callback.message.edit_text(
                 "Ключ создан, но не удалось сформировать VLESS ссылку."
             )
             return
 
-        # Создаем версию с доменом для выдачи пользователю
-        # Заменяем IP на домен и порт на 443 (так как используется парсинг портов)
-        vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
-
         # Получаем цену из данных
         period_price = data.get("period_price", 0)
 
-        # Сохраняем в базу данных (сохраняем оригинальную ссылку с IP для внутренних нужд)
+        # Сохраняем в базу данных
         await db.add_key_to_history(
             manager_id=user_id,
             client_email=phone,
             phone_number=phone,
             period=period_name,
             expire_days=period_days,
-            client_id=client_data['client_id'],
+            client_id=client_uuid,
             price=period_price
         )
 
         # Формируем ссылку подписки
-        client_uuid = client_data['client_id']
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
 
         # Генерируем QR код для ссылки с ДОМЕНОМ (для пользователя)
@@ -621,6 +681,639 @@ async def cancel_creation_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ==================== ЗАМЕНА КЛЮЧА ====================
+
+@router.message(F.text == "🔄 Замена ключа")
+async def start_replace_key(message: Message, state: FSMContext, db: DatabaseManager):
+    """Начало процесса замены ключа"""
+    user_id = message.from_user.id
+
+    # Проверка авторизации
+    if not await is_authorized(user_id, db):
+        await message.answer("У вас нет доступа к этой функции.")
+        return
+
+    await state.set_state(ReplaceKeyStates.waiting_for_phone)
+    await message.answer(
+        "🔄 <b>Замена ключа</b>\n\n"
+        "Введите:\n"
+        "• ID клиента (номер телефона или текст)\n"
+        "• Или <b>VLESS ключ</b> целиком\n\n"
+        "Примеры:\n"
+        "• +79001234567\n"
+        "• client_name_123\n"
+        "• vless://uuid@server...\n\n"
+        "Или нажмите 'Сгенерировать ID'",
+        reply_markup=Keyboards.phone_input(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(ReplaceKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
+async def generate_replacement_id(message: Message, state: FSMContext):
+    """Генерация случайного ID для замены"""
+    user_id_value = generate_user_id()
+    await state.update_data(phone=user_id_value, inbound_id=INBOUND_ID)
+    await state.set_state(ReplaceKeyStates.waiting_for_period)
+
+    await message.answer(
+        f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
+        "Выберите срок действия ключа:",
+        reply_markup=Keyboards.replacement_periods(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(ReplaceKeyStates.waiting_for_phone, F.text == "Отмена")
+async def cancel_replacement(message: Message, state: FSMContext):
+    """Отмена замены ключа"""
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+
+    await state.clear()
+    await message.answer(
+        "Замена ключа отменена.",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+
+
+@router.message(ReplaceKeyStates.waiting_for_phone)
+async def process_replacement_phone(message: Message, state: FSMContext, xui_client: XUIClient):
+    """Обработка введенного ID/номера/VLESS ключа для замены"""
+    user_input = message.text.strip()
+
+    # Проверяем, не VLESS ли это ключ
+    if user_input.startswith('vless://'):
+        # Парсим VLESS ключ
+        try:
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(user_input)
+            client_uuid = parsed.username  # UUID из ключа
+
+            # Получаем email из фрагмента (имя после #)
+            fragment = unquote(parsed.fragment) if parsed.fragment else ''
+
+            # Ищем клиента по UUID в локальной базе
+            client_info = await xui_client.find_client_by_uuid(client_uuid)
+
+            if client_info:
+                client_email = client_info.get('email', fragment or client_uuid[:8])
+                ip_limit = client_info.get('limitIp', 2)
+                expiry_time = client_info.get('expiryTime', 0)
+
+                # Вычисляем оставшиеся дни
+                if expiry_time > 0:
+                    import time
+                    remaining_ms = expiry_time - int(time.time() * 1000)
+                    remaining_days = max(0, remaining_ms // (1000 * 60 * 60 * 24))
+                else:
+                    remaining_days = 0
+
+                await state.update_data(
+                    phone=client_email,
+                    original_uuid=client_uuid,
+                    original_ip_limit=ip_limit,
+                    original_expiry=expiry_time,
+                    remaining_days=remaining_days,
+                    inbound_id=INBOUND_ID,
+                    from_vless_key=True
+                )
+                await state.set_state(ReplaceKeyStates.waiting_for_period)
+
+                await message.answer(
+                    f"🔑 <b>Найден клиент из VLESS ключа:</b>\n\n"
+                    f"🆔 Email: <code>{client_email}</code>\n"
+                    f"🔐 UUID: <code>{client_uuid[:8]}...</code>\n"
+                    f"🌐 Лимит IP: {ip_limit}\n"
+                    f"⏰ Осталось дней: {remaining_days}\n\n"
+                    f"Выберите срок действия ключа:",
+                    reply_markup=Keyboards.replacement_periods(show_original=True, remaining_days=remaining_days),
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                # Клиент не найден - используем имя из ключа
+                client_email = fragment if fragment else client_uuid[:8]
+                await state.update_data(
+                    phone=client_email,
+                    original_uuid=client_uuid,
+                    inbound_id=INBOUND_ID,
+                    from_vless_key=True
+                )
+                await state.set_state(ReplaceKeyStates.waiting_for_period)
+
+                await message.answer(
+                    f"⚠️ <b>Клиент не найден в локальной базе</b>\n\n"
+                    f"🆔 Используем имя: <code>{client_email}</code>\n"
+                    f"🔐 UUID из ключа: <code>{client_uuid[:8]}...</code>\n\n"
+                    f"Выберите срок действия <b>нового</b> ключа:",
+                    reply_markup=Keyboards.replacement_periods(),
+                    parse_mode="HTML"
+                )
+                return
+        except Exception as e:
+            await message.answer(
+                f"❌ Ошибка парсинга VLESS ключа: {str(e)[:50]}\n"
+                "Попробуйте ввести ID клиента вручную."
+            )
+            return
+
+    # Проверяем минимальную длину
+    if len(user_input) < 3:
+        await message.answer(
+            "Идентификатор слишком короткий. Минимум 3 символа.\n"
+            "Попробуйте еще раз или нажмите 'Сгенерировать ID'"
+        )
+        return
+
+    # Если это похоже на номер телефона, форматируем его
+    if validate_phone(user_input):
+        user_input = format_phone(user_input)
+
+    await state.update_data(phone=user_input, inbound_id=INBOUND_ID)
+    await state.set_state(ReplaceKeyStates.waiting_for_period)
+
+    await message.answer(
+        f"🆔 ID клиента: <code>{user_input}</code>\n\n"
+        "Выберите срок действия ключа:",
+        reply_markup=Keyboards.replacement_periods(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("replace_period_"))
+async def process_replacement_period(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора периода для замены"""
+    period_key = callback.data.replace("replace_period_", "")
+
+    data = await state.get_data()
+    phone = data.get("phone")
+    original_ip_limit = data.get("original_ip_limit", 2)
+    remaining_days = data.get("remaining_days", 0)
+
+    # Обработка выбора "оставить оригинальный"
+    if period_key == "original":
+        period_name = f"Оригинальный ({remaining_days} дн.)"
+        period_days = remaining_days
+        await state.update_data(
+            period_key="original",
+            period_name=period_name,
+            period_days=period_days,
+            use_original_expiry=True
+        )
+    else:
+        periods = get_subscription_periods()
+        if period_key not in periods:
+            await callback.answer("Ошибка выбора периода")
+            return
+
+        period_info = periods[period_key]
+        period_name = period_info["name"]
+        period_days = period_info["days"]
+        await state.update_data(
+            period_key=period_key,
+            period_name=period_name,
+            period_days=period_days,
+            use_original_expiry=False
+        )
+
+    await callback.message.edit_text(
+        f"🔄 <b>Подтверждение замены ключа:</b>\n\n"
+        f"🆔 ID клиента: <code>{phone}</code>\n"
+        f"📅 Срок действия: <b>{period_name}</b>\n"
+        f"🌐 Лимит IP: {original_ip_limit}\n"
+        f"📊 Трафик: безлимит\n\n"
+        f"❓ Создать ключ на новом сервере?",
+        reply_markup=Keyboards.confirm_key_replacement(phone, period_key),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_replacement")
+async def cancel_replacement_callback(callback: CallbackQuery, state: FSMContext):
+    """Отмена замены ключа (callback)"""
+    user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
+
+    await state.clear()
+    await callback.message.edit_text("Замена ключа отменена.")
+    await callback.message.answer(
+        "Главное меню:",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("replace_") & ~F.data.startswith("replace_period_"))
+async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
+                               xui_client: XUIClient, bot):
+    """Подтверждение и замена ключа - поиск в локальной базе, создание на удалённом сервере"""
+    user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
+
+    # Получаем данные из состояния
+    data = await state.get_data()
+    phone = data.get("phone")
+    period_name = data.get("period_name")
+    period_days = data.get("period_days")
+    original_ip_limit = data.get("original_ip_limit", 2)
+    original_expiry = data.get("original_expiry", 0)
+    use_original_expiry = data.get("use_original_expiry", False)
+
+    await callback.message.edit_text("🔄 Создание ключа на новом сервере...")
+
+    try:
+        from bot.api.remote_xui import load_servers_config
+        import urllib.parse
+        import aiohttp
+        import ssl
+        import uuid
+        import time
+
+        servers_config = load_servers_config()
+
+        # Находим активный удалённый сервер с панелью для создания ключа
+        active_server = None
+        for server in servers_config.get('servers', []):
+            if not server.get('enabled', True):
+                continue
+            if not server.get('active_for_new', True):
+                continue
+            if server.get('panel', {}).get('url'):
+                active_server = server
+                break
+
+        if not active_server:
+            await callback.message.edit_text(
+                "❌ Нет активного сервера для создания ключей.\n"
+                "Включите сервер в настройках."
+            )
+            await state.clear()
+            return
+
+        panel_config = active_server.get('panel', {})
+        panel_url = panel_config.get('url')
+        panel_user = panel_config.get('username')
+        panel_pass = panel_config.get('password')
+        main_inbound = active_server.get('inbounds', {}).get('main', {})
+        inbound_id = main_inbound.get('id', 1)
+        server_domain = active_server.get('domain', active_server.get('ip', ''))
+        server_port = active_server.get('port', 443)
+
+        # Сначала проверяем клиента в ЛОКАЛЬНОЙ базе (xui_client читает напрямую из SQLite)
+        local_client = await xui_client.find_client_by_email(phone)
+        if local_client:
+            logger.info(f"Найден клиент {phone} в локальной базе: UUID={local_client.get('id')}, expiry={local_client.get('expiryTime')}")
+            # Используем данные из локальной базы если не переданы из состояния
+            if original_ip_limit == 2 and local_client.get('limitIp'):
+                original_ip_limit = local_client.get('limitIp')
+            if original_expiry == 0 and local_client.get('expiryTime'):
+                original_expiry = local_client.get('expiryTime')
+
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Авторизация на удалённом сервере
+            login_url = f"{panel_url}/login"
+            login_data = {"username": panel_user, "password": panel_pass}
+            async with session.post(login_url, data=login_data, timeout=aiohttp.ClientTimeout(total=15)) as login_resp:
+                login_result = await login_resp.json()
+                if not login_result.get('success'):
+                    await callback.message.edit_text("❌ Ошибка авторизации в панели сервера")
+                    await state.clear()
+                    return
+
+            # Проверяем, существует ли клиент с таким email на УДАЛЁННОМ сервере
+            inbounds_url = f"{panel_url}/panel/api/inbounds/get/{inbound_id}"
+            logger.info(f"Запрос к удалённому серверу: {inbounds_url}")
+            async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                logger.info(f"Ответ от удалённого сервера: status={resp.status}")
+                if resp.status != 200:
+                    resp_text = await resp.text()
+                    logger.error(f"Ошибка получения inbound: status={resp.status}, body={resp_text[:200]}")
+                    await callback.message.edit_text(f"❌ Ошибка получения данных inbound (статус {resp.status})")
+                    await state.clear()
+                    return
+
+                inb_data = await resp.json()
+                if not inb_data.get('success'):
+                    await callback.message.edit_text("❌ Inbound не найден на сервере")
+                    await state.clear()
+                    return
+
+                inbound_obj = inb_data.get('obj', {})
+                settings = json.loads(inbound_obj.get('settings', '{}'))
+                existing_clients = settings.get('clients', [])
+
+                # Ищем клиента по email на удалённом сервере
+                existing_client = None
+                for client in existing_clients:
+                    if client.get('email') == phone:
+                        existing_client = client
+                        break
+
+            if existing_client:
+                # Клиент уже существует на удалённом сервере - возвращаем его ключ
+                client_uuid = existing_client.get('id')
+                logger.info(f"Клиент {phone} уже существует на сервере {active_server.get('name')}, UUID: {client_uuid}")
+            else:
+                # Создаём нового клиента на удалённом сервере
+                client_uuid = str(uuid.uuid4())
+
+                # Вычисляем время истечения
+                if use_original_expiry and original_expiry > 0:
+                    # Используем оригинальную дату истечения
+                    expire_time = original_expiry
+                else:
+                    # Новая дата на основе period_days
+                    expire_time = int((time.time() + period_days * 24 * 60 * 60) * 1000)
+
+                new_client = {
+                    "id": client_uuid,
+                    "flow": main_inbound.get('flow', ''),
+                    "email": phone,
+                    "limitIp": original_ip_limit,
+                    "totalGB": 0,
+                    "expiryTime": expire_time,
+                    "enable": True,
+                    "tgId": "",
+                    "subId": "",
+                    "reset": 0
+                }
+
+                add_client_data = {
+                    "id": inbound_id,
+                    "settings": json.dumps({"clients": [new_client]})
+                }
+
+                add_url = f"{panel_url}/panel/api/inbounds/addClient"
+                async with session.post(add_url, json=add_client_data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    result = await resp.json()
+                    if not result.get('success'):
+                        error_msg = result.get('msg', 'Неизвестная ошибка')
+                        await callback.message.edit_text(
+                            f"❌ Ошибка создания клиента: {error_msg}"
+                        )
+                        await state.clear()
+                        return
+
+                logger.info(f"Создан клиент {phone} на сервере {active_server.get('name')}, UUID: {client_uuid}")
+
+        # Формируем VLESS ссылку
+        params = ["type=tcp", "encryption=none", f"security={main_inbound.get('security', 'reality')}"]
+
+        if main_inbound.get('security') == 'reality':
+            if main_inbound.get('pbk'):
+                params.append(f"pbk={main_inbound['pbk']}")
+            if main_inbound.get('fp'):
+                params.append(f"fp={main_inbound['fp']}")
+            if main_inbound.get('sni'):
+                params.append(f"sni={main_inbound['sni']}")
+            if main_inbound.get('sid'):
+                params.append(f"sid={main_inbound['sid']}")
+            params.append("spx=%2F")
+
+        query = '&'.join(params)
+        name_prefix = main_inbound.get('name_prefix', active_server.get('name', 'VPN'))
+        # Добавляем email к имени
+        display_name = f"{name_prefix}-{phone[-6:]}" if len(phone) > 6 else f"{name_prefix}-{phone}"
+        encoded_name = urllib.parse.quote(display_name)
+
+        vless_link_for_user = f"vless://{client_uuid}@{server_domain}:{server_port}?{query}#{encoded_name}"
+
+        # Сохраняем в базу данных ЗАМЕН
+        await db.add_key_replacement(
+            manager_id=user_id,
+            client_email=phone,
+            phone_number=phone,
+            period=period_name,
+            expire_days=period_days,
+            client_id=client_uuid
+        )
+
+        # Формируем ссылку подписки
+        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
+        # Генерируем QR код
+        try:
+            qr_code = generate_qr_code(vless_link_for_user)
+
+            await callback.message.answer_photo(
+                BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+                caption=(
+                    f"🔄 Ключ успешно заменен!\n\n"
+                    f"🆔 ID клиента: {phone}\n"
+                    f"⏰ Срок действия: {period_name}\n"
+                    f"🌐 Лимит IP: 2\n"
+                    f"📊 Трафик: безлимит\n\n"
+                    f"📱 Отсканируйте QR код в приложении VPN"
+                )
+            )
+
+            await callback.message.answer(
+                f"📋 VLESS ключ:\n\n`{vless_link_for_user}`\n\n"
+                f"🔄 Ссылка подписки (автообновление):\n`{subscription_url}`\n\n"
+                f"💡 Скопируйте и отправьте клиенту.",
+                parse_mode="Markdown"
+            )
+
+            await callback.message.delete()
+
+        except Exception as e:
+            print(f"QR generation error: {e}")
+            await callback.message.edit_text(
+                f"🔄 Ключ успешно заменен!\n\n"
+                f"🆔 ID клиента: {phone}\n"
+                f"⏰ Срок действия: {period_name}\n"
+                f"🌐 Лимит IP: 2\n\n"
+                f"📋 VLESS ключ:\n`{vless_link_for_user}`\n\n"
+                f"🔄 Ссылка подписки:\n`{subscription_url}`",
+                parse_mode="Markdown"
+            )
+
+        # Возвращаем в главное меню
+        is_admin = user_id == ADMIN_ID
+        await callback.message.answer(
+            "✅ Готово!",
+            reply_markup=Keyboards.main_menu(is_admin)
+        )
+
+    except Exception as e:
+        await callback.message.edit_text(
+            f"Произошла ошибка при замене ключа: {str(e)}"
+        )
+
+    finally:
+        await state.clear()
+
+    await callback.answer()
+
+
+# ============ ИСПРАВЛЕНИЕ КЛЮЧА ============
+
+@router.message(F.text == "🔧 Исправить ключ")
+async def start_fix_key(message: Message, state: FSMContext, db: DatabaseManager):
+    """Начало исправления ключа"""
+    user_id = message.from_user.id
+
+    # Проверка авторизации
+    if not await is_authorized(user_id, db):
+        await message.answer("У вас нет доступа к этой функции.")
+        return
+
+    await state.set_state(FixKeyStates.waiting_for_key)
+    await message.answer(
+        "🔧 <b>Исправление ключа</b>\n\n"
+        "Вставьте VLESS ключ, который нужно исправить.\n\n"
+        "Функция исправит параметры ключа (SNI, pbk, sid, flow) "
+        "по текущему конфигу активного сервера.\n\n"
+        "Пример:\n<code>vless://uuid@server:443?...</code>",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel_button()
+    )
+
+
+@router.message(FixKeyStates.waiting_for_key, F.text == "Отмена")
+async def cancel_fix_key(message: Message, state: FSMContext):
+    """Отмена исправления ключа"""
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+
+    await state.clear()
+    await message.answer(
+        "Исправление ключа отменено.",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+
+
+@router.message(FixKeyStates.waiting_for_key)
+async def process_fix_key(message: Message, state: FSMContext):
+    """Обработка VLESS ключа для исправления"""
+    import urllib.parse
+    from bot.api.remote_xui import load_servers_config
+
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+    vless_link = message.text.strip()
+
+    if not vless_link.startswith('vless://'):
+        await message.answer(
+            "❌ Неверный формат. Ключ должен начинаться с <code>vless://</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        # Парсим ссылку
+        link_without_proto = vless_link[8:]
+
+        if '#' in link_without_proto:
+            main_part, fragment = link_without_proto.rsplit('#', 1)
+        else:
+            main_part, fragment = link_without_proto, ""
+
+        if '?' in main_part:
+            address_part, query_string = main_part.split('?', 1)
+        else:
+            address_part, query_string = main_part, ""
+
+        if '@' not in address_part:
+            await message.answer("❌ Неверный формат: отсутствует UUID")
+            return
+
+        uuid_part, host_port = address_part.rsplit('@', 1)
+
+        # Загружаем конфиг серверов
+        servers_config = load_servers_config()
+
+        # Находим активный сервер
+        target_server = None
+        for srv in servers_config.get('servers', []):
+            if srv.get('active_for_new'):
+                target_server = srv
+                break
+
+        if not target_server:
+            await message.answer("❌ Активный сервер не найден в конфиге")
+            await state.clear()
+            return
+
+        # Формируем исправленный ключ
+        target_domain = target_server.get('domain', target_server.get('ip'))
+        target_port = target_server.get('port', 443)
+        main_inbound = target_server.get('inbounds', {}).get('main', {})
+
+        new_params = {
+            'type': 'tcp',
+            'security': main_inbound.get('security', 'reality'),
+            'pbk': main_inbound.get('pbk', ''),
+            'fp': main_inbound.get('fp', 'chrome'),
+            'sni': main_inbound.get('sni', ''),
+            'sid': main_inbound.get('sid', ''),
+            'spx': '%2F'
+        }
+
+        # Добавляем flow только если он не пустой
+        if main_inbound.get('flow'):
+            new_params['flow'] = main_inbound['flow']
+
+        new_query = '&'.join([f"{k}={v}" for k, v in new_params.items() if v])
+
+        # Сохраняем оригинальный фрагмент (имя)
+        fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{fragment}"
+
+        # Генерируем QR код
+        qr_code = generate_qr_code(fixed_link)
+
+        # Формируем информацию об изменениях
+        changes = []
+        if target_domain not in vless_link:
+            changes.append(f"• Хост: {target_domain}")
+        if main_inbound.get('sni') and main_inbound['sni'] not in vless_link:
+            changes.append(f"• SNI: {main_inbound['sni']}")
+        if 'flow=' in vless_link and not main_inbound.get('flow'):
+            changes.append("• Flow: убран")
+        elif main_inbound.get('flow') and main_inbound['flow'] not in vless_link:
+            changes.append(f"• Flow: {main_inbound['flow']}")
+
+        changes_text = "\n".join(changes) if changes else "Параметры актуальны"
+
+        await message.answer_photo(
+            BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+            caption=(
+                f"✅ <b>Ключ исправлен!</b>\n\n"
+                f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
+                f"🌐 Хост: {target_domain}\n"
+                f"🔒 SNI: {main_inbound.get('sni', 'N/A')}\n"
+                f"📡 Flow: {main_inbound.get('flow') or 'пусто'}\n\n"
+                f"<b>Изменения:</b>\n{changes_text}"
+            ),
+            parse_mode="HTML"
+        )
+
+        await message.answer(
+            f"📋 <b>Исправленный VLESS ключ:</b>\n\n"
+            f"<code>{fixed_link}</code>\n\n"
+            f"💡 Скопируйте и отправьте клиенту.",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.error(f"Error fixing key: {e}")
+        await message.answer(f"❌ Ошибка при обработке ключа: {str(e)[:100]}")
+
+    finally:
+        await state.clear()
+        await message.answer(
+            "Главное меню:",
+            reply_markup=Keyboards.main_menu(is_admin)
+        )
+
+
 @router.message(F.text == "Моя статистика")
 async def show_my_stats(message: Message, db: DatabaseManager):
     """Показать статистику менеджера"""
@@ -634,6 +1327,7 @@ async def show_my_stats(message: Message, db: DatabaseManager):
     # Получаем статистику
     stats = await db.get_manager_stats(user_id)
     revenue_stats = await db.get_manager_revenue_stats(user_id)
+    replacement_stats = await db.get_replacement_stats(user_id)
 
     stats_text = (
         f"📊 <b>ВАША СТАТИСТИКА</b>\n\n"
@@ -643,10 +1337,15 @@ async def show_my_stats(message: Message, db: DatabaseManager):
         f"📅 За сегодня: <b>{revenue_stats['today']:,} ₽</b>\n"
         f"📆 За месяц: <b>{revenue_stats['month']:,} ₽</b>\n\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"🔑 <b>КЛЮЧИ:</b>\n"
+        f"🔑 <b>СОЗДАННЫЕ КЛЮЧИ:</b>\n"
         f"Всего создано: <b>{stats['total']}</b>\n"
         f"Создано сегодня: <b>{stats['today']}</b>\n"
-        f"Создано за месяц: <b>{stats['month']}</b>\n"
+        f"Создано за месяц: <b>{stats['month']}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🔄 <b>ЗАМЕНЫ КЛЮЧЕЙ:</b>\n"
+        f"Всего замен: <b>{replacement_stats['total']}</b>\n"
+        f"Замен сегодня: <b>{replacement_stats['today']}</b>\n"
+        f"Замен за месяц: <b>{replacement_stats['month']}</b>\n"
     )
 
     # Получаем последние 5 ключей
@@ -656,7 +1355,16 @@ async def show_my_stats(message: Message, db: DatabaseManager):
         stats_text += "\n━━━━━━━━━━━━━━━━\n"
         stats_text += "📋 <b>Последние 5 ключей:</b>\n\n"
         for item in history:
-            stats_text += f"• {item['phone_number']} - {item['period']} ({item['created_at'][:10]})\n"
+            # Вычисляем дату истечения
+            expire_date_str = ""
+            if item.get('expire_days') and item.get('created_at'):
+                try:
+                    created_at = datetime.strptime(item['created_at'][:19], '%Y-%m-%d %H:%M:%S')
+                    expire_date = created_at + timedelta(days=item['expire_days'])
+                    expire_date_str = f" → до {expire_date.strftime('%d.%m.%Y')}"
+                except:
+                    pass
+            stats_text += f"• {item['phone_number']} - {item['period']}{expire_date_str}\n"
 
     await message.answer(stats_text, parse_mode="HTML")
 

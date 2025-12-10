@@ -297,10 +297,17 @@ def load_xray_config():
 
 
 def find_client_in_xray(uuid_str):
-    """Найти клиента по UUID в конфиге xray"""
+    """Найти клиента по UUID в конфиге xray (локальный сервер)"""
     config = load_xray_config()
     if not config:
-        return None, None
+        return None, None, None
+
+    servers_config = load_servers_config()
+    local_server = None
+    for srv in servers_config.get('servers', []):
+        if srv.get('local'):
+            local_server = srv
+            break
 
     for inbound in config.get('inbounds', []):
         settings = inbound.get('settings') or {}
@@ -308,9 +315,70 @@ def find_client_in_xray(uuid_str):
 
         for client in clients:
             if client.get('id') == uuid_str:
-                return client, inbound
+                return client, inbound, local_server
+
+    return None, None, None
+
+
+def find_client_on_remote_server(uuid_str, server):
+    """Найти клиента по UUID на удалённом сервере"""
+    import subprocess
+
+    ssh_config = server.get('ssh', {})
+    if not ssh_config:
+        return None, None
+
+    ssh_user = ssh_config.get('user', 'root')
+    ssh_pass = ssh_config.get('password', '')
+    ssh_host = server.get('ip', '')
+
+    if not ssh_pass or not ssh_host:
+        return None, None
+
+    try:
+        # Получаем конфиг xray с удалённого сервера
+        cmd = f"sshpass -p '{ssh_pass}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_user}@{ssh_host} 'cat /usr/local/x-ui/bin/config.json 2>/dev/null || cat /etc/x-ui/bin/config.json 2>/dev/null'"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return None, None
+
+        config = json.loads(result.stdout)
+
+        for inbound in config.get('inbounds', []):
+            settings = inbound.get('settings') or {}
+            clients = settings.get('clients') or []
+
+            for client in clients:
+                if client.get('id') == uuid_str:
+                    return client, inbound
+    except Exception as e:
+        logger.error(f"Error finding client on remote server {ssh_host}: {e}")
 
     return None, None
+
+
+def find_client_on_all_servers(uuid_str):
+    """Найти клиента по UUID на всех серверах"""
+    servers_config = load_servers_config()
+
+    # Сначала проверяем локальный сервер
+    client, inbound, local_server = find_client_in_xray(uuid_str)
+    if client and inbound:
+        return client, inbound, local_server
+
+    # Затем проверяем удалённые сервера
+    for server in servers_config.get('servers', []):
+        if server.get('local'):
+            continue  # Уже проверили
+        if not server.get('enabled'):
+            continue
+
+        client, inbound = find_client_on_remote_server(uuid_str, server)
+        if client and inbound:
+            return client, inbound, server
+
+    return None, None, None
 
 
 def generate_public_key(private_key):
@@ -330,7 +398,11 @@ def generate_public_key(private_key):
 
 
 async def api_fix_key(request):
-    """API: Проверить и исправить VLESS ключ по базе xray"""
+    """API: Миграция ключа с локального X-UI на активный сервер"""
+    import aiohttp
+    import ssl
+    import time
+
     try:
         data = await request.json()
     except:
@@ -363,131 +435,133 @@ async def api_fix_key(request):
 
         uuid_part, host_port = address_part.rsplit('@', 1)
 
-        if ':' in host_port:
-            host, port = host_port.rsplit(':', 1)
+        # Загружаем конфиг серверов
+        servers_config = load_servers_config()
+
+        # Находим активный сервер (active_for_new: true)
+        target_server = None
+        local_server = None
+
+        for srv in servers_config.get('servers', []):
+            if srv.get('active_for_new'):
+                target_server = srv
+            if srv.get('local'):
+                local_server = srv
+
+        if not target_server:
+            return web.json_response({"error": "Активный сервер не найден в конфиге"}, status=500)
+
+        # Ищем клиента на локальном X-UI
+        config = load_xray_config()
+        if not config:
+            return web.json_response({"error": "Не удалось загрузить локальный конфиг X-UI"}, status=500)
+
+        client_data = None
+        source_inbound = None
+
+        for inbound in config.get('inbounds', []):
+            settings = inbound.get('settings') or {}
+            clients = settings.get('clients') or []
+
+            for client in clients:
+                if client.get('id') == uuid_part:
+                    client_data = client
+                    source_inbound = inbound
+                    break
+
+            if client_data:
+                break
+
+        # Извлекаем данные клиента (если найден) или используем данные из ключа
+        if client_data:
+            email = client_data.get('email', '')
+            limit_ip = client_data.get('limitIp', 2)
+            expiry_time = client_data.get('expiryTime', 0)
         else:
-            host, port = host_port, "443"
+            # Клиент не найден локально - извлекаем email из фрагмента ключа
+            email = urllib.parse.unquote(fragment) if fragment else uuid_part[:8]
+            limit_ip = 2
+            expiry_time = 0
+            logger.info(f"Клиент {uuid_part[:8]}... не найден локально, используем данные из ключа")
 
-        # Парсим параметры
-        params = {}
-        if query_string:
-            for param in query_string.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    params[key] = value
+        # Используем оригинальный UUID - НЕ генерируем новый
+        new_uuid = uuid_part
 
-        issues = []
-        fixes = []
-        client_info = None
+        # Формируем новый VLESS ключ
+        target_domain = target_server.get('domain', target_server.get('ip'))
+        target_port_final = target_server.get('port', 443)
 
-        # Ищем клиента в базе xray
-        client, inbound = find_client_in_xray(uuid_part)
+        # Параметры из конфига целевого сервера
+        main_inbound = target_server.get('inbounds', {}).get('main', {})
 
-        if client and inbound:
-            client_info = {
-                "email": client.get('email', 'N/A'),
-                "inbound": inbound.get('tag', 'N/A'),
-                "port": inbound.get('port', 'N/A')
-            }
+        new_params = {
+            'type': 'tcp',
+            'security': main_inbound.get('security', 'reality'),
+            'pbk': main_inbound.get('pbk', ''),
+            'fp': main_inbound.get('fp', 'chrome'),
+            'sni': main_inbound.get('sni', ''),
+            'sid': main_inbound.get('sid', ''),
+            'flow': main_inbound.get('flow', ''),
+            'spx': '%2F'
+        }
 
-            stream = inbound.get('streamSettings') or {}
-            reality = stream.get('realitySettings') or {}
-            security = stream.get('security', 'none')
+        new_query = '&'.join([f"{k}={v}" for k, v in new_params.items() if v])
 
-            # Исправляем security
-            if params.get('security') != security:
-                old_sec = params.get('security', 'none')
-                params['security'] = security
-                fixes.append(f"Исправлен security: {old_sec} → {security}")
+        # Используем оригинальное имя или создаём новое
+        server_name = target_server.get('name', 'VPN')
+        new_fragment = fragment if fragment else f"{server_name}-{email}"
 
-            if security == 'reality':
-                # Исправляем flow из настроек клиента
-                client_flow = client.get('flow', '')
-                if client_flow:
-                    if params.get('flow') != client_flow:
-                        old_flow = params.get('flow', 'отсутствует')
-                        params['flow'] = client_flow
-                        fixes.append(f"Исправлен flow: {old_flow} → {client_flow}")
+        fixed_link = f"vless://{new_uuid}@{target_domain}:{target_port_final}?{new_query}#{new_fragment}"
 
-                # Исправляем SNI
-                server_names = reality.get('serverNames', [])
-                current_sni = params.get('sni', '')
-                if server_names and current_sni not in server_names:
-                    params['sni'] = server_names[0]
-                    fixes.append(f"Исправлен SNI: {current_sni} → {server_names[0]}")
+        # Форматируем дату истечения
+        expiry_str = "Безлимит"
+        if expiry_time > 0:
+            from datetime import datetime
+            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_dt.strftime("%d.%m.%Y %H:%M")
 
-                # Исправляем public key
-                private_key = reality.get('privateKey', '')
-                if private_key:
-                    public_key = generate_public_key(private_key)
-                    if public_key and params.get('pbk') != public_key:
-                        old_pbk = params.get('pbk', 'отсутствует')[:10] + '...'
-                        params['pbk'] = public_key
-                        fixes.append(f"Исправлен pbk: {old_pbk} → {public_key[:10]}...")
+        local_name = local_server.get('name', 'Local') if local_server else 'Local'
 
-                # Исправляем short id
-                short_ids = reality.get('shortIds', [])
-                current_sid = params.get('sid', '')
-                if short_ids and current_sid not in short_ids:
-                    params['sid'] = short_ids[0]
-                    fixes.append(f"Исправлен sid: {current_sid} → {short_ids[0]}")
-
-                # Исправляем fingerprint
-                if params.get('fp') == 'random':
-                    params['fp'] = 'chrome'
-                    fixes.append("Исправлен fp: random → chrome")
-
-            # Исправляем порт на 443
-            if port != "443":
-                old_port = port
-                port = "443"
-                fixes.append(f"Исправлен порт: {old_port} → 443")
-
-            # Исправляем хост
-            if host not in ['raphaelvpn.ru', 'zov-gor.ru', 'peakvip.ru']:
-                old_host = host
-                host = 'raphaelvpn.ru'
-                fixes.append(f"Исправлен хост: {old_host} → raphaelvpn.ru")
-
+        # Формируем список исправлений
+        fixes_list = [
+            f"Настройки обновлены по конфигу {target_server.get('name', 'Target')}",
+            f"Хост: {target_domain}",
+            f"SNI: {new_params.get('sni', 'N/A')}",
+        ]
+        if new_params.get('flow'):
+            fixes_list.append(f"Flow: {new_params['flow']}")
         else:
-            issues.append("UUID не найден в базе xray! Ключ может быть недействительным.")
-            # Базовые исправления без базы
-            if params.get('security') == 'reality':
-                if 'flow' not in params:
-                    params['flow'] = 'xtls-rprx-vision'
-                    fixes.append("Добавлен flow=xtls-rprx-vision (стандартный)")
-                if params.get('fp') == 'random':
-                    params['fp'] = 'chrome'
-                    fixes.append("Исправлен fp: random → chrome")
-
-        # Собираем исправленную ссылку
-        new_query = '&'.join([f"{k}={v}" for k, v in params.items()])
-        fixed_link = f"vless://{uuid_part}@{host}:{port}?{new_query}"
-        if fragment:
-            fixed_link += f"#{fragment}"
+            fixes_list.append("Flow: пусто (убран)")
 
         result = {
             "original": vless_link,
             "fixed": fixed_link,
             "changed": vless_link != fixed_link,
-            "fixes": fixes,
-            "issues": issues,
-            "found_in_db": client is not None,
-            "client_info": client_info,
+            "migrated": True,
+            "fixes": fixes_list,
+            "issues": [],
+            "found_in_db": client_data is not None,
+            "client_info": {
+                "email": email,
+                "limitIp": limit_ip,
+                "expiryTime": expiry_time,
+                "source_server": local_name if client_data else "Не найден",
+                "target_server": target_server.get('name', 'Target')
+            },
             "params": {
-                "uuid": uuid_part[:8] + "...",
-                "host": host,
-                "port": port,
-                "security": params.get('security', 'none'),
-                "sni": params.get('sni', 'N/A'),
-                "flow": params.get('flow', 'N/A')
+                "uuid": new_uuid[:8] + "...",
+                "host": target_domain,
+                "port": str(target_port_final),
+                "security": new_params.get('security', 'reality'),
+                "sni": new_params.get('sni', 'N/A'),
+                "flow": new_params.get('flow', '') or 'пусто'
             }
         }
 
         return web.json_response(result)
 
     except Exception as e:
-        logger.error(f"Error fixing key: {e}")
+        logger.error(f"Error migrating key: {e}")
         import traceback
         traceback.print_exc()
         return web.json_response({"error": f"Ошибка обработки: {str(e)}"}, status=400)
@@ -662,7 +736,7 @@ def generate_vless_link(client, inbound):
 
 
 async def subscription_handler(request):
-    """Обработчик подписки - возвращает все ключи клиента со всех серверов"""
+    """Обработчик подписки - возвращает ключи клиента с активных серверов"""
     client_id = request.match_info.get('client_id', '')
 
     if not client_id:
@@ -678,11 +752,15 @@ async def subscription_handler(request):
     # Ищем ключи клиента на локальном сервере
     client_keys = find_all_client_keys(client_id)
 
-    if not client_keys:
-        return web.Response(text="Client not found", status=404)
+    # Загружаем конфиг серверов
+    servers_config = load_servers_config()
+    local_server = next((s for s in servers_config.get('servers', []) if s.get('local')), None)
+    local_active = local_server.get('active_for_new', True) if local_server else True
 
-    # Получаем email клиента для именования и данные о подписке
-    client_email = client_keys[0]['client'].get('email', 'client') if client_keys else 'client'
+    # Получаем email клиента для именования
+    client_email = 'client'
+    if client_keys:
+        client_email = client_keys[0]['client'].get('email', 'client')
 
     # Получаем данные клиента из базы данных (срок, трафик)
     upload_bytes = 0
@@ -701,57 +779,57 @@ async def subscription_handler(request):
             total_bytes = row[2] or 0  # 0 = безлимит
             expire_time = row[3] or 0
             if expire_time:
-                # Конвертируем из миллисекунд в секунды для заголовка
                 expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
         conn.close()
     except Exception as e:
         logger.error(f"Error getting client data from DB: {e}")
 
-    # Генерируем ссылки для локального сервера
-    # Исключаем inbounds которые определены в servers_config (они будут добавлены отдельно)
-    servers_config_inbound_tags = set()
-    servers_config = load_servers_config()
-    local_server = next((s for s in servers_config.get('servers', []) if s.get('local')), None)
-    if local_server:
-        for inbound_name in local_server.get('inbounds', {}).keys():
-            if inbound_name != 'main':
-                # Эти inbounds будут добавлены через generate_vless_link_for_server
-                servers_config_inbound_tags.add(f"inbound-8452")  # megafon3 на порту 8452
-                servers_config_inbound_tags.add(f"inbound-8453")  # megafon4 на порту 8453
-                servers_config_inbound_tags.add(f"inbound-8454")  # megafon5 на порту 8454
-
     links = []
-    for item in client_keys:
-        # Пропускаем inbounds которые обрабатываются через servers_config
-        tag = item['inbound'].get('tag', '')
-        if tag in servers_config_inbound_tags:
-            continue
-        link = generate_vless_link(item['client'], item['inbound'])
-        links.append(link)
 
-    # Загружаем конфиг серверов
-    servers_config = load_servers_config()
+    # Генерируем ссылки для локального сервера только если он активен и клиент найден
+    if client_keys and local_active:
+        servers_config_inbound_tags = set()
+        if local_server:
+            for inbound_name in local_server.get('inbounds', {}).keys():
+                if inbound_name != 'main':
+                    servers_config_inbound_tags.add(f"inbound-8452")
+                    servers_config_inbound_tags.add(f"inbound-8453")
+                    servers_config_inbound_tags.add(f"inbound-8454")
 
-    # Обрабатываем ВСЕ серверы включая локальный для дополнительных inbounds
+        for item in client_keys:
+            tag = item['inbound'].get('tag', '')
+            if tag in servers_config_inbound_tags:
+                continue
+            link = generate_vless_link(item['client'], item['inbound'])
+            links.append(link)
+
+    # Обрабатываем серверы из конфига - только активные
     for server in servers_config.get('servers', []):
         if not server.get('enabled', True):
             continue
+        # Пропускаем неактивные для новых подписок серверы
+        if not server.get('active_for_new', True):
+            continue
 
         if server.get('local', False):
-            # Для локального сервера - генерируем ключи только для НЕ-main inbounds
-            # (main уже обработан через generate_vless_link выше)
-            for inbound_name, inbound_config in server.get('inbounds', {}).items():
-                if inbound_name == 'main':
-                    continue  # main уже добавлен
-                link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
-                if link:
-                    links.append(link)
+            # Для локального сервера - генерируем ключи только если клиент найден
+            if client_keys:
+                for inbound_name, inbound_config in server.get('inbounds', {}).items():
+                    if inbound_name == 'main':
+                        continue  # main уже добавлен выше
+                    link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
+                    if link:
+                        links.append(link)
         else:
             # Для внешних серверов - генерируем ключи для всех inbounds
             for inbound_name in server.get('inbounds', {}).keys():
                 link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
                 if link:
                     links.append(link)
+
+    # Если нет ключей - возвращаем 404
+    if not links:
+        return web.Response(text="Client not found or no active servers", status=404)
 
     # Кодируем в base64 (стандартный формат подписки)
     import base64

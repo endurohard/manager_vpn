@@ -82,6 +82,7 @@ class WebOrderRejectStates(StatesGroup):
 class AdminCreateKeyStates(StatesGroup):
     """Состояния для создания ключа с выбором inbound (только для админа)"""
     waiting_for_phone = State()
+    waiting_for_server = State()  # Выбор сервера
     waiting_for_inbound = State()
     waiting_for_period = State()
     confirming = State()
@@ -136,33 +137,42 @@ async def admin_cancel_create_key(message: Message, state: FSMContext):
 
 @router.message(AdminCreateKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
 async def admin_generate_id(message: Message, state: FSMContext, xui_client: XUIClient):
-    """Генерация ID и показ выбора inbound"""
+    """Генерация ID и показ выбора сервера"""
+    from bot.api.remote_xui import load_servers_config
+
     user_id_value = generate_user_id()
     await state.update_data(phone=user_id_value)
 
-    # Получаем список inbound'ов
-    inbounds = await xui_client.list_inbounds()
+    # Получаем список серверов
+    servers_config = load_servers_config()
+    servers = servers_config.get('servers', [])
 
-    if not inbounds:
+    if not servers:
         await message.answer(
-            "❌ Не удалось получить список inbound'ов.",
+            "❌ Нет доступных серверов.",
             reply_markup=Keyboards.admin_menu()
         )
         await state.clear()
         return
 
-    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+    await state.update_data(servers=servers)
+    await state.set_state(AdminCreateKeyStates.waiting_for_server)
     await message.answer(
         f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
-        f"🔌 <b>Выберите inbound для создания ключа:</b>",
-        reply_markup=Keyboards.inbound_selection(inbounds),
+        f"🖥 <b>Выберите сервер:</b>\n"
+        f"🟢 - активен для новых\n"
+        f"🟡 - отключен для новых\n"
+        f"🔴 - выключен",
+        reply_markup=Keyboards.server_selection(servers),
         parse_mode="HTML"
     )
 
 
 @router.message(AdminCreateKeyStates.waiting_for_phone)
 async def admin_process_phone(message: Message, state: FSMContext, xui_client: XUIClient):
-    """Обработка введенного ID и показ выбора inbound"""
+    """Обработка введенного ID и показ выбора сервера"""
+    from bot.api.remote_xui import load_servers_config
+
     user_input = message.text.strip()
 
     if len(user_input) < 3:
@@ -171,29 +181,119 @@ async def admin_process_phone(message: Message, state: FSMContext, xui_client: X
 
     await state.update_data(phone=user_input)
 
-    # Получаем список inbound'ов
-    inbounds = await xui_client.list_inbounds()
+    # Получаем список серверов
+    servers_config = load_servers_config()
+    servers = servers_config.get('servers', [])
 
-    if not inbounds:
+    if not servers:
         await message.answer(
-            "❌ Не удалось получить список inbound'ов.",
+            "❌ Нет доступных серверов.",
             reply_markup=Keyboards.admin_menu()
         )
         await state.clear()
         return
 
-    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+    await state.update_data(servers=servers)
+    await state.set_state(AdminCreateKeyStates.waiting_for_server)
     await message.answer(
         f"🆔 ID клиента: <code>{user_input}</code>\n\n"
-        f"🔌 <b>Выберите inbound для создания ключа:</b>",
-        reply_markup=Keyboards.inbound_selection(inbounds),
+        f"🖥 <b>Выберите сервер:</b>\n"
+        f"🟢 - активен для новых\n"
+        f"🟡 - отключен для новых\n"
+        f"🔴 - выключен",
+        reply_markup=Keyboards.server_selection(servers),
         parse_mode="HTML"
     )
 
 
+@router.callback_query(AdminCreateKeyStates.waiting_for_server, F.data.startswith("server_"))
+async def admin_process_server(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора сервера"""
+    server_idx = int(callback.data.split("_", 1)[1])
+    data = await state.get_data()
+    servers = data.get('servers', [])
+
+    if server_idx >= len(servers):
+        await callback.answer("Ошибка: сервер не найден", show_alert=True)
+        return
+
+    selected_server = servers[server_idx]
+    await state.update_data(selected_server=selected_server, server_idx=server_idx)
+
+    # Показываем inbound'ы этого сервера из конфига
+    inbounds = selected_server.get('inbounds', {})
+
+    if not inbounds:
+        await callback.answer("У сервера нет inbound'ов", show_alert=True)
+        return
+
+    server_name = selected_server.get('name', 'Unknown')
+    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+    await callback.message.edit_text(
+        f"🖥 Сервер: <b>{server_name}</b>\n\n"
+        f"🔌 <b>Выберите inbound:</b>",
+        reply_markup=Keyboards.inbound_selection_from_config(inbounds, server_name),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminCreateKeyStates.waiting_for_server, F.data == "back_to_servers")
+@router.callback_query(AdminCreateKeyStates.waiting_for_inbound, F.data == "back_to_servers")
+async def admin_back_to_servers(callback: CallbackQuery, state: FSMContext):
+    """Возврат к выбору сервера"""
+    data = await state.get_data()
+    servers = data.get('servers', [])
+    phone = data.get('phone', '')
+
+    await state.set_state(AdminCreateKeyStates.waiting_for_server)
+    await callback.message.edit_text(
+        f"🆔 ID клиента: <code>{phone}</code>\n\n"
+        f"🖥 <b>Выберите сервер:</b>",
+        reply_markup=Keyboards.server_selection(servers),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminCreateKeyStates.waiting_for_inbound, F.data.startswith("srv_inbound_"))
+async def admin_process_inbound_from_config(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора inbound из конфига сервера"""
+    inbound_key = callback.data.replace("srv_inbound_", "")
+    data = await state.get_data()
+    selected_server = data.get('selected_server', {})
+    inbounds = selected_server.get('inbounds', {})
+
+    if inbound_key not in inbounds:
+        await callback.answer("Inbound не найден", show_alert=True)
+        return
+
+    selected_inbound = inbounds[inbound_key]
+    inbound_id = selected_inbound.get('id', 1)
+
+    await state.update_data(
+        inbound_key=inbound_key,
+        inbound_id=inbound_id,
+        selected_inbound=selected_inbound
+    )
+
+    server_name = selected_server.get('name', 'Unknown')
+    inbound_name = selected_inbound.get('name_prefix', inbound_key)
+
+    await state.set_state(AdminCreateKeyStates.waiting_for_period)
+    await callback.message.edit_text(
+        f"🖥 Сервер: <b>{server_name}</b>\n"
+        f"🔌 Inbound: <b>{inbound_name}</b>\n\n"
+        "Выберите срок действия ключа:",
+        reply_markup=Keyboards.subscription_periods(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
 @router.callback_query(AdminCreateKeyStates.waiting_for_inbound, F.data.startswith("inbound_"))
 async def admin_process_inbound(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора inbound"""
+    """Обработка выбора inbound (старый метод для совместимости)"""
     inbound_id = int(callback.data.split("_", 1)[1])
     await state.update_data(inbound_id=inbound_id)
 
@@ -259,58 +359,121 @@ async def admin_cancel_key_callback(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "admin_confirm_key")
 async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
                            xui_client: XUIClient, bot):
-    """Создание ключа с выбранным inbound"""
+    """Создание ключа на выбранном сервере"""
+    import urllib.parse
+    import uuid
+    from datetime import datetime, timedelta
+    from bot.api.remote_xui import load_servers_config, create_client_via_panel, create_client_on_remote_server
+
     data = await state.get_data()
     phone = data.get("phone")
     inbound_id = data.get("inbound_id")
+    inbound_key = data.get("inbound_key", "main")
     period_name = data.get("period_name")
     period_days = data.get("period_days")
     period_price = data.get("period_price", 0)
+    selected_server = data.get("selected_server")
+    selected_inbound = data.get("selected_inbound")
 
     await callback.message.edit_text("⏳ Создание ключа...")
 
     try:
-        # Создаем клиента
-        client_data = await xui_client.add_client(
-            inbound_id=inbound_id,
-            email=phone,
-            phone=phone,
-            expire_days=period_days,
-            ip_limit=2
-        )
+        # Генерируем UUID для клиента
+        client_uuid = str(uuid.uuid4())
+        server_name = selected_server.get('name', 'Unknown') if selected_server else 'Local'
 
-        if not client_data:
-            await callback.message.edit_text("❌ Ошибка при создании ключа в X-UI панели.")
-            await state.clear()
-            return
+        # Создаём клиента на выбранном сервере
+        success = False
 
-        if client_data.get('error'):
-            error_message = client_data.get('message', 'Неизвестная ошибка')
-            if client_data.get('is_duplicate'):
-                await callback.message.edit_text(
-                    f"⚠️ Клиент с ID <code>{phone}</code> уже существует!",
-                    parse_mode="HTML"
+        if selected_server:
+            # Создаём на выбранном сервере
+            if selected_server.get('local'):
+                # Локальный сервер - используем xui_client
+                client_data = await xui_client.add_client(
+                    inbound_id=inbound_id,
+                    email=phone,
+                    phone=phone,
+                    expire_days=period_days,
+                    ip_limit=2
                 )
+                if client_data and not client_data.get('error'):
+                    success = True
+                    client_uuid = client_data.get('client_id', client_uuid)
+                elif client_data and client_data.get('is_duplicate'):
+                    await callback.message.edit_text(
+                        f"⚠️ Клиент с ID <code>{phone}</code> уже существует!",
+                        parse_mode="HTML"
+                    )
+                    await state.clear()
+                    await callback.message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
+                    return
             else:
-                await callback.message.edit_text(f"❌ Ошибка: {error_message}")
+                # Удалённый сервер
+                success = await create_client_on_remote_server(
+                    server_config=selected_server,
+                    client_uuid=client_uuid,
+                    email=phone,
+                    expire_days=period_days,
+                    ip_limit=2
+                )
+        else:
+            # Старый режим - на локальном сервере
+            client_data = await xui_client.add_client(
+                inbound_id=inbound_id,
+                email=phone,
+                phone=phone,
+                expire_days=period_days,
+                ip_limit=2
+            )
+            if client_data and not client_data.get('error'):
+                success = True
+                client_uuid = client_data.get('client_id', client_uuid)
+
+        if not success:
+            await callback.message.edit_text("❌ Ошибка при создании ключа.")
             await state.clear()
             await callback.message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
             return
 
-        # Получаем VLESS ссылку
-        vless_link_original = await xui_client.get_client_link(
-            inbound_id=inbound_id,
-            client_email=phone,
-            use_domain=None
-        )
+        # Формируем VLESS ссылку из конфига выбранного сервера
+        vless_link_for_user = None
 
-        if not vless_link_original:
+        if selected_server and selected_inbound:
+            domain = selected_server.get('domain', selected_server.get('ip', ''))
+            port = selected_server.get('port', 443)
+
+            params = ["type=tcp", f"security={selected_inbound.get('security', 'reality')}"]
+
+            if selected_inbound.get('security') == 'reality':
+                if selected_inbound.get('sni'):
+                    params.append(f"sni={selected_inbound['sni']}")
+                if selected_inbound.get('pbk'):
+                    params.append(f"pbk={selected_inbound['pbk']}")
+                if selected_inbound.get('sid'):
+                    params.append(f"sid={selected_inbound['sid']}")
+                params.append(f"fp={selected_inbound.get('fp', 'chrome')}")
+                if selected_inbound.get('flow'):
+                    params.append(f"flow={selected_inbound['flow']}")
+
+            query = '&'.join(params)
+            name_prefix = selected_inbound.get('name_prefix', server_name)
+            encoded_name = urllib.parse.quote(name_prefix)
+
+            vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
+        else:
+            # Старый режим - из локального сервера
+            vless_link_original = await xui_client.get_client_link(
+                inbound_id=inbound_id,
+                client_email=phone,
+                use_domain=None
+            )
+            if vless_link_original:
+                vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
+
+        if not vless_link_for_user:
             await callback.message.edit_text("Ключ создан, но не удалось сформировать VLESS ссылку.")
             await state.clear()
             return
-
-        # Заменяем IP на домен
-        vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
 
         # Сохраняем в БД
         await db.add_key_to_history(
@@ -324,7 +487,6 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
         )
 
         # Ссылка подписки
-        client_uuid = client_data['client_id']
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
 
         # QR код
@@ -1842,6 +2004,17 @@ PAYMENT_FILE = Path(__file__).parent.parent.parent / 'payment_details.json'
 ORDERS_DB = Path(__file__).parent.parent.parent / 'web_orders.db'
 
 
+class AddServerStates(StatesGroup):
+    """Состояния для добавления нового сервера (через панель, без SSH)"""
+    waiting_name = State()
+    waiting_ip = State()
+    waiting_domain = State()
+    waiting_panel_port = State()
+    waiting_panel_path = State()
+    waiting_panel_credentials = State()
+    confirm = State()
+
+
 class PaymentSettingsStates(StatesGroup):
     """Состояния для настройки реквизитов"""
     waiting_for_card = State()
@@ -2381,6 +2554,26 @@ async def process_reject_reason(message: Message, state: FSMContext):
 
 # ===== СТАТУС СЕРВЕРОВ =====
 
+def load_servers_config():
+    """Загрузить конфигурацию серверов"""
+    import json
+    from pathlib import Path
+    config_path = Path('/root/manager_vpn/servers_config.json')
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return {"servers": []}
+
+
+def save_servers_config(config: dict):
+    """Сохранить конфигурацию серверов"""
+    import json
+    from pathlib import Path
+    config_path = Path('/root/manager_vpn/servers_config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
 @router.message(F.text == "🖥 Статус серверов")
 @admin_only
 async def check_servers_status(message: Message, **kwargs):
@@ -2492,73 +2685,124 @@ async def check_servers_status(message: Message, **kwargs):
                 server_result['details'] = str(e)
 
         else:
-            # Проверка удалённого сервера через SSH
+            # Проверка удалённого сервера
             ssh_config = server.get('ssh', {})
-            ssh_user = ssh_config.get('user', 'root')
+            panel_config = server.get('panel', {})
             ssh_password = ssh_config.get('password', '')
 
-            if not ssh_password:
-                server_result['status'] = 'error'
-                server_result['details'] = 'Нет SSH пароля в конфиге'
-                results.append(server_result)
-                continue
+            # Если есть SSH - используем SSH
+            if ssh_password:
+                ssh_user = ssh_config.get('user', 'root')
+                try:
+                    cmd = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} 'systemctl is-active x-ui && pgrep -c xray && ss -tlnp | grep -c \":443 \"'"
 
-            try:
-                # Проверяем доступность по SSH и статус x-ui
-                cmd = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} 'systemctl is-active x-ui && pgrep -c xray && ss -tlnp | grep -c \":443 \"'"
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
 
-                proc = await asyncio.create_subprocess_shell(
-                    cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    output_lines = stdout.decode().strip().split('\n')
 
-                output_lines = stdout.decode().strip().split('\n')
+                    if len(output_lines) >= 1:
+                        xui_status = output_lines[0] == 'active'
+                        server_result['checks']['x-ui'] = xui_status
 
-                if len(output_lines) >= 1:
-                    xui_status = output_lines[0] == 'active'
-                    server_result['checks']['x-ui'] = xui_status
+                        if len(output_lines) >= 2:
+                            try:
+                                xray_count = int(output_lines[1])
+                                server_result['checks']['xray'] = xray_count > 0
+                            except:
+                                server_result['checks']['xray'] = False
 
-                    if len(output_lines) >= 2:
-                        try:
-                            xray_count = int(output_lines[1])
-                            server_result['checks']['xray'] = xray_count > 0
-                        except:
-                            server_result['checks']['xray'] = False
+                        if len(output_lines) >= 3:
+                            try:
+                                port_count = int(output_lines[2])
+                                server_result['checks']['port_443'] = port_count > 0
+                            except:
+                                server_result['checks']['port_443'] = False
 
-                    if len(output_lines) >= 3:
-                        try:
-                            port_count = int(output_lines[2])
-                            server_result['checks']['port_443'] = port_count > 0
-                        except:
-                            server_result['checks']['port_443'] = False
+                        server_result['status'] = 'ok' if all(server_result['checks'].values()) else 'warning'
+                    else:
+                        server_result['status'] = 'error'
+                        server_result['details'] = 'Некорректный ответ сервера'
+
+                    # Получаем количество клиентов
+                    cmd_clients = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} \"sqlite3 /etc/x-ui/x-ui.db \\\"SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND expiry_time > strftime('%s','now')*1000;\\\"\""
+
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd_clients,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                    try:
+                        server_result['clients'] = int(stdout.decode().strip())
+                    except:
+                        server_result['clients'] = 0
+
+                except asyncio.TimeoutError:
+                    server_result['status'] = 'error'
+                    server_result['details'] = 'Таймаут подключения SSH'
+                except Exception as e:
+                    server_result['status'] = 'error'
+                    server_result['details'] = str(e)
+
+            # Если нет SSH, но есть панель - используем API панели
+            elif panel_config.get('url'):
+                try:
+                    import aiohttp
+                    import ssl
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+
+                    panel_url = panel_config.get('url')
+                    panel_user = panel_config.get('username')
+                    panel_pass = panel_config.get('password')
+
+                    connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    async with aiohttp.ClientSession(connector=connector) as session:
+                        # Авторизация
+                        login_url = f"{panel_url}/login"
+                        async with session.post(login_url, json={"username": panel_user, "password": panel_pass}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                login_data = await resp.json()
+                                if login_data.get('success'):
+                                    server_result['checks']['panel_auth'] = True
+
+                        # Проверяем inbound'ы
+                        if server_result['checks'].get('panel_auth'):
+                            inbounds_url = f"{panel_url}/panel/api/inbounds/list"
+                            async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                if resp.status == 200:
+                                    inb_data = await resp.json()
+                                    if inb_data.get('success'):
+                                        server_result['checks']['inbounds'] = True
+                                        # Считаем активных клиентов
+                                        total_clients = 0
+                                        import time
+                                        now_ms = int(time.time() * 1000)
+                                        for inb in inb_data.get('obj', []):
+                                            settings = json.loads(inb.get('settings', '{}'))
+                                            for client in settings.get('clients', []):
+                                                exp = client.get('expiryTime', 0)
+                                                if client.get('enable', True) and (exp == 0 or exp > now_ms):
+                                                    total_clients += 1
+                                        server_result['clients'] = total_clients
 
                     server_result['status'] = 'ok' if all(server_result['checks'].values()) else 'warning'
-                else:
+
+                except asyncio.TimeoutError:
                     server_result['status'] = 'error'
-                    server_result['details'] = 'Некорректный ответ сервера'
-
-                # Получаем количество клиентов
-                cmd_clients = f"sshpass -p '{ssh_password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {ssh_user}@{server_ip} \"sqlite3 /etc/x-ui/x-ui.db \\\"SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND expiry_time > strftime('%s','now')*1000;\\\"\""
-
-                proc = await asyncio.create_subprocess_shell(
-                    cmd_clients,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                try:
-                    server_result['clients'] = int(stdout.decode().strip())
-                except:
-                    server_result['clients'] = 0
-
-            except asyncio.TimeoutError:
+                    server_result['details'] = 'Таймаут подключения к панели'
+                except Exception as e:
+                    server_result['status'] = 'error'
+                    server_result['details'] = f'Ошибка панели: {str(e)[:50]}'
+            else:
                 server_result['status'] = 'error'
-                server_result['details'] = 'Таймаут подключения SSH'
-            except Exception as e:
-                server_result['status'] = 'error'
-                server_result['details'] = str(e)
+                server_result['details'] = 'Нет SSH или панели в конфиге'
 
         results.append(server_result)
 
@@ -2595,7 +2839,9 @@ async def check_servers_status(message: Message, **kwargs):
                 check_display = {
                     'x-ui': 'X-UI панель',
                     'xray': 'Xray процесс',
-                    'port_443': 'Порт 443'
+                    'port_443': 'Порт 443',
+                    'panel_auth': 'Панель (авторизация)',
+                    'inbounds': 'Inbound\'ы'
                 }.get(check_name, check_name)
                 text += f"      {check_emoji} {check_display}\n"
 
@@ -2610,10 +2856,567 @@ async def check_servers_status(message: Message, **kwargs):
     # Добавляем время проверки
     from datetime import datetime
     text += f"━━━━━━━━━━━━━━━━\n"
-    text += f"🕐 Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    text += f"🕐 Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+
+    # Добавляем статус активности для новых подписок
+    text += "📋 <b>Активность для новых подписок:</b>\n"
+    servers_cfg = load_servers_config()
+    for srv in servers_cfg.get('servers', []):
+        srv_name = srv.get('name', 'Unknown')
+        is_active = srv.get('active_for_new', True)
+        status_icon = "✅" if is_active else "❌"
+        text += f"   {status_icon} {srv_name}: {'Включен' if is_active else 'Выключен'}\n"
+
+    # Кнопки для управления серверами
+    buttons = []
+    for srv in servers_cfg.get('servers', []):
+        srv_name = srv.get('name', 'Unknown')
+        is_active = srv.get('active_for_new', True)
+        action = "disable" if is_active else "enable"
+        btn_text = f"{'🔴 Выкл' if is_active else '🟢 Вкл'} {srv_name}"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"server_{action}_{srv_name}")])
+
+    # Кнопка добавления нового сервера
+    buttons.append([InlineKeyboardButton(text="➕ Добавить сервер", callback_data="add_new_server")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await message.answer(
         text,
         parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+# ============ УПРАВЛЕНИЕ СЕРВЕРАМИ ДЛЯ НОВЫХ ПОДПИСОК ============
+
+@router.message(F.text == "/servers")
+@admin_only
+async def show_servers_management(message: Message, **kwargs):
+    """Показать управление серверами для новых подписок"""
+    config = load_servers_config()
+    servers = config.get('servers', [])
+
+    text = "🖥 <b>УПРАВЛЕНИЕ СЕРВЕРАМИ</b>\n\n"
+    text += "Выберите серверы для новых подписок:\n\n"
+
+    buttons = []
+    for server in servers:
+        name = server.get('name', 'Unknown')
+        is_active = server.get('active_for_new', True)
+        is_local = server.get('local', False)
+        domain = server.get('domain', server.get('ip', ''))
+
+        status_emoji = "✅" if is_active else "❌"
+        local_tag = " (локальный)" if is_local else ""
+
+        text += f"{status_emoji} <b>{name}</b>{local_tag}\n"
+        text += f"   🌐 {domain}\n"
+        text += f"   📊 Статус: {'Включен' if is_active else 'Выключен'}\n\n"
+
+        # Кнопка для переключения
+        action = "disable" if is_active else "enable"
+        action_text = f"{'🔴 Выкл' if is_active else '🟢 Вкл'} {name}"
+        buttons.append([InlineKeyboardButton(
+            text=action_text,
+            callback_data=f"server_{action}_{name}"
+        )])
+
+    text += "━━━━━━━━━━━━━━━━\n"
+    text += "💡 <i>Включенные серверы используются\nдля создания новых подписок</i>"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("server_enable_") | F.data.startswith("server_disable_"))
+async def toggle_server_for_new(callback: CallbackQuery):
+    """Переключить сервер для новых подписок"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split("_", 2)
+    action = parts[1]  # enable или disable
+    server_name = parts[2]
+
+    config = load_servers_config()
+
+    # Находим сервер и переключаем
+    server_found = False
+    for server in config.get('servers', []):
+        if server.get('name') == server_name:
+            server['active_for_new'] = (action == "enable")
+            server_found = True
+            break
+
+    if not server_found:
+        await callback.answer(f"Сервер {server_name} не найден", show_alert=True)
+        return
+
+    # Сохраняем конфиг
+    save_servers_config(config)
+
+    # Обновляем сообщение
+    servers = config.get('servers', [])
+
+    text = "🖥 <b>УПРАВЛЕНИЕ СЕРВЕРАМИ</b>\n\n"
+    text += "Выберите серверы для новых подписок:\n\n"
+
+    buttons = []
+    for server in servers:
+        name = server.get('name', 'Unknown')
+        is_active = server.get('active_for_new', True)
+        is_local = server.get('local', False)
+        domain = server.get('domain', server.get('ip', ''))
+
+        status_emoji = "✅" if is_active else "❌"
+        local_tag = " (локальный)" if is_local else ""
+
+        text += f"{status_emoji} <b>{name}</b>{local_tag}\n"
+        text += f"   🌐 {domain}\n"
+        text += f"   📊 Статус: {'Включен' if is_active else 'Выключен'}\n\n"
+
+        # Кнопка для переключения
+        btn_action = "disable" if is_active else "enable"
+        action_text = f"{'🔴 Выкл' if is_active else '🟢 Вкл'} {name}"
+        buttons.append([InlineKeyboardButton(
+            text=action_text,
+            callback_data=f"server_{btn_action}_{name}"
+        )])
+
+    text += "━━━━━━━━━━━━━━━━\n"
+    text += "💡 <i>Включенные серверы используются\nдля создания новых подписок</i>"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    status_text = "включен" if action == "enable" else "выключен"
+    await callback.answer(f"Сервер {server_name} {status_text}", show_alert=False)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ============ ДОБАВЛЕНИЕ НОВОГО СЕРВЕРА ============
+
+@router.callback_query(F.data == "add_new_server")
+async def start_add_server(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс добавления нового сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "➕ <b>ДОБАВЛЕНИЕ НОВОГО СЕРВЕРА</b>\n\n"
+        "Шаг 1/5: Введите <b>название</b> сервера\n"
+        "(например: Germany-1, NL-Premium)\n\n"
+        "Для отмены нажмите /cancel",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_name)
+    await callback.answer()
+
+
+@router.message(AddServerStates.waiting_name)
+async def process_server_name(message: Message, state: FSMContext):
+    """Обработка названия сервера"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    name = message.text.strip()
+
+    # Проверяем уникальность имени
+    config = load_servers_config()
+    existing_names = [s.get('name', '').lower() for s in config.get('servers', [])]
+    if name.lower() in existing_names:
+        await message.answer(
+            f"❌ Сервер с именем <b>{name}</b> уже существует.\n"
+            "Введите другое название:",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(name=name)
+    await message.answer(
+        f"✅ Название: <b>{name}</b>\n\n"
+        "Шаг 2/5: Введите <b>IP адрес</b> сервера\n"
+        "(например: 80.76.43.74)",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_ip)
+
+
+@router.message(AddServerStates.waiting_ip)
+async def process_server_ip(message: Message, state: FSMContext):
+    """Обработка IP адреса"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    ip = message.text.strip()
+
+    # Простая валидация IP
+    import re
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    if not re.match(ip_pattern, ip):
+        await message.answer(
+            "❌ Некорректный IP адрес.\n"
+            "Введите в формате: xxx.xxx.xxx.xxx"
+        )
+        return
+
+    await state.update_data(ip=ip)
+    await message.answer(
+        f"✅ IP: <b>{ip}</b>\n\n"
+        "Шаг 3/5: Введите <b>домен</b> сервера\n"
+        "(например: vpn.example.com)\n\n"
+        "Или отправьте <b>-</b> если домена нет",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_domain)
+
+
+@router.message(AddServerStates.waiting_domain)
+async def process_server_domain(message: Message, state: FSMContext):
+    """Обработка домена"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    domain = message.text.strip()
+    if domain == "-":
+        data = await state.get_data()
+        domain = data.get('ip', '')  # Используем IP как домен
+
+    await state.update_data(domain=domain)
+    await message.answer(
+        f"✅ Домен: <b>{domain}</b>\n\n"
+        "Шаг 4/5: Введите <b>URL панели X-UI</b>\n"
+        "(например: https://80.76.43.74:1020/AMYmhoyf5gRI0qS)\n\n"
+        "Полный URL до /panel/inbounds",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_panel_path)
+
+
+@router.message(AddServerStates.waiting_panel_path)
+async def process_panel_path(message: Message, state: FSMContext):
+    """Обработка URL панели"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    panel_url = message.text.strip()
+
+    # Парсим URL панели
+    from urllib.parse import urlparse
+    parsed = urlparse(panel_url)
+
+    if not parsed.scheme or not parsed.netloc:
+        await message.answer(
+            "❌ Некорректный URL.\n"
+            "Введите полный URL, например:\n"
+            "<code>https://80.76.43.74:1020/AMYmhoyf5gRI0qS</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Извлекаем порт (по умолчанию 443 для https, 80 для http)
+    panel_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    panel_path = parsed.path.rstrip('/') or '/'
+
+    # Убираем лишние части URL (/panel/inbounds, /panel, etc.)
+    for suffix in ['/panel/inbounds', '/panel/api', '/panel', '/inbounds']:
+        if panel_path.endswith(suffix):
+            panel_path = panel_path[:-len(suffix)]
+            break
+
+    # Формируем чистый URL
+    panel_url = f"{parsed.scheme}://{parsed.hostname}:{panel_port}{panel_path}"
+
+    await state.update_data(panel_url=panel_url, panel_port=panel_port, panel_path=panel_path)
+    await message.answer(
+        f"✅ URL панели: <code>{panel_url}</code>\n"
+        f"   Порт: {panel_port}\n"
+        f"   Путь: {panel_path}\n\n"
+        "Шаг 5/5: Введите <b>логин и пароль</b> от панели X-UI\n"
+        "в формате: логин пароль\n"
+        "(например: admin MyPassword123)",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_panel_credentials)
+
+
+@router.message(AddServerStates.waiting_panel_credentials)
+async def process_panel_credentials(message: Message, state: FSMContext):
+    """Обработка учётных данных панели"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer(
+            "❌ Введите логин и пароль через пробел\n"
+            "Например: admin MyPassword123"
+        )
+        return
+
+    panel_username, panel_password = parts
+
+    # Удаляем сообщение с паролем
+    try:
+        await message.delete()
+    except:
+        pass
+
+    await state.update_data(panel_username=panel_username, panel_password=panel_password)
+
+    # Показываем подтверждение
+    data = await state.get_data()
+
+    text = (
+        "📋 <b>ПРОВЕРЬТЕ ДАННЫЕ СЕРВЕРА</b>\n\n"
+        f"📛 Название: <b>{data['name']}</b>\n"
+        f"🌐 IP: <code>{data['ip']}</code>\n"
+        f"🔗 Домен: <code>{data['domain']}</code>\n"
+        f"🖥 Панель: <code>{data.get('panel_url', '')}</code>\n"
+        f"👤 Логин: {panel_username}\n\n"
+        "Всё верно?"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add_server"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add_server")
+        ],
+        [InlineKeyboardButton(text="🔄 Проверить подключение", callback_data="test_server_connection")]
+    ])
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await state.set_state(AddServerStates.confirm)
+
+
+@router.callback_query(F.data == "test_server_connection", AddServerStates.confirm)
+async def test_server_connection(callback: CallbackQuery, state: FSMContext):
+    """Тестирование подключения к панели"""
+    data = await state.get_data()
+    panel_url = data.get('panel_url', '')
+    panel_username = data.get('panel_username')
+    panel_password = data.get('panel_password')
+
+    await callback.message.edit_text("⏳ Проверяю подключение к панели...")
+
+    results = {"panel_auth": False, "inbounds": False, "inbounds_count": 0}
+
+    try:
+        import aiohttp
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Тест авторизации
+            login_url = f"{panel_url}/login"
+            async with session.post(login_url, json={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    response_data = await resp.json()
+                    results['panel_auth'] = response_data.get('success', False)
+
+            # Если авторизация успешна, проверяем inbound'ы
+            if results['panel_auth']:
+                inbounds_url = f"{panel_url}/panel/api/inbounds/list"
+                async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        inbounds_data = await resp.json()
+                        if inbounds_data.get('success'):
+                            results['inbounds'] = True
+                            results['inbounds_count'] = len(inbounds_data.get('obj', []))
+    except Exception as e:
+        logger.error(f"Ошибка проверки подключения: {e}")
+
+    # Формируем результат
+    text = (
+        "🔍 <b>РЕЗУЛЬТАТЫ ПРОВЕРКИ</b>\n\n"
+        f"{'✅' if results['panel_auth'] else '❌'} Авторизация в панели\n"
+        f"{'✅' if results['inbounds'] else '❌'} Доступ к inbound'ам"
+    )
+
+    if results['inbounds']:
+        text += f" ({results['inbounds_count']} шт.)"
+
+    text += "\n\n"
+
+    if results['panel_auth'] and results['inbounds']:
+        text += "✅ <b>Панель доступна!</b>"
+    else:
+        text += "⚠️ <b>Есть проблемы с подключением</b>"
+
+    # Данные сервера
+    text += (
+        f"\n\n━━━━━━━━━━━━━━━━\n"
+        f"📛 Название: <b>{data['name']}</b>\n"
+        f"🌐 IP: <code>{data['ip']}</code>\n"
+        f"🔗 Домен: <code>{data['domain']}</code>\n"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add_server"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add_server")
+        ],
+        [InlineKeyboardButton(text="🔄 Повторить проверку", callback_data="test_server_connection")]
+    ])
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm_add_server", AddServerStates.confirm)
+async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение и сохранение сервера"""
+    data = await state.get_data()
+
+    await callback.message.edit_text("⏳ Получаю данные inbound'ов с панели...")
+
+    panel_url = data.get('panel_url', '')
+    panel_username = data.get('panel_username')
+    panel_password = data.get('panel_password')
+
+    inbounds_data = {}
+
+    try:
+        import aiohttp
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Авторизация
+            login_url = f"{panel_url}/login"
+            await session.post(login_url, json={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
+
+            # Получаем inbound'ы через API
+            inbounds_url = f"{panel_url}/panel/api/inbounds/list"
+            async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    response_data = await resp.json()
+                    if response_data.get('success'):
+                        for inbound in response_data.get('obj', []):
+                            if not inbound.get('enable'):
+                                continue
+
+                            inbound_id = inbound.get('id')
+                            remark = inbound.get('remark', f'inbound_{inbound_id}')
+                            port = inbound.get('port')
+                            protocol = inbound.get('protocol')
+
+                            try:
+                                stream_settings = json.loads(inbound.get('streamSettings', '{}'))
+                                security = stream_settings.get('security', 'none')
+
+                                if security == 'reality':
+                                    reality = stream_settings.get('realitySettings', {})
+                                    sni_list = reality.get('serverNames', [])
+                                    sni = sni_list[0] if sni_list else ''
+                                    pbk = reality.get('settings', {}).get('publicKey', '')
+                                    short_ids = reality.get('shortIds', [])
+                                    sid = short_ids[0] if short_ids else ''
+                                    fp = reality.get('settings', {}).get('fingerprint', 'chrome')
+
+                                    inbound_key = remark.lower().replace(' ', '_').replace('-', '_')
+                                    inbounds_data[inbound_key] = {
+                                        "id": int(inbound_id),
+                                        "security": "reality",
+                                        "sni": sni,
+                                        "pbk": pbk,
+                                        "sid": sid,
+                                        "flow": "",
+                                        "fp": fp,
+                                        "name_prefix": f"🌐 {remark}"
+                                    }
+                            except:
+                                pass
+    except Exception as e:
+        logger.error(f"Ошибка получения inbound'ов через API: {e}")
+
+    # Создаём конфигурацию сервера (без SSH)
+    new_server = {
+        "name": data['name'],
+        "domain": data['domain'],
+        "ip": data['ip'],
+        "port": 443,
+        "enabled": True,
+        "active_for_new": True,
+        "local": False,
+        "description": f"Сервер {data['name']}",
+        "panel": {
+            "url": panel_url,
+            "port": data.get('panel_port', 1020),
+            "path": data.get('panel_path', '/'),
+            "username": panel_username,
+            "password": panel_password
+        },
+        "inbounds": inbounds_data if inbounds_data else {
+            "main": {
+                "id": 1,
+                "security": "reality",
+                "sni": "example.com",
+                "pbk": "",
+                "sid": "",
+                "flow": "",
+                "fp": "chrome",
+                "name_prefix": "🌐 Main"
+            }
+        }
+    }
+
+    # Сохраняем в конфиг
+    config = load_servers_config()
+    config['servers'].append(new_server)
+    save_servers_config(config)
+
+    await state.clear()
+
+    inbounds_info = ""
+    if inbounds_data:
+        inbounds_info = f"\n\n📋 Найдено inbound'ов: {len(inbounds_data)}\n"
+        for key, val in inbounds_data.items():
+            inbounds_info += f"   • {key}: {val.get('sni', 'N/A')}\n"
+    else:
+        inbounds_info = "\n\n⚠️ Inbound'ы не найдены автоматически.\nНастройте вручную в servers_config.json"
+
+    await callback.message.edit_text(
+        f"✅ <b>СЕРВЕР ДОБАВЛЕН</b>\n\n"
+        f"📛 Название: <b>{data['name']}</b>\n"
+        f"🌐 IP: <code>{data['ip']}</code>\n"
+        f"🔗 Домен: <code>{data['domain']}</code>\n"
+        f"🖥 Панель: <code>{panel_url}</code>\n"
+        f"{inbounds_info}",
+        parse_mode="HTML"
+    )
+
+    await callback.message.answer(
+        "Сервер добавлен в конфигурацию.\n"
+        "Используйте 🖥 Статус серверов для управления.",
         reply_markup=Keyboards.admin_menu()
     )
+    await callback.answer("Сервер успешно добавлен!")
+
+
+@router.callback_query(F.data == "cancel_add_server")
+async def cancel_add_server(callback: CallbackQuery, state: FSMContext):
+    """Отмена добавления сервера"""
+    await state.clear()
+    await callback.message.edit_text("❌ Добавление сервера отменено")
+    await callback.message.answer("Главное меню:", reply_markup=Keyboards.admin_menu())
+    await callback.answer()

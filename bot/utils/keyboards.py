@@ -17,9 +17,9 @@ class Keyboards:
     def main_menu(is_admin: bool = False):
         """Главное меню"""
         buttons = [
-            [KeyboardButton(text="Создать ключ")],
-            [KeyboardButton(text="Моя статистика"), KeyboardButton(text="💰 Прайс")],
-            [KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
+            [KeyboardButton(text="Создать ключ"), KeyboardButton(text="🔄 Замена ключа")],
+            [KeyboardButton(text="🔧 Исправить ключ"), KeyboardButton(text="💰 Прайс")],
+            [KeyboardButton(text="Моя статистика"), KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
         ]
 
         if is_admin:
@@ -54,6 +54,14 @@ class Keyboards:
         )
 
     @staticmethod
+    def cancel_button():
+        """Клавиатура с кнопкой отмены"""
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        )
+
+    @staticmethod
     def subscription_periods():
         """Инлайн клавиатура с периодами подписки"""
         periods = get_subscription_periods()  # Загружаем актуальные цены
@@ -66,6 +74,43 @@ class Keyboards:
                 )
             ])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def replacement_periods(show_original: bool = False, remaining_days: int = 0):
+        """Инлайн клавиатура с периодами для замены ключа (без цены)"""
+        periods = get_subscription_periods()
+        buttons = []
+
+        # Если есть оригинальный срок - показываем его первым
+        if show_original and remaining_days > 0:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"✅ Оставить оригинальный ({remaining_days} дн.)",
+                    callback_data="replace_period_original"
+                )
+            ])
+
+        for key, value in periods.items():
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{value['name']} ({value['days']} дней)",
+                    callback_data=f"replace_period_{key}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_replacement")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def confirm_key_replacement(phone: str, period: str):
+        """Подтверждение замены ключа"""
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔄 Заменить", callback_data=f"replace_{phone}_{period}"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_replacement")
+                ]
+            ]
+        )
 
     @staticmethod
     def cancel():
@@ -225,6 +270,36 @@ class Keyboards:
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
+    def server_selection(servers: list):
+        """Клавиатура для выбора сервера (только для админа)"""
+        buttons = []
+        for i, server in enumerate(servers):
+            name = server.get('name', f'Server {i}')
+            domain = server.get('domain', server.get('ip', ''))
+            enabled = server.get('enabled', True)
+            active_for_new = server.get('active_for_new', True)
+
+            # Иконка статуса
+            if not enabled:
+                status = "🔴"
+            elif active_for_new:
+                status = "🟢"
+            else:
+                status = "🟡"
+
+            button_text = f"{status} {name} ({domain})"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"server_{i}"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_creation")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
     def inbound_selection(inbounds: list):
         """Клавиатура для выбора inbound (только для админа)"""
         buttons = []
@@ -249,6 +324,28 @@ class Keyboards:
             ])
 
         # Добавляем кнопку отмены
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_creation")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def inbound_selection_from_config(inbounds: dict, server_name: str):
+        """Клавиатура для выбора inbound из конфига сервера"""
+        buttons = []
+        for key, inbound in inbounds.items():
+            inbound_id = inbound.get('id', 1)
+            name_prefix = inbound.get('name_prefix', key)
+            sni = inbound.get('sni', '')
+
+            button_text = f"🔌 {name_prefix} (SNI: {sni[:20]}...)" if len(sni) > 20 else f"🔌 {name_prefix} ({sni})"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"srv_inbound_{key}"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton(text="◀️ Назад к серверам", callback_data="back_to_servers")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_creation")])
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
