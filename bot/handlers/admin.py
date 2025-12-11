@@ -1868,6 +1868,105 @@ async def cancel_sni_management(callback: CallbackQuery):
 
 # ===== ПОИСК КЛЮЧЕЙ =====
 
+async def search_clients_on_servers(query: str) -> list:
+    """Поиск клиентов по email/имени на всех X-UI серверах"""
+    import json
+    import subprocess
+    from pathlib import Path
+    from datetime import datetime
+
+    results = []
+    query_lower = query.lower()
+
+    # Загружаем конфиг серверов
+    servers_file = Path(__file__).parent.parent.parent / 'servers_config.json'
+    if not servers_file.exists():
+        return results
+
+    with open(servers_file, 'r') as f:
+        config = json.load(f)
+
+    # Поиск на локальном сервере
+    try:
+        import sqlite3
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, settings FROM inbounds WHERE enable=1")
+        rows = cursor.fetchall()
+        conn.close()
+
+        for inbound_id, settings_str in rows:
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    email = client.get('email', '')
+                    if query_lower in email.lower():
+                        expiry_time = client.get('expiryTime', 0)
+                        if expiry_time > 0:
+                            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+                            expiry_str = expiry_dt.strftime("%d.%m.%Y")
+                        else:
+                            expiry_str = "Безлимит"
+
+                        results.append({
+                            'email': email,
+                            'uuid': client.get('id', ''),
+                            'server': 'Local',
+                            'inbound_id': inbound_id,
+                            'expiry_time': expiry_time,
+                            'expiry_str': expiry_str,
+                            'limit_ip': client.get('limitIp', 2)
+                        })
+            except:
+                continue
+    except Exception as e:
+        logger.error(f"Ошибка поиска на локальном сервере: {e}")
+
+    # Поиск на удалённых серверах
+    for server in config.get('servers', []):
+        if server.get('local') or not server.get('enabled', True):
+            continue
+
+        ssh_config = server.get('ssh', {})
+        if not ssh_config.get('password') or not server.get('ip'):
+            continue
+
+        server_name = server.get('name', server.get('ip', 'Unknown'))
+
+        try:
+            cmd = f"sshpass -p '{ssh_config['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_config.get('user', 'root')}@{server['ip']} \"sqlite3 /etc/x-ui/x-ui.db 'SELECT settings FROM inbounds WHERE enable=1'\""
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split('\n'):
+                    try:
+                        settings = json.loads(line)
+                        for client in settings.get('clients', []):
+                            email = client.get('email', '')
+                            if query_lower in email.lower():
+                                expiry_time = client.get('expiryTime', 0)
+                                if expiry_time > 0:
+                                    expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+                                    expiry_str = expiry_dt.strftime("%d.%m.%Y")
+                                else:
+                                    expiry_str = "Безлимит"
+
+                                results.append({
+                                    'email': email,
+                                    'uuid': client.get('id', ''),
+                                    'server': server_name,
+                                    'expiry_time': expiry_time,
+                                    'expiry_str': expiry_str,
+                                    'limit_ip': client.get('limitIp', 2)
+                                })
+                    except:
+                        continue
+        except Exception as e:
+            logger.error(f"Ошибка поиска на сервере {server_name}: {e}")
+
+    return results
+
+
 @router.message(F.text == "🔍 Поиск ключа")
 @admin_only
 async def start_search_key(message: Message, state: FSMContext, **kwargs):
@@ -1898,18 +1997,23 @@ async def cancel_search_key(message: Message, state: FSMContext):
 
 @router.message(SearchKeyStates.waiting_for_search_query)
 async def process_search_query(message: Message, state: FSMContext, db: DatabaseManager):
-    """Обработка поискового запроса"""
+    """Обработка поискового запроса - ищет в базе и на X-UI серверах"""
     query = message.text.strip()
 
     if len(query) < 2:
         await message.answer("❌ Введите минимум 2 символа для поиска.")
         return
 
-    # Ищем ключи
+    status_msg = await message.answer("🔍 Поиск...")
+
+    # Ищем ключи в локальной базе
     keys = await db.search_keys(query)
 
-    if not keys:
-        await message.answer(
+    # Также ищем на X-UI серверах
+    xui_clients = await search_clients_on_servers(query)
+
+    if not keys and not xui_clients:
+        await status_msg.edit_text(
             f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
             "Попробуйте другой запрос или нажмите 'Отмена' для выхода.",
             parse_mode="HTML"
@@ -1919,65 +2023,88 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
     await state.clear()
 
     text = f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\n"
-    text += f"Запрос: «{query}»\n"
-    text += f"Найдено: {len(keys)} ключей\n\n"
-    text += "━━━━━━━━━━━━━━━━\n\n"
+    text += f"Запрос: «{query}»\n\n"
 
     buttons = []
+    idx = 0
 
-    for idx, key in enumerate(keys[:20], 1):  # Ограничиваем 20 результатами
-        # Получаем имя менеджера
-        custom_name = key.get('custom_name', '') or ''
-        full_name = key.get('full_name', '') or ''
-        username = key.get('username', '') or ''
+    # Показываем клиентов с X-UI серверов
+    if xui_clients:
+        text += f"<b>📡 На серверах X-UI:</b> {len(xui_clients)}\n"
+        text += "━━━━━━━━━━━━━━━━\n\n"
 
-        if custom_name:
-            manager_name = custom_name
-        elif full_name:
-            manager_name = full_name
-        elif username:
-            manager_name = f"@{username}"
-        else:
-            manager_name = f"ID: {key['manager_id']}"
+        for client in xui_clients[:15]:
+            idx += 1
+            email = client.get('email', 'N/A')
+            server = client.get('server', 'Unknown')
+            expiry = client.get('expiry_str', 'N/A')
+            uuid_short = client.get('uuid', '')[:8] + '...' if client.get('uuid') else 'N/A'
 
-        # Форматируем дату
-        created_at = key['created_at'][:16].replace('T', ' ')
-        price = key.get('price', 0) or 0
+            text += f"{idx}. <b>{email}</b>\n"
+            text += f"   🖥 Сервер: {server}\n"
+            text += f"   ⏰ Истекает: {expiry}\n"
+            text += f"   🔑 UUID: <code>{uuid_short}</code>\n\n"
 
-        # Отмечаем оплаченные/неоплаченные
-        if price > 0:
-            price_status = f"💰 {price} ₽"
-        else:
-            price_status = "❌ Не оплачен"
+            # Кнопка для получения ссылки
+            if client.get('uuid'):
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"🔗 {email[:20]}",
+                        callback_data=f"get_link_{client['uuid'][:32]}"
+                    )
+                ])
 
-        text += f"{idx}. <b>{key['phone_number']}</b>\n"
-        text += f"   👤 Менеджер: {manager_name}\n"
-        text += f"   📅 Срок: {key['period']}\n"
-        text += f"   {price_status}\n"
-        text += f"   🕒 Создан: {created_at}\n\n"
+            if len(text) > 2500:
+                text += "\n<i>... показаны первые результаты</i>\n"
+                break
 
-        # Кнопка удаления
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"🗑️ {key['phone_number'][:15]}",
-                callback_data=f"del_key_{key['id']}"
-            )
-        ])
+    # Показываем из локальной базы
+    if keys:
+        text += f"\n<b>📋 В базе бота:</b> {len(keys)}\n"
+        text += "━━━━━━━━━━━━━━━━\n\n"
 
-        # Ограничиваем длину сообщения
-        if len(text) > 3500:
-            text += "\n<i>... показаны первые результаты</i>"
-            break
+        for key in keys[:10]:
+            idx += 1
+            custom_name = key.get('custom_name', '') or ''
+            full_name = key.get('full_name', '') or ''
+            username = key.get('username', '') or ''
 
-    if len(keys) > 20:
-        text += f"\n<i>Показано 20 из {len(keys)} результатов</i>"
+            if custom_name:
+                manager_name = custom_name
+            elif full_name:
+                manager_name = full_name
+            elif username:
+                manager_name = f"@{username}"
+            else:
+                manager_name = f"ID: {key['manager_id']}"
+
+            created_at = key['created_at'][:16].replace('T', ' ')
+            price = key.get('price', 0) or 0
+            price_status = f"💰 {price} ₽" if price > 0 else "🎁 Бесплатно"
+
+            text += f"{idx}. <b>{key['phone_number']}</b>\n"
+            text += f"   👤 Менеджер: {manager_name}\n"
+            text += f"   📅 Срок: {key['period']}\n"
+            text += f"   {price_status}\n"
+            text += f"   🕒 Создан: {created_at}\n\n"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗑️ {key['phone_number'][:15]}",
+                    callback_data=f"del_key_{key['id']}"
+                )
+            ])
+
+            if len(text) > 3800:
+                text += "\n<i>... показаны первые результаты</i>"
+                break
 
     # Добавляем кнопки
     buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_key_delete")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "new_search")
@@ -1994,6 +2121,119 @@ async def new_search(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("get_link_"))
+async def get_client_link_callback(callback: CallbackQuery):
+    """Получить VLESS ссылку для клиента по UUID"""
+    uuid_prefix = callback.data.replace("get_link_", "")
+
+    await callback.answer("Генерирую ссылку...")
+
+    # Ищем полный UUID клиента на серверах
+    import json
+    import subprocess
+    import sqlite3
+    from pathlib import Path
+
+    servers_file = Path(__file__).parent.parent.parent / 'servers_config.json'
+    with open(servers_file, 'r') as f:
+        config = json.load(f)
+
+    client_info = None
+    full_uuid = None
+    target_server = None
+
+    # Ищем на локальном сервере
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+        rows = cursor.fetchall()
+        conn.close()
+
+        for (settings_str,) in rows:
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('id', '').startswith(uuid_prefix):
+                        full_uuid = client.get('id')
+                        client_info = client
+                        # Найти активный сервер для генерации ссылки
+                        for srv in config.get('servers', []):
+                            if srv.get('active_for_new'):
+                                target_server = srv
+                                break
+                        break
+            except:
+                continue
+            if client_info:
+                break
+    except Exception as e:
+        logger.error(f"Ошибка поиска UUID на локальном сервере: {e}")
+
+    # Если не нашли локально, ищем на удалённых
+    if not client_info:
+        for server in config.get('servers', []):
+            if server.get('local') or not server.get('enabled', True):
+                continue
+
+            ssh_config = server.get('ssh', {})
+            if not ssh_config.get('password') or not server.get('ip'):
+                continue
+
+            try:
+                cmd = f"sshpass -p '{ssh_config['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_config.get('user', 'root')}@{server['ip']} \"sqlite3 /etc/x-ui/x-ui.db 'SELECT settings FROM inbounds WHERE enable=1'\""
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split('\n'):
+                        try:
+                            settings = json.loads(line)
+                            for client in settings.get('clients', []):
+                                if client.get('id', '').startswith(uuid_prefix):
+                                    full_uuid = client.get('id')
+                                    client_info = client
+                                    target_server = server
+                                    break
+                        except:
+                            continue
+                        if client_info:
+                            break
+            except:
+                continue
+            if client_info:
+                break
+
+    if not client_info or not full_uuid:
+        await callback.message.answer("❌ Клиент не найден")
+        return
+
+    # Генерируем VLESS ссылку
+    from bot.api.remote_xui import get_client_link_from_active_server
+
+    email = client_info.get('email', 'client')
+    vless_link = await get_client_link_from_active_server(full_uuid, email)
+
+    if vless_link:
+        sub_url = f"https://zov-gor.ru/sub/{full_uuid}"
+
+        text = (
+            f"🔑 <b>Ключ клиента</b>\n\n"
+            f"👤 Email: <code>{email}</code>\n"
+            f"🔑 UUID: <code>{full_uuid[:8]}...</code>\n\n"
+            f"<b>VLESS ключ:</b>\n<code>{vless_link}</code>\n\n"
+            f"<b>Подписка:</b>\n<code>{sub_url}</code>"
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_key_delete")]
+        ])
+
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await callback.message.answer("❌ Не удалось сгенерировать ссылку")
 
 
 # ==================== УПРАВЛЕНИЕ ВЕБ-ЗАКАЗАМИ И РЕКВИЗИТАМИ ====================
