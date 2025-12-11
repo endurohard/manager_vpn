@@ -1927,11 +1927,95 @@ async def search_clients_on_servers(query: str) -> list:
         if server.get('local') or not server.get('enabled', True):
             continue
 
+        server_name = server.get('name', server.get('ip', 'Unknown'))
+
+        # Попробуем через API панели (если есть)
+        panel_config = server.get('panel', {})
+        if panel_config:
+            try:
+                from bot.api.remote_xui import _get_panel_opener, _panel_login
+                import asyncio
+                import ssl
+                import urllib.request
+                import http.cookiejar
+
+                ip = server.get('ip', '')
+                port = panel_config.get('port', 1020)
+                path = panel_config.get('path', '')
+                username = panel_config.get('username', '')
+                password = panel_config.get('password', '')
+
+                if ip and username and password:
+                    # Создаём opener для HTTPS без проверки сертификата
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+
+                    cookie_jar = http.cookiejar.CookieJar()
+                    opener = urllib.request.build_opener(
+                        urllib.request.HTTPCookieProcessor(cookie_jar),
+                        urllib.request.HTTPSHandler(context=ctx)
+                    )
+
+                    base_url = f"https://{ip}:{port}{path}"
+
+                    # Логин
+                    import urllib.parse
+                    login_data = urllib.parse.urlencode({
+                        'username': username,
+                        'password': password
+                    }).encode()
+
+                    login_req = urllib.request.Request(
+                        f"{base_url}/login",
+                        data=login_data,
+                        method='POST'
+                    )
+                    login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+                    resp = opener.open(login_req, timeout=10)
+                    login_result = json.loads(resp.read())
+
+                    if login_result.get('success'):
+                        # Получаем список inbounds
+                        list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
+                        resp = opener.open(list_req, timeout=10)
+                        data = json.loads(resp.read())
+
+                        if data.get('success'):
+                            for inbound in data.get('obj', []):
+                                settings_str = inbound.get('settings', '{}')
+                                try:
+                                    settings = json.loads(settings_str)
+                                    for client in settings.get('clients', []):
+                                        email = client.get('email', '')
+                                        if query_lower in email.lower():
+                                            expiry_time = client.get('expiryTime', 0)
+                                            if expiry_time > 0:
+                                                expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+                                                expiry_str = expiry_dt.strftime("%d.%m.%Y")
+                                            else:
+                                                expiry_str = "Безлимит"
+
+                                            results.append({
+                                                'email': email,
+                                                'uuid': client.get('id', ''),
+                                                'server': server_name,
+                                                'inbound_id': inbound.get('id'),
+                                                'expiry_time': expiry_time,
+                                                'expiry_str': expiry_str,
+                                                'limit_ip': client.get('limitIp', 2)
+                                            })
+                                except:
+                                    continue
+                        continue  # Переходим к следующему серверу
+            except Exception as e:
+                logger.error(f"Ошибка поиска через API панели {server_name}: {e}")
+
+        # Если нет панели или ошибка - пробуем через SSH
         ssh_config = server.get('ssh', {})
         if not ssh_config.get('password') or not server.get('ip'):
             continue
-
-        server_name = server.get('name', server.get('ip', 'Unknown'))
 
         try:
             cmd = f"sshpass -p '{ssh_config['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_config.get('user', 'root')}@{server['ip']} \"sqlite3 /etc/x-ui/x-ui.db 'SELECT settings FROM inbounds WHERE enable=1'\""
@@ -2178,6 +2262,76 @@ async def get_client_link_callback(callback: CallbackQuery):
             if server.get('local') or not server.get('enabled', True):
                 continue
 
+            # Попробуем через API панели (если есть)
+            panel_config = server.get('panel', {})
+            if panel_config:
+                try:
+                    import ssl
+                    import urllib.request
+                    import urllib.parse
+                    import http.cookiejar
+
+                    ip = server.get('ip', '')
+                    port = panel_config.get('port', 1020)
+                    path = panel_config.get('path', '')
+                    username = panel_config.get('username', '')
+                    password = panel_config.get('password', '')
+
+                    if ip and username and password:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+
+                        cookie_jar = http.cookiejar.CookieJar()
+                        opener = urllib.request.build_opener(
+                            urllib.request.HTTPCookieProcessor(cookie_jar),
+                            urllib.request.HTTPSHandler(context=ctx)
+                        )
+
+                        base_url = f"https://{ip}:{port}{path}"
+
+                        login_data = urllib.parse.urlencode({
+                            'username': username,
+                            'password': password
+                        }).encode()
+
+                        login_req = urllib.request.Request(
+                            f"{base_url}/login",
+                            data=login_data,
+                            method='POST'
+                        )
+                        login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+                        resp = opener.open(login_req, timeout=10)
+                        login_result = json.loads(resp.read())
+
+                        if login_result.get('success'):
+                            list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
+                            resp = opener.open(list_req, timeout=10)
+                            data = json.loads(resp.read())
+
+                            if data.get('success'):
+                                for inbound in data.get('obj', []):
+                                    settings_str = inbound.get('settings', '{}')
+                                    try:
+                                        settings = json.loads(settings_str)
+                                        for client in settings.get('clients', []):
+                                            if client.get('id', '').startswith(uuid_prefix):
+                                                full_uuid = client.get('id')
+                                                client_info = client
+                                                target_server = server
+                                                break
+                                    except:
+                                        continue
+                                    if client_info:
+                                        break
+                except Exception as e:
+                    logger.error(f"Ошибка поиска через API панели: {e}")
+
+            if client_info:
+                break
+
+            # Если нет панели - пробуем через SSH
             ssh_config = server.get('ssh', {})
             if not ssh_config.get('password') or not server.get('ip'):
                 continue
