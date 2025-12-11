@@ -494,18 +494,26 @@ async def api_fix_key(request):
         # Параметры из конфига целевого сервера
         main_inbound = target_server.get('inbounds', {}).get('main', {})
 
-        new_params = {
-            'type': 'tcp',
-            'security': main_inbound.get('security', 'reality'),
-            'pbk': main_inbound.get('pbk', ''),
-            'fp': main_inbound.get('fp', 'chrome'),
-            'sni': main_inbound.get('sni', ''),
-            'sid': main_inbound.get('sid', ''),
-            'flow': main_inbound.get('flow', ''),
-            'spx': '%2F'
-        }
+        # Формируем параметры в правильном порядке (как в remote_xui.py)
+        params_list = [
+            "type=tcp",
+            f"security={main_inbound.get('security', 'reality')}",
+            "encryption=none"
+        ]
 
-        new_query = '&'.join([f"{k}={v}" for k, v in new_params.items() if v])
+        if main_inbound.get('security', 'reality') == 'reality':
+            if main_inbound.get('pbk'):
+                params_list.append(f"pbk={main_inbound['pbk']}")
+            params_list.append(f"fp={main_inbound.get('fp', 'chrome')}")
+            if main_inbound.get('sni'):
+                params_list.append(f"sni={main_inbound['sni']}")
+            if main_inbound.get('sid'):
+                params_list.append(f"sid={main_inbound['sid']}")
+            if main_inbound.get('flow'):
+                params_list.append(f"flow={main_inbound['flow']}")
+            params_list.append("spx=%2F")
+
+        new_query = '&'.join(params_list)
 
         # Используем оригинальное имя или создаём новое
         server_name = target_server.get('name', 'VPN')
@@ -522,14 +530,19 @@ async def api_fix_key(request):
 
         local_name = local_server.get('name', 'Local') if local_server else 'Local'
 
+        # Получаем значения для отображения
+        security_val = main_inbound.get('security', 'reality')
+        sni_val = main_inbound.get('sni', '')
+        flow_val = main_inbound.get('flow', '')
+
         # Формируем список исправлений
         fixes_list = [
             f"Настройки обновлены по конфигу {target_server.get('name', 'Target')}",
             f"Хост: {target_domain}",
-            f"SNI: {new_params.get('sni', 'N/A')}",
+            f"SNI: {sni_val or 'N/A'}",
         ]
-        if new_params.get('flow'):
-            fixes_list.append(f"Flow: {new_params['flow']}")
+        if flow_val:
+            fixes_list.append(f"Flow: {flow_val}")
         else:
             fixes_list.append("Flow: пусто (убран)")
 
@@ -552,9 +565,9 @@ async def api_fix_key(request):
                 "uuid": new_uuid[:8] + "...",
                 "host": target_domain,
                 "port": str(target_port_final),
-                "security": new_params.get('security', 'reality'),
-                "sni": new_params.get('sni', 'N/A'),
-                "flow": new_params.get('flow', '') or 'пусто'
+                "security": security_val,
+                "sni": sni_val or 'N/A',
+                "flow": flow_val or 'пусто'
             }
         }
 
@@ -645,25 +658,27 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
 
     params = [
         "type=tcp",
+        "encryption=none",
         f"security={inbound.get('security', 'reality')}"
     ]
 
     if inbound.get('security') == 'reality':
-        if inbound.get('sni'):
-            params.append(f"sni={inbound['sni']}")
         if inbound.get('pbk'):
             params.append(f"pbk={inbound['pbk']}")
+        params.append(f"fp={inbound.get('fp', 'chrome')}")
+        if inbound.get('sni'):
+            params.append(f"sni={inbound['sni']}")
         if inbound.get('sid'):
             params.append(f"sid={inbound['sid']}")
-        params.append(f"fp={inbound.get('fp', 'chrome')}")
         if inbound.get('flow'):
             params.append(f"flow={inbound['flow']}")
+        params.append("spx=%2F")
 
     query = '&'.join(params)
 
     # Имя для ключа
     name_prefix = inbound.get('name_prefix', server_name)
-    link_name = name_prefix
+    link_name = f"{name_prefix} {email}" if email else name_prefix
     encoded_name = urllib.parse.quote(link_name)
 
     return f"vless://{uuid}@{domain}:{port}?{query}#{encoded_name}"
@@ -684,6 +699,7 @@ def generate_vless_link(client, inbound):
     # Базовые параметры
     params = [
         f"type={network}",
+        "encryption=none",
         f"security={security}"
     ]
 

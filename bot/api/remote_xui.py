@@ -103,22 +103,26 @@ async def create_client_via_panel(
     email: str,
     expire_days: int,
     ip_limit: int = 2
-) -> bool:
+) -> dict:
     """
     Создать клиента через API панели X-UI
+    Возвращает: {'success': bool, 'uuid': str, 'existing': bool}
+    - success=True, existing=False - клиент создан с переданным UUID
+    - success=True, existing=True, uuid=... - клиент с таким email уже есть, возвращаем его UUID
+    - success=False - ошибка
     """
     server_name = server_config.get('name', 'Unknown')
     panel = server_config.get('panel', {})
 
     if not panel:
         logger.warning(f"Нет конфигурации панели для {server_name}")
-        return False
+        return {'success': False}
 
     # Авторизуемся если нужно
     session = _get_panel_opener(server_name)
     if not session.get('logged_in'):
         if not await _panel_login(server_config):
-            return False
+            return {'success': False}
 
     base_url = session.get('base_url', '')
     expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
@@ -159,21 +163,66 @@ async def create_client_via_panel(
 
         if result.get('success'):
             logger.info(f"Клиент {email} создан на {server_name} через API")
-            return True
+            return {'success': True, 'uuid': client_uuid, 'existing': False}
         else:
             error_msg = result.get('msg', '')
             if 'Duplicate' in error_msg or 'exist' in error_msg.lower():
-                logger.info(f"Клиент {email} уже существует на {server_name}")
-                return True
+                # Клиент с таким email уже существует - ищем его UUID
+                logger.info(f"Клиент {email} уже существует на {server_name}, ищем UUID...")
+                existing_uuid = await _find_client_uuid_by_email(server_config, email)
+                if existing_uuid:
+                    logger.info(f"Найден существующий клиент {email} с UUID {existing_uuid}")
+                    return {'success': True, 'uuid': existing_uuid, 'existing': True}
+                else:
+                    logger.warning(f"Не удалось найти UUID клиента {email}")
+                    return {'success': False}
             logger.error(f"Ошибка создания клиента на {server_name}: {error_msg}")
             # Сбрасываем сессию на случай истечения
             session['logged_in'] = False
-            return False
+            return {'success': False}
 
     except Exception as e:
         logger.error(f"Ошибка создания клиента через панель {server_name}: {e}")
         session['logged_in'] = False
-        return False
+        return {'success': False}
+
+
+async def _find_client_uuid_by_email(server_config: dict, email: str) -> str:
+    """Найти UUID клиента по email на сервере"""
+    server_name = server_config.get('name', 'Unknown')
+    session = _get_panel_opener(server_name)
+
+    if not session.get('logged_in'):
+        return None
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        list_req = urllib.request.Request(list_url)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, opener.open, list_req)
+        data = json.loads(response.read().decode())
+
+        if not data.get('success'):
+            return None
+
+        for inbound in data.get('obj', []):
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('email') == email:
+                        return client.get('id')
+            except:
+                continue
+
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска клиента по email: {e}")
+        return None
 
 
 async def delete_client_via_panel(
@@ -249,13 +298,14 @@ async def create_client_on_remote_server(
     # Если есть конфигурация панели - используем API
     panel_config = server_config.get('panel', {})
     if panel_config:
-        return await create_client_via_panel(
+        result = await create_client_via_panel(
             server_config=server_config,
             client_uuid=client_uuid,
             email=email,
             expire_days=expire_days,
             ip_limit=ip_limit
         )
+        return result.get('success', False)
 
     # Иначе используем SSH
     ssh_config = server_config.get('ssh', {})
@@ -550,3 +600,313 @@ async def delete_client_on_all_remote_servers(client_uuid: str) -> dict:
         results[server_name] = success
 
     return results
+
+
+async def find_client_on_server(server_config: dict, client_uuid: str) -> dict:
+    """
+    Найти клиента по UUID на сервере через API панели
+    Возвращает: {'email': ..., 'inbound_name': ..., 'inbound_id': ..., 'expiry_time': ..., 'limit_ip': ...,
+                 'inbound_settings': {'sni': ..., 'pbk': ..., 'sid': ..., 'security': ..., 'fp': ...}}
+    """
+    server_name = server_config.get('name', 'Unknown')
+    panel = server_config.get('panel', {})
+
+    if not panel:
+        # Нет API панели - пробуем через SSH
+        return await _find_client_via_ssh(server_config, client_uuid)
+
+    session = _get_panel_opener(server_name)
+    if not session.get('logged_in'):
+        if not await _panel_login(server_config):
+            return None
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        # Получаем список всех inbound'ов
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        list_req = urllib.request.Request(list_url)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, opener.open, list_req)
+        data = json.loads(response.read().decode())
+
+        if not data.get('success'):
+            return None
+
+        # Карта inbound_id -> название из конфига
+        inbounds_config = server_config.get('inbounds', {})
+        id_to_name = {}
+        for name, cfg in inbounds_config.items():
+            inbound_id = cfg.get('id')
+            if inbound_id:
+                id_to_name[inbound_id] = name
+
+        # Ищем клиента во всех inbounds
+        for inbound in data.get('obj', []):
+            inbound_id = inbound.get('id')
+            settings_str = inbound.get('settings', '{}')
+            stream_str = inbound.get('streamSettings', '{}')
+
+            try:
+                settings = json.loads(settings_str)
+                stream = json.loads(stream_str)
+
+                for client in settings.get('clients', []):
+                    if client.get('id') == client_uuid:
+                        inbound_name = id_to_name.get(inbound_id, inbound.get('remark', 'main'))
+
+                        # Извлекаем реальные параметры inbound с сервера
+                        security = stream.get('security', 'reality')
+                        reality = stream.get('realitySettings', {})
+                        reality_settings = reality.get('settings', {})
+
+                        sni_list = reality.get('serverNames', [])
+                        short_ids = reality.get('shortIds', [])
+                        pbk = reality_settings.get('publicKey', '')
+                        fp = reality.get('fingerprint', 'chrome')
+
+                        return {
+                            'email': client.get('email', ''),
+                            'inbound_name': inbound_name,
+                            'inbound_remark': inbound.get('remark', ''),
+                            'inbound_id': inbound_id,
+                            'expiry_time': client.get('expiryTime', 0),
+                            'limit_ip': client.get('limitIp', 2),
+                            'flow': client.get('flow', ''),
+                            'enable': client.get('enable', True),
+                            # Реальные параметры inbound с сервера
+                            'inbound_settings': {
+                                'security': security,
+                                'sni': sni_list[0] if sni_list else '',
+                                'pbk': pbk,
+                                'sid': short_ids[0] if short_ids else '',
+                                'fp': fp
+                            }
+                        }
+            except:
+                continue
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Ошибка поиска клиента на {server_name}: {e}")
+        session['logged_in'] = False
+        return None
+
+
+async def _find_client_via_ssh(server_config: dict, client_uuid: str) -> dict:
+    """Найти клиента через SSH (для серверов без API панели)"""
+    ssh_config = server_config.get('ssh', {})
+    host = server_config.get('ip', '')
+    user = ssh_config.get('user', 'root')
+    password = ssh_config.get('password', '')
+
+    if not host or not password:
+        return None
+
+    sql_script = f'''
+import json
+import sqlite3
+
+conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+cursor = conn.cursor()
+cursor.execute("SELECT id, settings FROM inbounds WHERE enable=1")
+rows = cursor.fetchall()
+conn.close()
+
+for inbound_id, settings_str in rows:
+    try:
+        settings = json.loads(settings_str)
+        for client in settings.get('clients', []):
+            if client.get('id') == '{client_uuid}':
+                print(json.dumps({{
+                    'email': client.get('email', ''),
+                    'inbound_id': inbound_id,
+                    'expiry_time': client.get('expiryTime', 0),
+                    'limit_ip': client.get('limitIp', 2),
+                    'flow': client.get('flow', ''),
+                    'enable': client.get('enable', True)
+                }}))
+                exit()
+    except:
+        pass
+print('NOT_FOUND')
+'''
+
+    try:
+        cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host} \"python3 -c '{sql_script}'\""
+
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        result = stdout.decode().strip()
+        if result and result != 'NOT_FOUND':
+            data = json.loads(result)
+            # Определяем имя inbound из конфига
+            inbounds_config = server_config.get('inbounds', {})
+            inbound_id = data.get('inbound_id')
+            inbound_name = 'main'
+            for name, cfg in inbounds_config.items():
+                if cfg.get('id') == inbound_id:
+                    inbound_name = name
+                    break
+            data['inbound_name'] = inbound_name
+            return data
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска клиента через SSH на {server_config.get('name')}: {e}")
+        return None
+
+
+async def find_client_on_local_server(client_uuid: str) -> dict:
+    """Найти клиента в локальной базе X-UI"""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, settings FROM inbounds WHERE enable=1")
+        rows = cursor.fetchall()
+        conn.close()
+
+        for inbound_id, settings_str in rows:
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('id') == client_uuid:
+                        return {
+                            'email': client.get('email', ''),
+                            'inbound_id': inbound_id,
+                            'expiry_time': client.get('expiryTime', 0),
+                            'limit_ip': client.get('limitIp', 2),
+                            'flow': client.get('flow', ''),
+                            'enable': client.get('enable', True)
+                        }
+            except:
+                continue
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска в локальной базе: {e}")
+        return None
+
+
+async def get_client_link_from_active_server(client_uuid: str, client_email: str) -> str:
+    """
+    Получить VLESS ссылку для клиента с активного сервера
+
+    :param client_uuid: UUID клиента
+    :param client_email: Email клиента
+    :return: VLESS ссылка или None
+    """
+    config = load_servers_config()
+
+    # Ищем активный для новых подписок сервер
+    for server in config.get('servers', []):
+        if not server.get('enabled', True):
+            continue
+        if not server.get('active_for_new', False):
+            continue
+
+        server_name = server.get('name', 'Unknown')
+        domain = server.get('domain', server.get('ip', ''))
+        port = server.get('port', 443)
+
+        # Получаем настройки inbound из конфига
+        inbounds = server.get('inbounds', {})
+        main_inbound = inbounds.get('main', {})
+
+        sni = main_inbound.get('sni', '')
+        pbk = main_inbound.get('pbk', '')
+        sid = main_inbound.get('sid', '')
+        fp = main_inbound.get('fp', 'chrome')
+        security = main_inbound.get('security', 'reality')
+        flow = main_inbound.get('flow', '')
+        name_prefix = main_inbound.get('name_prefix', '')
+
+        # Формируем VLESS ссылку
+        vless_link = f"vless://{client_uuid}@{domain}:{port}"
+
+        params = [
+            "type=tcp",
+            f"security={security}",
+            "encryption=none"
+        ]
+
+        if security == 'reality':
+            if pbk:
+                params.append(f"pbk={pbk}")
+            if fp:
+                params.append(f"fp={fp}")
+            if sni:
+                params.append(f"sni={sni}")
+            if sid:
+                params.append(f"sid={sid}")
+            if flow:
+                params.append(f"flow={flow}")
+            params.append("spx=%2F")
+
+        # Название ссылки
+        link_name = f"{name_prefix} {client_email}" if name_prefix else client_email
+
+        vless_link += "?" + "&".join(params) + f"#{link_name}"
+
+        logger.info(f"Сгенерирована VLESS ссылка с сервера {server_name} для {client_email}")
+        return vless_link
+
+    # Если не нашли активный сервер, ищем любой включенный
+    for server in config.get('servers', []):
+        if not server.get('enabled', True):
+            continue
+        if server.get('local', False):
+            continue
+
+        server_name = server.get('name', 'Unknown')
+        domain = server.get('domain', server.get('ip', ''))
+        port = server.get('port', 443)
+
+        inbounds = server.get('inbounds', {})
+        main_inbound = inbounds.get('main', {})
+
+        sni = main_inbound.get('sni', '')
+        pbk = main_inbound.get('pbk', '')
+        sid = main_inbound.get('sid', '')
+        fp = main_inbound.get('fp', 'chrome')
+        security = main_inbound.get('security', 'reality')
+        flow = main_inbound.get('flow', '')
+        name_prefix = main_inbound.get('name_prefix', '')
+
+        vless_link = f"vless://{client_uuid}@{domain}:{port}"
+
+        params = [
+            "type=tcp",
+            f"security={security}",
+            "encryption=none"
+        ]
+
+        if security == 'reality':
+            if pbk:
+                params.append(f"pbk={pbk}")
+            if fp:
+                params.append(f"fp={fp}")
+            if sni:
+                params.append(f"sni={sni}")
+            if sid:
+                params.append(f"sid={sid}")
+            if flow:
+                params.append(f"flow={flow}")
+            params.append("spx=%2F")
+
+        link_name = f"{name_prefix} {client_email}" if name_prefix else client_email
+        vless_link += "?" + "&".join(params) + f"#{link_name}"
+
+        logger.info(f"Сгенерирована VLESS ссылка с сервера {server_name} для {client_email}")
+        return vless_link
+
+    logger.error(f"Не найден активный сервер для генерации ссылки")
+    return None

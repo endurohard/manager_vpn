@@ -111,12 +111,12 @@
         "main": {
           "id": 1,
           "security": "reality",
-          "sni": "p01-content.icloud.com",
+          "sni": "m.vk.com",
           "pbk": "HXNuA3woMvkSZbrJ2qiuKSwI2mksCvb1owrWHYuE4Uo",
           "sid": "2672b3",
           "flow": "",
           "fp": "chrome",
-          "name_prefix": "🇩🇪 Germany"
+          "name_prefix": "ГОС"
         }
       }
     }

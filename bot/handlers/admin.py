@@ -442,7 +442,7 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
             domain = selected_server.get('domain', selected_server.get('ip', ''))
             port = selected_server.get('port', 443)
 
-            params = ["type=tcp", f"security={selected_inbound.get('security', 'reality')}"]
+            params = ["type=tcp", "encryption=none", f"security={selected_inbound.get('security', 'reality')}"]
 
             if selected_inbound.get('security') == 'reality':
                 if selected_inbound.get('sni'):
@@ -457,7 +457,9 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
 
             query = '&'.join(params)
             name_prefix = selected_inbound.get('name_prefix', server_name)
-            encoded_name = urllib.parse.quote(name_prefix)
+            # Формируем имя: PREFIX-email (например: ГОС-+79991234567)
+            full_name = f"{name_prefix}-{phone}" if phone else name_prefix
+            encoded_name = urllib.parse.quote(full_name)
 
             vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
         else:
@@ -2211,16 +2213,19 @@ async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
         
         order_dict = dict(order)
     
-    # Генерируем ключ через X-UI
+    # Генерируем ключ через X-UI на активном сервере
     try:
+        from bot.api.remote_xui import get_client_link_from_active_server
+        from bot.config import INBOUND_ID
+
         status_msg = await message.answer("⏳ Генерирую ключ...")
 
         # Используем контакт как email/имя клиента
         client_name = f"web_{order_id}_{order_dict['contact'].replace('@', '').replace('+', '')[:15]}"
 
-        # Создаем клиента в X-UI
+        # Создаем клиента в X-UI (на активных серверах)
         client_data = await xui_client.add_client(
-            inbound_id=12,  # Используем inbound 12 по умолчанию
+            inbound_id=INBOUND_ID,  # Используем inbound из конфига
             email=client_name,
             phone=client_name,
             expire_days=order_dict["days"],
@@ -2228,15 +2233,17 @@ async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
         )
 
         if client_data and not client_data.get('error'):
-            # Получаем VLESS ссылку
-            vless_key = await xui_client.get_client_link(
-                inbound_id=12,
+            # Получаем UUID клиента
+            client_uuid = client_data.get('client_id', '')
+
+            # Получаем VLESS ссылку с активного сервера
+            vless_key = await get_client_link_from_active_server(
+                client_uuid=client_uuid,
                 client_email=client_name
             )
 
             if vless_key:
                 # Формируем ссылку подписки
-                client_uuid = client_data.get('client_id', '')
                 subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
 
                 # Сохраняем ключ в заказ
@@ -2399,13 +2406,16 @@ async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManage
     except:
         pass
 
-    # Генерируем ключ через X-UI (по умолчанию inbound 12)
+    # Генерируем ключ через X-UI на активном сервере
     try:
+        from bot.api.remote_xui import get_client_link_from_active_server
+        from bot.config import INBOUND_ID
+
         client_name = f"web_{order_id}_{order_dict['contact'].replace('@', '').replace('+', '')[:15]}"
 
-        # Создаем клиента в X-UI
+        # Создаем клиента в X-UI (на активных серверах)
         client_data = await xui_client.add_client(
-            inbound_id=12,  # Используем inbound 12 по умолчанию
+            inbound_id=INBOUND_ID,  # Используем inbound из конфига
             email=client_name,
             phone=client_name,
             expire_days=order_dict["days"],
@@ -2413,15 +2423,17 @@ async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManage
         )
 
         if client_data and not client_data.get('error'):
-            # Получаем VLESS ссылку
-            vless_key = await xui_client.get_client_link(
-                inbound_id=12,
+            # Получаем UUID клиента
+            client_uuid = client_data.get('client_id', '')
+
+            # Получаем VLESS ссылку с активного сервера
+            vless_key = await get_client_link_from_active_server(
+                client_uuid=client_uuid,
                 client_email=client_name
             )
 
             if vless_key:
                 # Формируем ссылку подписки
-                client_uuid = client_data.get('client_id', '')
                 subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
 
                 # Сохраняем ключ в заказ
