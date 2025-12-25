@@ -102,10 +102,11 @@ async def create_client_via_panel(
     client_uuid: str,
     email: str,
     expire_days: int,
-    ip_limit: int = 2
+    ip_limit: int = 2,
+    max_retries: int = 2
 ) -> dict:
     """
-    Создать клиента через API панели X-UI
+    Создать клиента через API панели X-UI с retry при ошибках
     Возвращает: {'success': bool, 'uuid': str, 'existing': bool}
     - success=True, existing=False - клиент создан с переданным UUID
     - success=True, existing=True, uuid=... - клиент с таким email уже есть, возвращаем его UUID
@@ -118,13 +119,6 @@ async def create_client_via_panel(
         logger.warning(f"Нет конфигурации панели для {server_name}")
         return {'success': False}
 
-    # Авторизуемся если нужно
-    session = _get_panel_opener(server_name)
-    if not session.get('logged_in'):
-        if not await _panel_login(server_config):
-            return {'success': False}
-
-    base_url = session.get('base_url', '')
     expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
     # Получаем inbound ID из конфигурации
@@ -147,44 +141,66 @@ async def create_client_via_panel(
         }]
     }
 
-    try:
-        add_url = f"{base_url}/panel/api/inbounds/addClient"
-        payload = urllib.parse.urlencode({
-            'id': inbound_id,
-            'settings': json.dumps(client_settings)
-        }).encode()
-
-        add_req = urllib.request.Request(add_url, data=payload, method='POST')
-        add_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, session['opener'].open, add_req)
-        result = json.loads(resp.read())
-
-        if result.get('success'):
-            logger.info(f"Клиент {email} создан на {server_name} через API")
-            return {'success': True, 'uuid': client_uuid, 'existing': False}
-        else:
-            error_msg = result.get('msg', '')
-            if 'Duplicate' in error_msg or 'exist' in error_msg.lower():
-                # Клиент с таким email уже существует - ищем его UUID
-                logger.info(f"Клиент {email} уже существует на {server_name}, ищем UUID...")
-                existing_uuid = await _find_client_uuid_by_email(server_config, email)
-                if existing_uuid:
-                    logger.info(f"Найден существующий клиент {email} с UUID {existing_uuid}")
-                    return {'success': True, 'uuid': existing_uuid, 'existing': True}
-                else:
-                    logger.warning(f"Не удалось найти UUID клиента {email}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Авторизуемся если нужно
+            session = _get_panel_opener(server_name)
+            if not session.get('logged_in'):
+                if not await _panel_login(server_config):
+                    if attempt < max_retries:
+                        logger.warning(f"Не удалось авторизоваться в панели {server_name}, попытка {attempt}/{max_retries}")
+                        await asyncio.sleep(1)
+                        continue
                     return {'success': False}
-            logger.error(f"Ошибка создания клиента на {server_name}: {error_msg}")
-            # Сбрасываем сессию на случай истечения
+
+            base_url = session.get('base_url', '')
+            add_url = f"{base_url}/panel/api/inbounds/addClient"
+            payload = urllib.parse.urlencode({
+                'id': inbound_id,
+                'settings': json.dumps(client_settings)
+            }).encode()
+
+            add_req = urllib.request.Request(add_url, data=payload, method='POST')
+            add_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, session['opener'].open, add_req)
+            result = json.loads(resp.read())
+
+            if result.get('success'):
+                logger.info(f"Клиент {email} создан на {server_name} через API")
+                return {'success': True, 'uuid': client_uuid, 'existing': False}
+            else:
+                error_msg = result.get('msg', '')
+                if 'Duplicate' in error_msg or 'exist' in error_msg.lower():
+                    # Клиент с таким email уже существует - ищем его UUID
+                    logger.info(f"Клиент {email} уже существует на {server_name}, ищем UUID...")
+                    existing_uuid = await _find_client_uuid_by_email(server_config, email)
+                    if existing_uuid:
+                        logger.info(f"Найден существующий клиент {email} с UUID {existing_uuid}")
+                        return {'success': True, 'uuid': existing_uuid, 'existing': True}
+                    else:
+                        logger.warning(f"Не удалось найти UUID клиента {email}")
+                        return {'success': False}
+                logger.error(f"Ошибка создания клиента на {server_name}: {error_msg}")
+                # Сбрасываем сессию на случай истечения
+                session['logged_in'] = False
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
+                return {'success': False}
+
+        except Exception as e:
+            logger.warning(f"Ошибка создания клиента через панель {server_name} (попытка {attempt}/{max_retries}): {e}")
+            session = _get_panel_opener(server_name)
             session['logged_in'] = False
+            if attempt < max_retries:
+                await asyncio.sleep(1)
+                continue
+            logger.error(f"Не удалось создать клиента через панель {server_name} после {max_retries} попыток")
             return {'success': False}
 
-    except Exception as e:
-        logger.error(f"Ошибка создания клиента через панель {server_name}: {e}")
-        session['logged_in'] = False
-        return {'success': False}
+    return {'success': False}
 
 
 async def _find_client_uuid_by_email(server_config: dict, email: str) -> str:

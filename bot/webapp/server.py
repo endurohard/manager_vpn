@@ -1103,8 +1103,9 @@ async def subscription_json_handler(request):
             link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
             if link:
                 name_prefix = inbound_config.get('name_prefix', server_name)
+                # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
                 links.append({
-                    'name': f"{name_prefix}-{client_email}",
+                    'name': f"{name_prefix} {client_email}",
                     'link': link,
                     'port': server.get('port', 443),
                     'tag': inbound_name,

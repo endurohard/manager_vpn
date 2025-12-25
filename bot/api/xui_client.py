@@ -620,8 +620,9 @@ class XUIClient:
                 params.append(f"host={ws_host}")
 
             # Добавляем префикс для LTE inbound (ID=28, порт 8449)
+            # Формат имени: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
             if inbound_id == 28:
-                link_name = f"LTE-Все операторы {client_email}"
+                link_name = f"LTE Все операторы {client_email}"
             else:
                 link_name = client_email
 

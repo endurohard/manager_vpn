@@ -447,10 +447,35 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         )
 
         if not client_data:
-            await callback.message.edit_text(
-                "❌ Ошибка при создании ключа в X-UI панели.\n"
-                "Проверьте подключение к панели."
+            # Сохраняем в очередь на повторное создание
+            error_msg = f"Не удалось создать клиента для ID: {phone}, период: {period_name} ({period_days} дней)"
+            pending_id = await db.add_pending_key(
+                telegram_id=user_id,
+                username=callback.from_user.username or "",
+                phone=phone,
+                period_key=period_key,
+                period_name=period_name,
+                period_days=period_days,
+                period_price=data.get("period_price", 0),
+                inbound_id=inbound_id,
+                error=error_msg
             )
+
+            if pending_id:
+                await callback.message.edit_text(
+                    "⏳ <b>Временная ошибка сервера</b>\n\n"
+                    f"🆔 ID/Номер: <code>{phone}</code>\n"
+                    f"📦 Тариф: {period_name}\n\n"
+                    "⚙️ Ваш ключ добавлен в очередь и будет создан автоматически "
+                    "в течение нескольких минут.\n\n"
+                    "📬 Вы получите уведомление с ключом, как только он будет готов.",
+                    parse_mode="HTML"
+                )
+            else:
+                await callback.message.edit_text(
+                    "❌ Ошибка при создании ключа в X-UI панели.\n"
+                    "Попробуйте позже или обратитесь к администратору."
+                )
 
             # Отправляем уведомление админу об ошибке
             await notify_admin_xui_error(
@@ -461,7 +486,7 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     'username': callback.from_user.username,
                     'phone': phone
                 },
-                error_details=f"Не удалось создать клиента для ID: {phone}, период: {period_name} ({period_days} дней)"
+                error_details=f"{error_msg}\n📋 Добавлен в очередь: #{pending_id}" if pending_id else error_msg
             )
 
             return
@@ -572,10 +597,13 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                         params.append(f"fp={main_inbound.get('fp', 'chrome')}")
                         if main_inbound.get('flow'):
                             params.append(f"flow={main_inbound['flow']}")
+                        params.append("spx=%2F")
 
                     query = '&'.join(params)
                     name_prefix = main_inbound.get('name_prefix', server.get('name', 'VPN'))
-                    encoded_name = urllib.parse.quote(name_prefix)
+                    # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
+                    full_name = f"{name_prefix} {phone}" if phone else name_prefix
+                    encoded_name = urllib.parse.quote(full_name)
 
                     vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
                     break
@@ -1079,8 +1107,8 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
 
         query = '&'.join(params)
         name_prefix = main_inbound.get('name_prefix', active_server.get('name', 'VPN'))
-        # Добавляем email к имени
-        display_name = f"{name_prefix}-{phone[-6:]}" if len(phone) > 6 else f"{name_prefix}-{phone}"
+        # Формируем имя как в get_client_link_from_active_server: PREFIX пробел EMAIL
+        display_name = f"{name_prefix} {phone}" if name_prefix else phone
         encoded_name = urllib.parse.quote(display_name)
 
         vless_link_for_user = f"vless://{client_uuid}@{server_domain}:{server_port}?{query}#{encoded_name}"
@@ -1328,8 +1356,8 @@ async def process_fix_key(message: Message, state: FSMContext):
                 if not inbound_config:
                     inbound_config = target_server.get('inbounds', {}).get('main', {})
 
-            # Формируем имя для ключа из remark inbound и email
-            fragment = urllib.parse.quote(f"{inbound_remark}-{client_email}", safe='')
+            # Формируем имя для ключа: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
+            fragment = urllib.parse.quote(f"{inbound_remark} {client_email}", safe='')
             found_on_server = True
         else:
             # Не нашли нигде - используем оригинальный fragment и main inbound

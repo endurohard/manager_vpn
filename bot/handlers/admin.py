@@ -454,11 +454,12 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
                 params.append(f"fp={selected_inbound.get('fp', 'chrome')}")
                 if selected_inbound.get('flow'):
                     params.append(f"flow={selected_inbound['flow']}")
+                params.append("spx=%2F")
 
             query = '&'.join(params)
             name_prefix = selected_inbound.get('name_prefix', server_name)
-            # Формируем имя: PREFIX-email (например: ГОС-+79991234567)
-            full_name = f"{name_prefix}-{phone}" if phone else name_prefix
+            # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
+            full_name = f"{name_prefix} {phone}" if phone else name_prefix
             encoded_name = urllib.parse.quote(full_name)
 
             vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
@@ -3826,3 +3827,33 @@ async def cancel_add_server(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Добавление сервера отменено")
     await callback.message.answer("Главное меню:", reply_markup=Keyboards.admin_menu())
     await callback.answer()
+
+
+@router.message(F.text == "/pending")
+@admin_only
+async def show_pending_keys(message: Message, db: DatabaseManager, **kwargs):
+    """Показать отложенные ключи в очереди на создание"""
+    stats = await db.get_pending_keys_count()
+    pending_keys = await db.get_pending_keys(limit=10)
+
+    text = "⏳ <b>ОЧЕРЕДЬ ОТЛОЖЕННЫХ КЛЮЧЕЙ</b>\n\n"
+    text += f"📊 <b>Статистика:</b>\n"
+    text += f"   • В ожидании: {stats['pending']}\n"
+    text += f"   • Создано: {stats['completed']}\n"
+    text += f"   • Не удалось: {stats['failed']}\n\n"
+
+    if pending_keys:
+        text += "📋 <b>Ключи в очереди:</b>\n"
+        for pk in pending_keys:
+            text += f"\n🔑 #{pk['id']} | <code>{pk['phone']}</code>\n"
+            text += f"   👤 User: {pk['telegram_id']} (@{pk['username'] or 'N/A'})\n"
+            text += f"   📦 Тариф: {pk['period_name']}\n"
+            text += f"   🔄 Попыток: {pk['retry_count']}/{pk['max_retries']}\n"
+            if pk['last_error']:
+                text += f"   ❌ Ошибка: {pk['last_error'][:50]}...\n"
+    else:
+        text += "✅ <i>Очередь пуста</i>"
+
+    text += "\n\n💡 <i>Retry каждые 2 минуты автоматически</i>"
+
+    await message.answer(text, parse_mode="HTML")
