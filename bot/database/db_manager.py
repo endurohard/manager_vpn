@@ -68,6 +68,28 @@ class DatabaseManager:
                 )
             ''')
 
+            # Таблица отложенных ключей (для retry при ошибках)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS pending_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER,
+                    username TEXT,
+                    phone TEXT,
+                    period_key TEXT,
+                    period_name TEXT,
+                    period_days INTEGER,
+                    period_price INTEGER DEFAULT 0,
+                    inbound_id INTEGER,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 5,
+                    last_error TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_retry_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            ''')
+
             await db.commit()
 
     async def add_manager(self, user_id: int, username: str, full_name: str, added_by: int) -> bool:
@@ -702,3 +724,141 @@ class DatabaseManager:
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    # ==================== МЕТОДЫ ДЛЯ ОТЛОЖЕННЫХ КЛЮЧЕЙ (RETRY) ====================
+
+    async def add_pending_key(self, telegram_id: int, username: str, phone: str,
+                              period_key: str, period_name: str, period_days: int,
+                              period_price: int, inbound_id: int, error: str) -> int:
+        """Добавить ключ в очередь на повторное создание"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    '''INSERT INTO pending_keys
+                       (telegram_id, username, phone, period_key, period_name, period_days,
+                        period_price, inbound_id, last_error, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')''',
+                    (telegram_id, username, phone, period_key, period_name, period_days,
+                     period_price, inbound_id, error)
+                )
+                await db.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            print(f"Error adding pending key: {e}")
+            return 0
+
+    async def get_pending_keys(self, limit: int = 10) -> List[Dict]:
+        """Получить список ключей для повторной попытки"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                '''SELECT * FROM pending_keys
+                   WHERE status = 'pending' AND retry_count < max_retries
+                   ORDER BY created_at ASC
+                   LIMIT ?''',
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def update_pending_key_retry(self, key_id: int, error: str) -> bool:
+        """Обновить информацию о попытке retry"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    '''UPDATE pending_keys
+                       SET retry_count = retry_count + 1,
+                           last_error = ?,
+                           last_retry_at = CURRENT_TIMESTAMP
+                       WHERE id = ?''',
+                    (error, key_id)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error updating pending key retry: {e}")
+            return False
+
+    async def mark_pending_key_completed(self, key_id: int, client_id: str = None) -> bool:
+        """Отметить ключ как успешно созданный"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    '''UPDATE pending_keys
+                       SET status = 'completed',
+                           completed_at = CURRENT_TIMESTAMP
+                       WHERE id = ?''',
+                    (key_id,)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error marking pending key as completed: {e}")
+            return False
+
+    async def mark_pending_key_failed(self, key_id: int) -> bool:
+        """Отметить ключ как окончательно неудавшийся (после всех retry)"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    '''UPDATE pending_keys
+                       SET status = 'failed'
+                       WHERE id = ?''',
+                    (key_id,)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error marking pending key as failed: {e}")
+            return False
+
+    async def get_pending_keys_count(self) -> Dict:
+        """Получить статистику по отложенным ключам"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Ожидающие
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM pending_keys WHERE status = 'pending'"
+            )
+            pending = (await cursor.fetchone())[0]
+
+            # Выполненные
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM pending_keys WHERE status = 'completed'"
+            )
+            completed = (await cursor.fetchone())[0]
+
+            # Неудачные
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM pending_keys WHERE status = 'failed'"
+            )
+            failed = (await cursor.fetchone())[0]
+
+            return {
+                'pending': pending,
+                'completed': completed,
+                'failed': failed
+            }
+
+    async def get_user_pending_keys(self, telegram_id: int) -> List[Dict]:
+        """Получить отложенные ключи пользователя"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                '''SELECT * FROM pending_keys
+                   WHERE telegram_id = ? AND status = 'pending'
+                   ORDER BY created_at DESC''',
+                (telegram_id,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def delete_pending_key(self, key_id: int) -> bool:
+        """Удалить отложенный ключ"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('DELETE FROM pending_keys WHERE id = ?', (key_id,))
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"Error deleting pending key: {e}")
+            return False

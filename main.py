@@ -15,11 +15,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import FSInputFile
 
-from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID
+from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, INBOUND_ID
 from bot.database import DatabaseManager
 from bot.api import XUIClient
 from bot.handlers import common, manager, admin
 from bot.webapp.server import start_webapp_server, set_bot_instance
+from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server
 
 # Путь к базе данных X-UI
 XUI_DB_PATH = Path("/etc/x-ui/x-ui.db")
@@ -111,6 +112,145 @@ async def send_xui_backup(bot: Bot):
             pass
 
 
+async def retry_pending_keys_task(bot: Bot, db: DatabaseManager, xui_client: XUIClient):
+    """Фоновая задача для повторной попытки создания ключей"""
+    # Ждём 30 секунд после старта бота перед первой проверкой
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            # Получаем список отложенных ключей
+            pending_keys = await db.get_pending_keys(limit=5)
+
+            for pending in pending_keys:
+                try:
+                    logger.info(f"Retry создания ключа #{pending['id']} для {pending['phone']}")
+
+                    # Пытаемся создать ключ
+                    client_data = await xui_client.add_client(
+                        inbound_id=pending['inbound_id'] or INBOUND_ID,
+                        email=pending['phone'],
+                        phone=pending['phone'],
+                        expire_days=pending['period_days'],
+                        ip_limit=2
+                    )
+
+                    if client_data and not client_data.get('error'):
+                        # Успешно создан
+                        client_uuid = client_data.get('client_id', '')
+
+                        # Получаем ссылку
+                        vless_link = await get_client_link_from_active_server(
+                            client_uuid=client_uuid,
+                            client_email=pending['phone']
+                        )
+
+                        # Отмечаем как выполненный
+                        await db.mark_pending_key_completed(pending['id'], client_uuid)
+
+                        # Сохраняем в историю
+                        await db.add_key_to_history(
+                            manager_id=pending['telegram_id'],
+                            client_email=pending['phone'],
+                            phone_number=pending['phone'],
+                            period=pending['period_name'],
+                            expire_days=pending['period_days'],
+                            client_id=client_uuid,
+                            price=pending['period_price'] or 0
+                        )
+
+                        # Отправляем уведомление пользователю
+                        try:
+                            if vless_link:
+                                await bot.send_message(
+                                    pending['telegram_id'],
+                                    f"✅ <b>Ваш ключ готов!</b>\n\n"
+                                    f"🆔 ID: <code>{pending['phone']}</code>\n"
+                                    f"📦 Тариф: {pending['period_name']}\n"
+                                    f"⏱ Срок: {pending['period_days']} дней\n\n"
+                                    f"🔑 <b>Ваш ключ:</b>\n<code>{vless_link}</code>\n\n"
+                                    f"📋 Нажмите на ключ чтобы скопировать",
+                                    parse_mode="HTML"
+                                )
+                            else:
+                                await bot.send_message(
+                                    pending['telegram_id'],
+                                    f"✅ <b>Ваш ключ создан!</b>\n\n"
+                                    f"🆔 ID: <code>{pending['phone']}</code>\n"
+                                    f"📦 Тариф: {pending['period_name']}\n\n"
+                                    f"⚠️ Не удалось получить ссылку. Обратитесь к администратору.",
+                                    parse_mode="HTML"
+                                )
+                        except Exception as e:
+                            logger.error(f"Не удалось отправить уведомление пользователю {pending['telegram_id']}: {e}")
+
+                        logger.info(f"Ключ #{pending['id']} успешно создан для {pending['phone']}")
+
+                    elif client_data and client_data.get('is_duplicate'):
+                        # Дубликат - отмечаем как завершённый
+                        await db.mark_pending_key_completed(pending['id'])
+                        try:
+                            await bot.send_message(
+                                pending['telegram_id'],
+                                f"⚠️ Клиент <code>{pending['phone']}</code> уже существует в системе.",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
+                        logger.info(f"Ключ #{pending['id']} - дубликат")
+
+                    else:
+                        # Ошибка - обновляем счётчик retry
+                        error = client_data.get('message', 'Unknown error') if client_data else 'Server unavailable'
+                        await db.update_pending_key_retry(pending['id'], error)
+
+                        # Проверяем, достигнут ли лимит попыток
+                        if pending['retry_count'] + 1 >= pending['max_retries']:
+                            await db.mark_pending_key_failed(pending['id'])
+                            try:
+                                await bot.send_message(
+                                    pending['telegram_id'],
+                                    f"❌ <b>Не удалось создать ключ</b>\n\n"
+                                    f"🆔 ID: <code>{pending['phone']}</code>\n"
+                                    f"📦 Тариф: {pending['period_name']}\n\n"
+                                    f"После нескольких попыток ключ не удалось создать.\n"
+                                    f"Пожалуйста, обратитесь к администратору.",
+                                    parse_mode="HTML"
+                                )
+                                # Уведомляем админа
+                                await bot.send_message(
+                                    ADMIN_ID,
+                                    f"🚨 <b>Ключ не создан после {pending['max_retries']} попыток</b>\n\n"
+                                    f"👤 User: {pending['telegram_id']} (@{pending['username']})\n"
+                                    f"🆔 ID: <code>{pending['phone']}</code>\n"
+                                    f"📦 Тариф: {pending['period_name']}\n"
+                                    f"❌ Ошибка: {error}",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+                            logger.error(f"Ключ #{pending['id']} - достигнут лимит retry")
+                        else:
+                            logger.warning(f"Ключ #{pending['id']} - попытка {pending['retry_count']+1}/{pending['max_retries']}")
+
+                    # Небольшая пауза между ключами
+                    await asyncio.sleep(2)
+
+                except Exception as e:
+                    logger.error(f"Ошибка обработки pending key #{pending['id']}: {e}")
+                    await db.update_pending_key_retry(pending['id'], str(e))
+
+            # Ждём 2 минуты перед следующей проверкой
+            await asyncio.sleep(120)
+
+        except asyncio.CancelledError:
+            logger.info("Задача retry отменена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в задаче retry: {e}")
+            await asyncio.sleep(60)
+
+
 async def main():
     """Основная функция запуска бота"""
 
@@ -187,14 +327,23 @@ async def main():
     backup_task = asyncio.create_task(daily_backup_task(bot))
     logger.info("Задача ежедневного бэкапа X-UI запущена (в 2:00)")
 
+    # Запуск задачи retry отложенных ключей
+    retry_task = asyncio.create_task(retry_pending_keys_task(bot, db, xui_client))
+    logger.info("Задача retry отложенных ключей запущена (каждые 2 минуты)")
+
     # Запуск бота
     try:
         logger.info("Бот запущен и готов к работе")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         backup_task.cancel()
+        retry_task.cancel()
         try:
             await backup_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await retry_task
         except asyncio.CancelledError:
             pass
         await bot.session.close()

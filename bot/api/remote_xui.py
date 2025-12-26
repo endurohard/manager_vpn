@@ -781,24 +781,45 @@ print('NOT_FOUND')
 
 
 async def find_client_on_local_server(client_uuid: str) -> dict:
-    """Найти клиента в локальной базе X-UI"""
+    """Найти клиента в локальной базе X-UI с настройками inbound"""
     import sqlite3
 
     try:
         conn = sqlite3.connect('/etc/x-ui/x-ui.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT id, settings FROM inbounds WHERE enable=1")
+        cursor.execute("SELECT id, remark, port, settings, stream_settings FROM inbounds WHERE enable=1")
         rows = cursor.fetchall()
         conn.close()
 
-        for inbound_id, settings_str in rows:
+        for inbound_id, remark, port, settings_str, stream_str in rows:
             try:
                 settings = json.loads(settings_str)
                 for client in settings.get('clients', []):
                     if client.get('id') == client_uuid:
+                        # Парсим stream_settings для получения reality параметров
+                        inbound_settings = {}
+                        try:
+                            stream = json.loads(stream_str) if stream_str else {}
+                            reality = stream.get('realitySettings', {})
+                            server_names = reality.get('serverNames', [])
+                            short_ids = reality.get('shortIds', [])
+                            inbound_settings = {
+                                'security': 'reality',
+                                'sni': server_names[0] if server_names else '',
+                                'pbk': reality.get('settings', {}).get('publicKey', ''),
+                                'sid': short_ids[0] if short_ids else '',
+                                'fp': reality.get('settings', {}).get('fingerprint', 'chrome'),
+                                'flow': client.get('flow', '')
+                            }
+                        except:
+                            pass
+
                         return {
                             'email': client.get('email', ''),
                             'inbound_id': inbound_id,
+                            'inbound_remark': remark or f'Inbound-{inbound_id}',
+                            'inbound_port': port,
+                            'inbound_settings': inbound_settings,
                             'expiry_time': client.get('expiryTime', 0),
                             'limit_ip': client.get('limitIp', 2),
                             'flow': client.get('flow', ''),

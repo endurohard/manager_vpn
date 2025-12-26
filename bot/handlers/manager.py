@@ -1274,19 +1274,20 @@ async def process_fix_key(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        await message.answer("🔍 Ищу клиента на сервере...")
+        await message.answer("🔍 Ищу клиента на серверах...")
 
-        # Ищем клиента на активном сервере (Germany) по UUID
+        # Сначала ищем на Germany (активный сервер)
         client_info = await find_client_on_server(target_server, uuid_part)
-        created_on_server = False
+        found_on_germany = client_info is not None
+        created_on_germany = False
 
         if not client_info:
             # Не нашли на Germany - ищем на локальном сервере
-            await message.answer("🔍 Не найден на Germany, ищу на локальном сервере...")
+            await message.answer("🔍 Не найден на Germany, ищу на локальном...")
             local_client = await find_client_on_local_server(uuid_part)
 
             if local_client:
-                # Нашли на локальном - создаём на Germany
+                # Нашли на локальном - берём данные и создаём на Germany
                 client_email = local_client.get('email', '')
                 expiry_time = local_client.get('expiry_time', 0)
                 limit_ip = local_client.get('limit_ip', 2)
@@ -1314,82 +1315,85 @@ async def process_fix_key(message: Message, state: FSMContext):
                 )
 
                 if create_result.get('success'):
-                    created_on_server = True
-                    # Используем UUID из результата (может отличаться если клиент уже существовал)
+                    created_on_germany = True
                     actual_uuid = create_result.get('uuid', uuid_part)
                     if create_result.get('existing'):
-                        # Клиент уже был на сервере с другим UUID
-                        if actual_uuid != uuid_part:
-                            uuid_part = actual_uuid
-                            await message.answer(f"✅ Клиент уже есть на Germany (другой UUID)")
-                        else:
-                            await message.answer(f"✅ Клиент уже есть на Germany!")
+                        await message.answer(f"✅ Клиент уже есть на Germany!")
                     else:
                         await message.answer(f"✅ Клиент создан на Germany!")
 
-                    # После создания ищем клиента заново, чтобы получить реальные параметры inbound
+                    # Ищем клиента заново для получения реальных параметров inbound
                     client_info = await find_client_on_server(target_server, actual_uuid)
                     if not client_info:
                         # Fallback если поиск не удался
                         client_info = {
                             'email': client_email,
                             'inbound_name': 'main',
+                            'inbound_remark': 'ГОС',
                             'expiry_time': expiry_time,
                             'limit_ip': limit_ip
                         }
                 else:
-                    await message.answer(f"⚠️ Не удалось создать на Germany, генерирую ключ...")
+                    error_msg = create_result.get('error', 'Неизвестная ошибка')
+                    await message.answer(f"⚠️ Не удалось создать: {error_msg}")
 
         if client_info:
-            # Нашли или создали клиента - берём данные
+            # Нашли клиента - берём данные
             client_email = client_info.get('email', '')
             client_inbound = client_info.get('inbound_name', 'main')
             inbound_remark = client_info.get('inbound_remark', client_inbound)
 
-            # Используем РЕАЛЬНЫЕ параметры inbound с сервера
+            # Используем РЕАЛЬНЫЕ параметры inbound с Germany
             real_inbound = client_info.get('inbound_settings', {})
             if real_inbound:
                 inbound_config = real_inbound
             else:
-                # Fallback на конфиг если нет реальных данных
+                # Fallback на конфиг Germany
                 inbound_config = target_server.get('inbounds', {}).get(client_inbound, {})
                 if not inbound_config:
                     inbound_config = target_server.get('inbounds', {}).get('main', {})
 
-            # Формируем имя для ключа: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
-            fragment = urllib.parse.quote(f"{inbound_remark} {client_email}", safe='')
+            # Формируем имя для ключа: PREFIX пробел EMAIL (БЕЗ url-encode, как в get_client_link_from_active_server)
+            link_name = f"{inbound_remark} {client_email}"
             found_on_server = True
         else:
-            # Не нашли нигде - используем оригинальный fragment и main inbound
-            fragment = original_fragment
+            # Не нашли нигде - используем оригинальный fragment и main inbound Germany
+            link_name = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
             inbound_config = target_server.get('inbounds', {}).get('main', {})
-            client_email = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
+            client_email = link_name
             inbound_remark = "Unknown"
             found_on_server = False
 
-        # Формируем исправленный ключ
+        # Формируем исправленный ключ с настройками Germany
+        # Порядок параметров как в get_client_link_from_active_server: type, security, encryption, pbk, fp, sni, sid, flow, spx
         target_domain = target_server.get('domain', target_server.get('ip'))
         target_port = target_server.get('port', 443)
 
-        new_params = {
-            'type': 'tcp',
-            'encryption': 'none',
-            'security': inbound_config.get('security', 'reality'),
-            'pbk': inbound_config.get('pbk', ''),
-            'fp': inbound_config.get('fp', 'chrome'),
-            'sni': inbound_config.get('sni', ''),
-            'sid': inbound_config.get('sid', ''),
-            'spx': '%2F'
-        }
-
-        # Добавляем flow только если он не пустой
+        security = inbound_config.get('security', 'reality')
         client_flow = client_info.get('flow', '') if client_info else ''
-        if client_flow:
-            new_params['flow'] = client_flow
 
-        new_query = '&'.join([f"{k}={v}" for k, v in new_params.items() if v])
+        params = [
+            "type=tcp",
+            f"security={security}",
+            "encryption=none"
+        ]
 
-        fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{fragment}"
+        if security == 'reality':
+            if inbound_config.get('pbk'):
+                params.append(f"pbk={inbound_config['pbk']}")
+            if inbound_config.get('fp'):
+                params.append(f"fp={inbound_config['fp']}")
+            if inbound_config.get('sni'):
+                params.append(f"sni={inbound_config['sni']}")
+            if inbound_config.get('sid'):
+                params.append(f"sid={inbound_config['sid']}")
+            if client_flow:
+                params.append(f"flow={client_flow}")
+            params.append("spx=%2F")
+
+        new_query = '&'.join(params)
+
+        fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
 
         # Генерируем QR код
         qr_code = generate_qr_code(fixed_link)
@@ -1398,36 +1402,42 @@ async def process_fix_key(message: Message, state: FSMContext):
         changes = []
         if target_domain not in vless_link:
             changes.append(f"• Хост: {target_domain}")
+        if str(target_port) not in vless_link:
+            changes.append(f"• Порт: {target_port}")
         if inbound_config.get('sni') and inbound_config['sni'] not in vless_link:
             changes.append(f"• SNI: {inbound_config['sni']}")
-        if 'flow=' in vless_link and not inbound_config.get('flow'):
+        if inbound_config.get('pbk') and inbound_config['pbk'] not in vless_link:
+            changes.append(f"• Public Key: обновлён")
+        if 'flow=' in vless_link and not client_flow:
             changes.append("• Flow: убран")
-        elif inbound_config.get('flow') and inbound_config['flow'] not in vless_link:
-            changes.append(f"• Flow: {inbound_config['flow']}")
-        if found_on_server and original_fragment != fragment:
+        elif client_flow and client_flow not in vless_link:
+            changes.append(f"• Flow: {client_flow}")
+        original_name = urllib.parse.unquote(original_fragment) if original_fragment else ""
+        if found_on_server and original_name != link_name:
             changes.append(f"• Имя: из базы сервера")
-        if created_on_server:
-            changes.append(f"• Создан на Germany")
 
         changes_text = "\n".join(changes) if changes else "Параметры актуальны"
 
-        if created_on_server:
+        if created_on_germany:
             status_text = "✅ Создан на Germany (из локальной базы)"
+        elif found_on_germany:
+            status_text = "✅ Найден на Germany"
         elif found_on_server:
-            status_text = "✅ Найден на сервере"
+            status_text = "✅ Найден на Germany"
         else:
-            status_text = "⚠️ Не найден, использованы параметры из ключа"
+            status_text = "⚠️ Не найден, использованы параметры Germany"
 
         await message.answer_photo(
             BufferedInputFile(qr_code.read(), filename="qrcode.png"),
             caption=(
                 f"✅ <b>Ключ исправлен!</b>\n\n"
                 f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
+                f"📍 Inbound: {inbound_remark}\n"
                 f"👤 Клиент: {client_email}\n"
                 f"🔍 Статус: {status_text}\n"
-                f"🌐 Хост: {target_domain}\n"
+                f"🌐 Хост: {target_domain}:{target_port}\n"
                 f"🔒 SNI: {inbound_config.get('sni', 'N/A')}\n"
-                f"📡 Flow: {inbound_config.get('flow') or 'пусто'}\n\n"
+                f"📡 Flow: {client_flow or 'пусто'}\n\n"
                 f"<b>Изменения:</b>\n{changes_text}"
             ),
             parse_mode="HTML"
