@@ -493,13 +493,20 @@ async def api_fix_key(request):
 
         # Параметры из конфига целевого сервера
         main_inbound = target_server.get('inbounds', {}).get('main', {})
+        network = main_inbound.get('network', 'tcp')
 
         # Формируем параметры в правильном порядке (как в remote_xui.py)
         params_list = [
-            "type=tcp",
-            f"security={main_inbound.get('security', 'reality')}",
+            f"type={network}",
             "encryption=none"
         ]
+
+        # Добавляем gRPC параметры если нужно
+        if network == 'grpc':
+            params_list.append(f"serviceName={main_inbound.get('serviceName', '')}")
+            params_list.append(f"authority={main_inbound.get('authority', '')}")
+
+        params_list.append(f"security={main_inbound.get('security', 'reality')}")
 
         if main_inbound.get('security', 'reality') == 'reality':
             if main_inbound.get('pbk'):
@@ -655,12 +662,19 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
     domain = server_config.get('domain', server_config.get('ip', ''))
     port = server_config.get('port', 443)
     server_name = server_config.get('name', 'Server')
+    network = inbound.get('network', 'tcp')
 
     params = [
-        "type=tcp",
-        "encryption=none",
-        f"security={inbound.get('security', 'reality')}"
+        f"type={network}",
+        "encryption=none"
     ]
+
+    # Добавляем gRPC параметры если нужно
+    if network == 'grpc':
+        params.append(f"serviceName={inbound.get('serviceName', '')}")
+        params.append(f"authority={inbound.get('authority', '')}")
+
+    params.append(f"security={inbound.get('security', 'reality')}")
 
     if inbound.get('security') == 'reality':
         if inbound.get('pbk'):
@@ -679,9 +693,8 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
     # Имя для ключа
     name_prefix = inbound.get('name_prefix', server_name)
     link_name = f"{name_prefix} {email}" if email else name_prefix
-    encoded_name = urllib.parse.quote(link_name)
 
-    return f"vless://{uuid}@{domain}:{port}?{query}#{encoded_name}"
+    return f"vless://{uuid}@{domain}:{port}?{query}#{link_name}"
 
 
 def generate_vless_link(client, inbound):
@@ -744,11 +757,7 @@ def generate_vless_link(client, inbound):
         name_prefix = main_inbound.get('name_prefix', '📶 Основной')
     link_name = f"{name_prefix}"
 
-    # URL encode имени
-    import urllib.parse
-    encoded_name = urllib.parse.quote(link_name)
-
-    return f"vless://{uuid}@raphaelvpn.ru:443?{query}#{encoded_name}"
+    return f"vless://{uuid}@raphaelvpn.ru:443?{query}#{link_name}"
 
 
 async def subscription_handler(request):

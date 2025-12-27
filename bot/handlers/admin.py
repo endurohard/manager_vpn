@@ -375,6 +375,10 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
     selected_server = data.get("selected_server")
     selected_inbound = data.get("selected_inbound")
 
+    # Логируем для отладки
+    logger.info(f"Admin create key: server={selected_server.get('name') if selected_server else 'None'}, "
+                f"inbound_id={inbound_id}, inbound_key={inbound_key}")
+
     await callback.message.edit_text("⏳ Создание ключа...")
 
     try:
@@ -414,7 +418,8 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
                     client_uuid=client_uuid,
                     email=phone,
                     expire_days=period_days,
-                    ip_limit=2
+                    ip_limit=2,
+                    inbound_id=inbound_id
                 )
         else:
             # Старый режим - на локальном сервере
@@ -441,17 +446,25 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
         if selected_server and selected_inbound:
             domain = selected_server.get('domain', selected_server.get('ip', ''))
             port = selected_server.get('port', 443)
+            network = selected_inbound.get('network', 'tcp')
 
-            params = ["type=tcp", "encryption=none", f"security={selected_inbound.get('security', 'reality')}"]
+            params = [f"type={network}", "encryption=none"]
+
+            # Добавляем gRPC параметры если нужно
+            if network == 'grpc':
+                params.append(f"serviceName={selected_inbound.get('serviceName', '')}")
+                params.append(f"authority={selected_inbound.get('authority', '')}")
+
+            params.append(f"security={selected_inbound.get('security', 'reality')}")
 
             if selected_inbound.get('security') == 'reality':
-                if selected_inbound.get('sni'):
-                    params.append(f"sni={selected_inbound['sni']}")
                 if selected_inbound.get('pbk'):
                     params.append(f"pbk={selected_inbound['pbk']}")
+                params.append(f"fp={selected_inbound.get('fp', 'chrome')}")
+                if selected_inbound.get('sni'):
+                    params.append(f"sni={selected_inbound['sni']}")
                 if selected_inbound.get('sid'):
                     params.append(f"sid={selected_inbound['sid']}")
-                params.append(f"fp={selected_inbound.get('fp', 'chrome')}")
                 if selected_inbound.get('flow'):
                     params.append(f"flow={selected_inbound['flow']}")
                 params.append("spx=%2F")
@@ -460,9 +473,8 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
             name_prefix = selected_inbound.get('name_prefix', server_name)
             # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
             full_name = f"{name_prefix} {phone}" if phone else name_prefix
-            encoded_name = urllib.parse.quote(full_name)
 
-            vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
+            vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{full_name}"
         else:
             # Старый режим - из локального сервера
             vless_link_original = await xui_client.get_client_link(
@@ -3494,9 +3506,11 @@ async def process_server_domain(message: Message, state: FSMContext):
         return
 
     domain = message.text.strip()
-    if domain == "-":
-        data = await state.get_data()
-        domain = data.get('ip', '')  # Используем IP как домен
+    data = await state.get_data()
+
+    # Если домен пустой, "-" или совпадает с IP - используем IP как домен
+    if not domain or domain == "-" or domain == data.get('ip', ''):
+        domain = data.get('ip', '')
 
     await state.update_data(domain=domain)
     await message.answer(
@@ -3630,9 +3644,9 @@ async def test_server_connection(callback: CallbackQuery, state: FSMContext):
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Тест авторизации
+            # Тест авторизации (form-data, не JSON!)
             login_url = f"{panel_url}/login"
-            async with session.post(login_url, json={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     response_data = await resp.json()
                     results['panel_auth'] = response_data.get('success', False)
@@ -3708,9 +3722,9 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Авторизация
+            # Авторизация (form-data, не JSON!)
             login_url = f"{panel_url}/login"
-            await session.post(login_url, json={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
+            await session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
 
             # Получаем inbound'ы через API
             inbounds_url = f"{panel_url}/panel/api/inbounds/list"
@@ -3730,6 +3744,7 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                             try:
                                 stream_settings = json.loads(inbound.get('streamSettings', '{}'))
                                 security = stream_settings.get('security', 'none')
+                                network = stream_settings.get('network', 'tcp')
 
                                 if security == 'reality':
                                     reality = stream_settings.get('realitySettings', {})
@@ -3741,7 +3756,7 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                                     fp = reality.get('settings', {}).get('fingerprint', 'chrome')
 
                                     inbound_key = remark.lower().replace(' ', '_').replace('-', '_')
-                                    inbounds_data[inbound_key] = {
+                                    inbound_config = {
                                         "id": int(inbound_id),
                                         "security": "reality",
                                         "sni": sni,
@@ -3751,6 +3766,10 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                                         "fp": fp,
                                         "name_prefix": f"🌐 {remark}"
                                     }
+                                    # Добавляем network если не tcp (по умолчанию)
+                                    if network and network != 'tcp':
+                                        inbound_config["network"] = network
+                                    inbounds_data[inbound_key] = inbound_config
                             except:
                                 pass
     except Exception as e:

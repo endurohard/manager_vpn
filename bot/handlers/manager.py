@@ -23,6 +23,7 @@ router = Router()
 class CreateKeyStates(StatesGroup):
     """Состояния для создания ключа"""
     waiting_for_phone = State()
+    waiting_for_server = State()  # Выбор сервера
     waiting_for_inbound = State()  # Для админа - выбор inbound
     waiting_for_period = State()
     waiting_for_custom_price = State()  # Для админа - ввод кастомной цены
@@ -74,17 +75,35 @@ async def start_create_key(message: Message, state: FSMContext, db: DatabaseMana
 @router.message(CreateKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
 async def generate_user_identifier(message: Message, state: FSMContext, xui_client: XUIClient):
     """Генерация случайного ID пользователя"""
+    from bot.api.remote_xui import load_servers_config
+
     user_id_value = generate_user_id()
     await state.update_data(phone=user_id_value)
 
-    # Используем дефолтный inbound для всех
-    await state.update_data(inbound_id=INBOUND_ID)
-    await state.set_state(CreateKeyStates.waiting_for_period)
+    # Загружаем список серверов
+    servers_config = load_servers_config()
+    servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
 
+    if not servers:
+        # Если нет удалённых серверов, используем локальный
+        await state.update_data(inbound_id=INBOUND_ID)
+        await state.set_state(CreateKeyStates.waiting_for_period)
+        await message.answer(
+            f"Сгенерирован ID: {user_id_value}\n\n"
+            "Выберите срок действия ключа:",
+            reply_markup=Keyboards.subscription_periods()
+        )
+        return
+
+    await state.update_data(servers=servers)
+    await state.set_state(CreateKeyStates.waiting_for_server)
     await message.answer(
-        f"Сгенерирован ID: {user_id_value}\n\n"
-        "Выберите срок действия ключа:",
-        reply_markup=Keyboards.subscription_periods()
+        f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
+        f"🖥 <b>Выберите сервер:</b>\n"
+        f"🟢 - активен для новых\n"
+        f"🟡 - отключен для новых",
+        reply_markup=Keyboards.server_selection(servers),
+        parse_mode="HTML"
     )
 
 
@@ -112,18 +131,35 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
 
     # Проверяем, не ввел ли пользователь вручную текст кнопки "Сгенерировать"
     if 'генерир' in user_input.lower() or 'generate' in user_input.lower():
-        # Автоматически генерируем ID
+        # Автоматически генерируем ID и показываем выбор сервера
+        from bot.api.remote_xui import load_servers_config
+
         generated_id = generate_user_id()
         await state.update_data(phone=generated_id, inbound_id=INBOUND_ID)
-        await state.set_state(CreateKeyStates.waiting_for_period)
 
-        await message.answer(
-            f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
-            f"🆔 <code>{generated_id}</code>\n\n"
-            "Выберите срок действия ключа:",
-            reply_markup=Keyboards.subscription_periods(),
-            parse_mode="HTML"
-        )
+        servers_config = load_servers_config()
+        servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+        if not servers:
+            await state.set_state(CreateKeyStates.waiting_for_period)
+            await message.answer(
+                f"⚠️ Обнаружен текст кнопки. Автоматически сгенерирован новый ID:\n"
+                f"🆔 <code>{generated_id}</code>\n\n"
+                "Выберите срок действия ключа:",
+                reply_markup=Keyboards.subscription_periods(),
+                parse_mode="HTML"
+            )
+        else:
+            await state.update_data(servers=servers)
+            await state.set_state(CreateKeyStates.waiting_for_server)
+            await message.answer(
+                f"🆔 Сгенерирован ID: <code>{generated_id}</code>\n\n"
+                f"🖥 <b>Выберите сервер:</b>\n"
+                f"🟢 - активен для новых\n"
+                f"🟡 - отключен для новых",
+                reply_markup=Keyboards.server_selection(servers),
+                parse_mode="HTML"
+            )
         return
 
     # Проверяем минимальную длину
@@ -154,13 +190,67 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
         )
 
     await state.update_data(phone=user_input, inbound_id=INBOUND_ID)
-    await state.set_state(CreateKeyStates.waiting_for_period)
 
+    # Загружаем список серверов
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+    if not servers:
+        # Если нет удалённых серверов, используем локальный
+        await state.set_state(CreateKeyStates.waiting_for_period)
+        await message.answer(
+            format_message + "Выберите срок действия ключа:",
+            reply_markup=Keyboards.subscription_periods(),
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(servers=servers)
+    await state.set_state(CreateKeyStates.waiting_for_server)
     await message.answer(
-        format_message + "Выберите срок действия ключа:",
+        format_message +
+        "🖥 <b>Выберите сервер:</b>\n"
+        "🟢 - активен для новых\n"
+        "🟡 - отключен для новых",
+        reply_markup=Keyboards.server_selection(servers),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(CreateKeyStates.waiting_for_server, F.data.startswith("server_"))
+async def process_server_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора сервера для создания ключа"""
+    server_idx = int(callback.data.split("_", 1)[1])
+    data = await state.get_data()
+    servers = data.get('servers', [])
+    phone = data.get('phone', '')
+
+    if server_idx >= len(servers):
+        await callback.answer("Ошибка: сервер не найден", show_alert=True)
+        return
+
+    selected_server = servers[server_idx]
+    main_inbound = selected_server.get('inbounds', {}).get('main', {})
+    inbound_id = main_inbound.get('id', 1)
+
+    await state.update_data(
+        selected_server=selected_server,
+        selected_inbound=main_inbound,
+        inbound_id=inbound_id
+    )
+
+    server_name = selected_server.get('name', 'Unknown')
+
+    await state.set_state(CreateKeyStates.waiting_for_period)
+    await callback.message.edit_text(
+        f"🆔 ID: <code>{phone}</code>\n"
+        f"🖥 Сервер: <b>{server_name}</b>\n\n"
+        "Выберите срок действия ключа:",
         reply_markup=Keyboards.subscription_periods(),
         parse_mode="HTML"
     )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("inbound_"))
@@ -433,18 +523,43 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
     period_name = data.get("period_name")
     period_days = data.get("period_days")
     inbound_id = data.get("inbound_id", INBOUND_ID)  # Используем выбранный или дефолтный
+    selected_server = data.get("selected_server")  # Выбранный сервер (если есть)
+    selected_inbound = data.get("selected_inbound")  # Выбранный inbound
 
     await callback.message.edit_text("Создание ключа...")
 
     try:
-        # Создаем клиента в X-UI
-        client_data = await xui_client.add_client(
-            inbound_id=inbound_id,
-            email=phone,
-            phone=phone,
-            expire_days=period_days,
-            ip_limit=2
-        )
+        # Если выбран конкретный сервер - создаём только на нём
+        if selected_server and not selected_server.get('local', False):
+            import uuid as uuid_module
+            from bot.api.remote_xui import create_client_on_remote_server
+
+            client_uuid = str(uuid_module.uuid4())
+            success = await create_client_on_remote_server(
+                server_config=selected_server,
+                client_uuid=client_uuid,
+                email=phone,
+                expire_days=period_days,
+                ip_limit=2,
+                inbound_id=inbound_id
+            )
+
+            if success:
+                client_data = {
+                    'client_id': client_uuid,
+                    'local_created': False
+                }
+            else:
+                client_data = None
+        else:
+            # Старая логика - создаём на локальном и всех удалённых
+            client_data = await xui_client.add_client(
+                inbound_id=inbound_id,
+                email=phone,
+                phone=phone,
+                expire_days=period_days,
+                ip_limit=2
+            )
 
         if not client_data:
             # Сохраняем в очередь на повторное создание
@@ -566,47 +681,58 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
             if vless_link_original:
                 vless_link_for_user = XUIClient.replace_ip_with_domain(vless_link_original, DOMAIN)
 
-        # Если локально не создан или не получилось - генерируем из конфига активного сервера
+        # Если локально не создан или не получилось - генерируем из конфига сервера
         if not vless_link_for_user:
-            from bot.api.remote_xui import load_servers_config
             import urllib.parse
 
-            servers_config = load_servers_config()
-            # Ищем первый активный сервер
-            for server in servers_config.get('servers', []):
-                if not server.get('enabled', True):
-                    continue
-                if not server.get('active_for_new', True):
-                    continue
+            # Если есть выбранный сервер - используем его, иначе ищем первый активный
+            target_server = selected_server
+            target_inbound = selected_inbound
 
-                # Генерируем VLESS ссылку из конфига
-                main_inbound = server.get('inbounds', {}).get('main', {})
-                if main_inbound:
-                    domain = server.get('domain', server.get('ip', ''))
-                    port = server.get('port', 443)
-
-                    params = ["type=tcp", "encryption=none", f"security={main_inbound.get('security', 'reality')}"]
-
-                    if main_inbound.get('security') == 'reality':
-                        if main_inbound.get('sni'):
-                            params.append(f"sni={main_inbound['sni']}")
-                        if main_inbound.get('pbk'):
-                            params.append(f"pbk={main_inbound['pbk']}")
-                        if main_inbound.get('sid'):
-                            params.append(f"sid={main_inbound['sid']}")
-                        params.append(f"fp={main_inbound.get('fp', 'chrome')}")
-                        if main_inbound.get('flow'):
-                            params.append(f"flow={main_inbound['flow']}")
-                        params.append("spx=%2F")
-
-                    query = '&'.join(params)
-                    name_prefix = main_inbound.get('name_prefix', server.get('name', 'VPN'))
-                    # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
-                    full_name = f"{name_prefix} {phone}" if phone else name_prefix
-                    encoded_name = urllib.parse.quote(full_name)
-
-                    vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{encoded_name}"
+            if not target_server:
+                from bot.api.remote_xui import load_servers_config
+                servers_config = load_servers_config()
+                for server in servers_config.get('servers', []):
+                    if not server.get('enabled', True):
+                        continue
+                    if not server.get('active_for_new', True):
+                        continue
+                    target_server = server
+                    target_inbound = server.get('inbounds', {}).get('main', {})
                     break
+
+            if target_server and target_inbound:
+                domain = target_server.get('domain', target_server.get('ip', ''))
+                port = target_server.get('port', 443)
+                network = target_inbound.get('network', 'tcp')
+
+                params = [f"type={network}", "encryption=none"]
+
+                # Добавляем gRPC параметры если нужно
+                if network == 'grpc':
+                    params.append(f"serviceName={target_inbound.get('serviceName', '')}")
+                    params.append(f"authority={target_inbound.get('authority', '')}")
+
+                params.append(f"security={target_inbound.get('security', 'reality')}")
+
+                if target_inbound.get('security') == 'reality':
+                    if target_inbound.get('pbk'):
+                        params.append(f"pbk={target_inbound['pbk']}")
+                    params.append(f"fp={target_inbound.get('fp', 'chrome')}")
+                    if target_inbound.get('sni'):
+                        params.append(f"sni={target_inbound['sni']}")
+                    if target_inbound.get('sid'):
+                        params.append(f"sid={target_inbound['sid']}")
+                    if target_inbound.get('flow'):
+                        params.append(f"flow={target_inbound['flow']}")
+                    params.append("spx=%2F")
+
+                query = '&'.join(params)
+                name_prefix = target_inbound.get('name_prefix', target_server.get('name', 'VPN'))
+                # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
+                full_name = f"{name_prefix} {phone}" if phone else name_prefix
+
+                vless_link_for_user = f"vless://{client_uuid}@{domain}:{port}?{query}#{full_name}"
 
         if not vless_link_for_user:
             await callback.message.edit_text(
@@ -1092,13 +1218,20 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
                 logger.info(f"Создан клиент {phone} на сервере {active_server.get('name')}, UUID: {client_uuid}")
 
         # Формируем VLESS ссылку
-        params = ["type=tcp", "encryption=none", f"security={main_inbound.get('security', 'reality')}"]
+        network = main_inbound.get('network', 'tcp')
+        params = [f"type={network}", "encryption=none"]
+
+        # Добавляем gRPC параметры если нужно
+        if network == 'grpc':
+            params.append(f"serviceName={main_inbound.get('serviceName', '')}")
+            params.append(f"authority={main_inbound.get('authority', '')}")
+
+        params.append(f"security={main_inbound.get('security', 'reality')}")
 
         if main_inbound.get('security') == 'reality':
             if main_inbound.get('pbk'):
                 params.append(f"pbk={main_inbound['pbk']}")
-            if main_inbound.get('fp'):
-                params.append(f"fp={main_inbound['fp']}")
+            params.append(f"fp={main_inbound.get('fp', 'chrome')}")
             if main_inbound.get('sni'):
                 params.append(f"sni={main_inbound['sni']}")
             if main_inbound.get('sid'):
@@ -1109,9 +1242,8 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
         name_prefix = main_inbound.get('name_prefix', active_server.get('name', 'VPN'))
         # Формируем имя как в get_client_link_from_active_server: PREFIX пробел EMAIL
         display_name = f"{name_prefix} {phone}" if name_prefix else phone
-        encoded_name = urllib.parse.quote(display_name)
 
-        vless_link_for_user = f"vless://{client_uuid}@{server_domain}:{server_port}?{query}#{encoded_name}"
+        vless_link_for_user = f"vless://{client_uuid}@{server_domain}:{server_port}?{query}#{display_name}"
 
         # Сохраняем в базу данных ЗАМЕН
         await db.add_key_replacement(
@@ -1370,19 +1502,25 @@ async def process_fix_key(message: Message, state: FSMContext):
         target_port = target_server.get('port', 443)
 
         security = inbound_config.get('security', 'reality')
+        network = inbound_config.get('network', 'tcp')
         client_flow = client_info.get('flow', '') if client_info else ''
 
         params = [
-            "type=tcp",
-            f"security={security}",
+            f"type={network}",
             "encryption=none"
         ]
+
+        # Добавляем gRPC параметры если нужно
+        if network == 'grpc':
+            params.append(f"serviceName={inbound_config.get('serviceName', '')}")
+            params.append(f"authority={inbound_config.get('authority', '')}")
+
+        params.append(f"security={security}")
 
         if security == 'reality':
             if inbound_config.get('pbk'):
                 params.append(f"pbk={inbound_config['pbk']}")
-            if inbound_config.get('fp'):
-                params.append(f"fp={inbound_config['fp']}")
+            params.append(f"fp={inbound_config.get('fp', 'chrome')}")
             if inbound_config.get('sni'):
                 params.append(f"sni={inbound_config['sni']}")
             if inbound_config.get('sid'):
