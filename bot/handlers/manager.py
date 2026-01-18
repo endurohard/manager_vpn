@@ -1394,26 +1394,29 @@ async def process_fix_key(message: Message, state: FSMContext):
         # Загружаем конфиг серверов
         servers_config = load_servers_config()
 
-        # Находим активный сервер (Germany)
+        # Находим Germany сервер (active_for_new)
         target_server = None
         for srv in servers_config.get('servers', []):
-            if srv.get('active_for_new'):
+            if srv.get('active_for_new') and srv.get('enabled', True) and not srv.get('local', False):
                 target_server = srv
                 break
 
         if not target_server:
-            await message.answer("❌ Активный сервер не найден в конфиге")
+            await message.answer("❌ Активный сервер (Germany) не найден в конфиге")
             await state.clear()
             return
 
-        await message.answer("🔍 Ищу клиента на серверах...")
+        await message.answer(f"🔍 Ищу клиента на {target_server.get('name')}...")
 
-        # Сначала ищем на Germany (активный сервер)
+        # Сначала ищем на Germany
         client_info = await find_client_on_server(target_server, uuid_part)
-        found_on_germany = client_info is not None
-        created_on_germany = False
+        found_on_server_name = None
+        created_on_server = False
 
-        if not client_info:
+        if client_info:
+            found_on_server_name = target_server.get('name')
+            logger.info(f"Клиент найден на сервере {found_on_server_name}")
+        else:
             # Не нашли на Germany - ищем на локальном сервере
             await message.answer("🔍 Не найден на Germany, ищу на локальном...")
             local_client = await find_client_on_local_server(uuid_part)
@@ -1435,7 +1438,7 @@ async def process_fix_key(message: Message, state: FSMContext):
                 else:
                     expire_days = 365  # Безлимит
 
-                await message.answer(f"📤 Создаю клиента {client_email} на Germany...")
+                await message.answer(f"📤 Создаю клиента {client_email} на {target_server.get('name')}...")
 
                 # Создаём на Germany через API панели
                 create_result = await create_client_via_panel(
@@ -1447,12 +1450,13 @@ async def process_fix_key(message: Message, state: FSMContext):
                 )
 
                 if create_result.get('success'):
-                    created_on_germany = True
+                    created_on_server = True
+                    found_on_server_name = target_server.get('name')
                     actual_uuid = create_result.get('uuid', uuid_part)
                     if create_result.get('existing'):
-                        await message.answer(f"✅ Клиент уже есть на Germany!")
+                        await message.answer(f"✅ Клиент уже есть на {target_server.get('name')}!")
                     else:
-                        await message.answer(f"✅ Клиент создан на Germany!")
+                        await message.answer(f"✅ Клиент создан на {target_server.get('name')}!")
 
                     # Ищем клиента заново для получения реальных параметров inbound
                     client_info = await find_client_on_server(target_server, actual_uuid)
@@ -1461,7 +1465,7 @@ async def process_fix_key(message: Message, state: FSMContext):
                         client_info = {
                             'email': client_email,
                             'inbound_name': 'main',
-                            'inbound_remark': 'ГОС',
+                            'inbound_remark': target_server.get('inbounds', {}).get('main', {}).get('name_prefix', 'VPN'),
                             'expiry_time': expiry_time,
                             'limit_ip': limit_ip
                         }
@@ -1489,15 +1493,25 @@ async def process_fix_key(message: Message, state: FSMContext):
             link_name = f"{inbound_remark} {client_email}"
             found_on_server = True
         else:
-            # Не нашли нигде - используем оригинальный fragment и main inbound Germany
+            # Не нашли нигде - используем оригинальный fragment и первый активный сервер
             link_name = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
+            # Находим первый активный сервер для fallback
+            if not target_server:
+                for srv in servers_config.get('servers', []):
+                    if srv.get('active_for_new') and srv.get('enabled', True) and not srv.get('local', False):
+                        target_server = srv
+                        break
+            if not target_server:
+                await message.answer("❌ Активный сервер не найден в конфиге")
+                await state.clear()
+                return
             inbound_config = target_server.get('inbounds', {}).get('main', {})
             client_email = link_name
             inbound_remark = "Unknown"
             found_on_server = False
 
-        # Формируем исправленный ключ с настройками Germany
-        # Порядок параметров как в get_client_link_from_active_server: type, security, encryption, pbk, fp, sni, sid, flow, spx
+        # Формируем исправленный ключ с настройками найденного сервера
+        # Порядок параметров как в get_client_link_from_active_server: type, encryption, security, pbk, fp, sni, sid, flow, spx
         target_domain = target_server.get('domain', target_server.get('ip'))
         target_port = target_server.get('port', 443)
 
@@ -1556,14 +1570,22 @@ async def process_fix_key(message: Message, state: FSMContext):
 
         changes_text = "\n".join(changes) if changes else "Параметры актуальны"
 
-        if created_on_germany:
-            status_text = "✅ Создан на Germany (из локальной базы)"
-        elif found_on_germany:
-            status_text = "✅ Найден на Germany"
+        if created_on_server:
+            status_text = f"✅ Создан на {target_server.get('name', 'Unknown')} (из локальной базы)"
         elif found_on_server:
-            status_text = "✅ Найден на Germany"
+            status_text = f"✅ Найден на {target_server.get('name', 'Unknown')}"
         else:
-            status_text = "⚠️ Не найден, использованы параметры Germany"
+            status_text = f"⚠️ Не найден, использованы параметры {target_server.get('name', 'Unknown')}"
+
+        # Форматируем дату окончания
+        expiry_time = client_info.get('expiry_time', 0) if client_info else 0
+        if expiry_time and expiry_time > 0:
+            expiry_date = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_date.strftime('%d.%m.%Y %H:%M')
+            if expiry_date < datetime.now():
+                expiry_str += " ⚠️ (истёк)"
+        else:
+            expiry_str = "Безлимит"
 
         await message.answer_photo(
             BufferedInputFile(qr_code.read(), filename="qrcode.png"),
@@ -1572,6 +1594,7 @@ async def process_fix_key(message: Message, state: FSMContext):
                 f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
                 f"📍 Inbound: {inbound_remark}\n"
                 f"👤 Клиент: {client_email}\n"
+                f"📅 Действует до: {expiry_str}\n"
                 f"🔍 Статус: {status_text}\n"
                 f"🌐 Хост: {target_domain}:{target_port}\n"
                 f"🔒 SNI: {inbound_config.get('sni', 'N/A')}\n"

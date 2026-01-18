@@ -1416,44 +1416,79 @@ async def delete_key_record(callback: CallbackQuery, db: DatabaseManager):
     )
 
     xui_deleted = False
+    remote_deleted = {}
     client_email = key.get('client_email', '')
 
     # Удаляем клиента из X-UI если есть email
     if client_email:
+        # Удаляем с локального сервера
         try:
             async with XUIClient(XUI_HOST, XUI_USERNAME, XUI_PASSWORD) as xui:
                 xui_deleted = await xui.find_and_delete_client(client_email)
                 if xui_deleted:
-                    logger.info(f"Клиент {client_email} удален из X-UI панели")
+                    logger.info(f"Клиент {client_email} удален из X-UI панели (локально)")
                 else:
                     logger.warning(f"Клиент {client_email} не найден в X-UI панели (возможно уже удален)")
         except Exception as e:
             logger.error(f"Ошибка при удалении клиента из X-UI: {e}")
             xui_deleted = False
 
+        # Удаляем с удалённых серверов
+        try:
+            from bot.api.remote_xui import delete_client_by_email_on_all_remote_servers
+            remote_deleted = await delete_client_by_email_on_all_remote_servers(client_email)
+            if remote_deleted:
+                for server_name, success in remote_deleted.items():
+                    if success:
+                        logger.info(f"Клиент {client_email} удален с сервера {server_name}")
+                    else:
+                        logger.warning(f"Клиент {client_email} не удален с сервера {server_name}")
+        except Exception as e:
+            logger.error(f"Ошибка при удалении клиента с удалённых серверов: {e}")
+
     # Удаляем запись из базы данных
     db_success = await db.delete_key_record(key_id)
 
     if db_success:
-        if xui_deleted:
+        # Формируем строку статуса удалённых серверов
+        remote_status_lines = []
+        all_remote_success = True
+        for server_name, success in remote_deleted.items():
+            if success:
+                remote_status_lines.append(f"✅ {server_name}")
+            else:
+                remote_status_lines.append(f"⚠️ {server_name} (не найден)")
+                all_remote_success = False
+        remote_status = "\n".join(remote_status_lines) if remote_status_lines else ""
+
+        if xui_deleted and all_remote_success:
             result_text = (
                 f"✅ <b>Ключ полностью удален!</b>\n\n"
                 f"📱 Номер/ID: <code>{key['phone_number']}</code>\n"
                 f"📅 Срок: {key['period']}\n"
                 f"💰 Цена: {key['price']} ₽\n\n"
-                f"✅ Удален из X-UI панели\n"
-                f"✅ Удален из аналитики бота"
+                f"✅ Удален из X-UI панели (локально)\n"
             )
+            if remote_status:
+                result_text += f"\n<b>Удалённые серверы:</b>\n{remote_status}\n"
+            result_text += f"\n✅ Удален из аналитики бота"
         else:
             result_text = (
                 f"⚠️ <b>Запись удалена частично</b>\n\n"
                 f"📱 Номер/ID: <code>{key['phone_number']}</code>\n"
                 f"📅 Срок: {key['period']}\n"
                 f"💰 Цена: {key['price']} ₽\n\n"
-                f"❌ Не найден в X-UI панели\n"
-                f"✅ Удален из аналитики бота\n\n"
-                f"<i>Возможно ключ уже был удален из X-UI ранее</i>"
             )
+            if xui_deleted:
+                result_text += f"✅ Удален из X-UI (локально)\n"
+            else:
+                result_text += f"⚠️ Не найден в X-UI (локально)\n"
+
+            if remote_status:
+                result_text += f"\n<b>Удалённые серверы:</b>\n{remote_status}\n"
+
+            result_text += f"\n✅ Удален из аналитики бота\n\n"
+            result_text += f"<i>Возможно ключ уже был удален ранее</i>"
         await callback.message.edit_text(result_text, parse_mode="HTML")
     else:
         await callback.message.edit_text(
@@ -2142,12 +2177,18 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
             text += f"   ⏰ Истекает: {expiry}\n"
             text += f"   🔑 UUID: <code>{uuid_short}</code>\n\n"
 
-            # Кнопка для получения ссылки
+            # Кнопки для клиента: ссылка и продление
+            # UUID = 36 символов, callback_data лимит = 64 байта
+            # get_link_ = 9 + 36 = 45 символов - вмещается
             if client.get('uuid'):
                 buttons.append([
                     InlineKeyboardButton(
-                        text=f"🔗 {email[:20]}",
-                        callback_data=f"get_link_{client['uuid'][:32]}"
+                        text=f"🔗 {email[:15]}",
+                        callback_data=f"get_link_{client['uuid']}"
+                    ),
+                    InlineKeyboardButton(
+                        text=f"📅 Продлить",
+                        callback_data=f"extend_{client['uuid']}"
                     )
                 ])
 
@@ -2218,6 +2259,197 @@ async def new_search(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("extend_"))
+async def extend_client_callback(callback: CallbackQuery):
+    """Показать меню выбора периода продления"""
+    uuid_prefix = callback.data.replace("extend_", "")
+
+    # Кнопки выбора периода
+    buttons = [
+        [
+            InlineKeyboardButton(text="1 мес", callback_data=f"do_extend_{uuid_prefix}_30"),
+            InlineKeyboardButton(text="3 мес", callback_data=f"do_extend_{uuid_prefix}_90"),
+        ],
+        [
+            InlineKeyboardButton(text="6 мес", callback_data=f"do_extend_{uuid_prefix}_180"),
+            InlineKeyboardButton(text="1 год", callback_data=f"do_extend_{uuid_prefix}_365"),
+        ],
+        [
+            InlineKeyboardButton(text="◀️ Назад", callback_data="new_search")
+        ]
+    ]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(
+        f"📅 <b>ПРОДЛЕНИЕ КЛЮЧА</b>\n\n"
+        f"🔑 UUID: <code>{uuid_prefix}...</code>\n\n"
+        f"Выберите период продления:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("do_extend_"))
+async def do_extend_client_callback(callback: CallbackQuery):
+    """Выполнить продление ключа"""
+    from bot.api.remote_xui import extend_client_on_all_servers, load_servers_config
+    import json
+    from datetime import datetime
+
+    # Парсим данные: do_extend_{uuid}_{days}
+    parts = callback.data.replace("do_extend_", "").rsplit("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка: неверный формат данных", show_alert=True)
+        return
+
+    uuid_prefix = parts[0]
+    try:
+        extend_days = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Ошибка: неверное количество дней", show_alert=True)
+        return
+
+    await callback.answer("⏳ Продлеваю ключ на всех серверах...")
+
+    # Ищем полный UUID по префиксу
+    config = load_servers_config()
+    full_uuid = None
+    client_email = None
+
+    for server in config.get('servers', []):
+        if not server.get('enabled', True):
+            continue
+
+        if server.get('local', False):
+            # Ищем в локальной базе
+            import sqlite3
+            try:
+                conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT settings FROM inbounds")
+                for (settings_str,) in cursor.fetchall():
+                    try:
+                        settings = json.loads(settings_str)
+                        for client in settings.get('clients', []):
+                            if client.get('id', '').startswith(uuid_prefix):
+                                full_uuid = client.get('id')
+                                client_email = client.get('email', '')
+                                break
+                    except:
+                        continue
+                    if full_uuid:
+                        break
+                conn.close()
+            except:
+                pass
+        else:
+            # Ищем через API панели
+            from bot.api.remote_xui import _get_panel_opener, _panel_login
+            import urllib.request
+
+            panel = server.get('panel', {})
+            if not panel:
+                continue
+
+            server_name = server.get('name', 'Unknown')
+            session = await _get_panel_opener(server_name)
+
+            if not session.get('logged_in'):
+                import asyncio
+                loop = asyncio.get_event_loop()
+                logged_in = await _panel_login(server)
+                if not logged_in:
+                    continue
+
+            base_url = session.get('base_url', '')
+            opener = session.get('opener')
+
+            try:
+                list_url = f"{base_url}/panel/api/inbounds/list"
+                list_req = urllib.request.Request(list_url)
+
+                import asyncio
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, opener.open, list_req)
+                data = json.loads(response.read().decode())
+
+                if data.get('success'):
+                    for inbound in data.get('obj', []):
+                        settings_str = inbound.get('settings', '{}')
+                        try:
+                            settings = json.loads(settings_str)
+                            for client in settings.get('clients', []):
+                                if client.get('id', '').startswith(uuid_prefix):
+                                    full_uuid = client.get('id')
+                                    client_email = client.get('email', '')
+                                    break
+                        except:
+                            continue
+                        if full_uuid:
+                            break
+            except:
+                pass
+
+        if full_uuid:
+            break
+
+    if not full_uuid:
+        await callback.message.edit_text(
+            "❌ <b>Ошибка</b>\n\n"
+            f"Клиент с UUID <code>{uuid_prefix}...</code> не найден на серверах.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")]
+            ])
+        )
+        return
+
+    # Продлеваем на всех серверах
+    result = await extend_client_on_all_servers(full_uuid, extend_days)
+
+    if result.get('success'):
+        # Форматируем новую дату истечения
+        new_expiry_ms = result.get('new_expiry', 0)
+        if new_expiry_ms:
+            new_expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000).strftime('%d.%m.%Y %H:%M')
+        else:
+            new_expiry_date = "неизвестно"
+
+        # Формируем отчёт по серверам
+        results_text = ""
+        for server_name, success in result.get('results', {}).items():
+            status = "✅" if success else "❌"
+            results_text += f"  {status} {server_name}\n"
+
+        period_text = {30: "1 месяц", 90: "3 месяца", 180: "6 месяцев", 365: "1 год"}.get(extend_days, f"{extend_days} дней")
+
+        await callback.message.edit_text(
+            f"✅ <b>Ключ успешно продлён!</b>\n\n"
+            f"👤 Клиент: <code>{client_email or uuid_prefix}</code>\n"
+            f"📅 Период: +{period_text}\n"
+            f"⏰ Новый срок: <b>{new_expiry_date}</b>\n\n"
+            f"<b>Результаты по серверам:</b>\n{results_text}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="cancel_key_delete")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка продления</b>\n\n"
+            f"Не удалось продлить ключ на серверах.\n"
+            f"UUID: <code>{uuid_prefix}...</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"extend_{uuid_prefix}")],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")]
+            ])
+        )
 
 
 @router.callback_query(F.data.startswith("get_link_"))
