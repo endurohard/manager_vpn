@@ -5,13 +5,35 @@ import os
 import json
 import logging
 import uuid
+import ssl
 import aiosqlite
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 from aiohttp import web
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
+
+# Путь к базе данных бота для связанных ключей
+BOT_DB_PATH = Path(__file__).parent.parent.parent / 'bot_data.db'
+
+
+async def get_linked_clients_for_subscription(master_uuid: str) -> list:
+    """Получить все связанные UUID для подписки"""
+    if not BOT_DB_PATH.exists():
+        return []
+    try:
+        async with aiosqlite.connect(BOT_DB_PATH) as db:
+            cursor = await db.execute(
+                'SELECT linked_uuid FROM linked_clients WHERE master_uuid = ?',
+                (master_uuid,)
+            )
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting linked clients: {e}")
+        return []
 
 # Путь к директории webapp
 WEBAPP_DIR = Path(__file__).parent
@@ -358,6 +380,97 @@ def find_client_on_remote_server(uuid_str, server):
     return None, None
 
 
+def check_client_exists_via_panel(uuid_str, server):
+    """Проверить существование клиента через API панели X-UI"""
+    import urllib.request
+    import urllib.parse
+    import ssl
+    import http.cookiejar
+
+    panel = server.get('panel', {})
+    if not panel:
+        return False
+
+    ip = server.get('ip', '')
+    port = panel.get('port', 1020)
+    path = panel.get('path', '')
+    username = panel.get('username', '')
+    password = panel.get('password', '')
+
+    if not all([ip, username, password]):
+        return False
+
+    try:
+        # Создаём SSL контекст без проверки сертификата
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cookie_jar),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+
+        base_url = f"https://{ip}:{port}{path}"
+
+        # Авторизуемся
+        login_data = urllib.parse.urlencode({
+            'username': username,
+            'password': password
+        }).encode()
+
+        login_req = urllib.request.Request(
+            f"{base_url}/login",
+            data=login_data,
+            method='POST'
+        )
+        login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+        resp = opener.open(login_req, timeout=10)
+        login_result = json.loads(resp.read())
+
+        if not login_result.get('success'):
+            return False
+
+        # Получаем список inbounds
+        list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
+        resp = opener.open(list_req, timeout=10)
+        data = json.loads(resp.read())
+
+        if not data.get('success'):
+            return False
+
+        # Ищем клиента
+        for inbound in data.get('obj', []):
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('id') == uuid_str:
+                        return True
+            except:
+                continue
+
+        return False
+
+    except Exception as e:
+        logger.error(f"Error checking client via panel on {server.get('name', ip)}: {e}")
+        return False
+
+
+def check_client_exists_on_server(uuid_str, server):
+    """Проверить существование клиента на сервере (через panel или SSH)"""
+    # Сначала пробуем через API панели
+    panel = server.get('panel', {})
+    if panel:
+        return check_client_exists_via_panel(uuid_str, server)
+
+    # Иначе через SSH
+    client, inbound = find_client_on_remote_server(uuid_str, server)
+    return client is not None
+
+
 def find_client_on_all_servers(uuid_str):
     """Найти клиента по UUID на всех серверах"""
     servers_config = load_servers_config()
@@ -651,13 +764,27 @@ def find_all_client_keys(uuid_str):
     return results
 
 
-def generate_vless_link_for_server(uuid, email, server_config, inbound_name='main'):
-    """Генерация VLESS ссылки для внешнего сервера"""
+def generate_vless_link_for_server(uuid, email, server_config, inbound_name='main', inbound_settings_override=None):
+    """
+    Генерация VLESS ссылки для внешнего сервера.
+
+    :param uuid: UUID клиента
+    :param email: Email клиента
+    :param server_config: Конфигурация сервера
+    :param inbound_name: Имя inbound из конфига
+    :param inbound_settings_override: Актуальные настройки с панели (приоритетнее статического конфига)
+    """
     import urllib.parse
 
+    # Берём базовые настройки из статического конфига
     inbound = server_config.get('inbounds', {}).get(inbound_name, {})
     if not inbound:
         return None
+
+    # Если переданы актуальные настройки с панели - используем их
+    if inbound_settings_override:
+        # Мержим: override перезаписывает статические настройки
+        inbound = {**inbound, **inbound_settings_override}
 
     domain = server_config.get('domain', server_config.get('ip', ''))
     port = server_config.get('port', 443)
@@ -695,6 +822,28 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
     link_name = f"{name_prefix} {email}" if email else name_prefix
 
     return f"vless://{uuid}@{domain}:{port}?{query}#{link_name}"
+
+
+async def generate_vless_link_for_server_async(uuid, email, server_config, inbound_name='main'):
+    """
+    Асинхронная генерация VLESS ссылки с автоматическим получением актуальных настроек с панели.
+
+    Сначала запрашивает актуальные настройки inbound с панели сервера,
+    затем генерирует ссылку с этими настройками.
+    """
+    from bot.api.remote_xui import get_inbound_settings_from_panel
+
+    inbound_config = server_config.get('inbounds', {}).get(inbound_name, {})
+    inbound_id = inbound_config.get('id', 1)
+
+    # Получаем актуальные настройки с панели
+    panel_settings = await get_inbound_settings_from_panel(server_config, inbound_id)
+
+    # Генерируем ссылку с актуальными настройками
+    return generate_vless_link_for_server(
+        uuid, email, server_config, inbound_name,
+        inbound_settings_override=panel_settings
+    )
 
 
 def generate_vless_link(client, inbound):
@@ -760,6 +909,479 @@ def generate_vless_link(client, inbound):
     return f"vless://{uuid}@raphaelvpn.ru:443?{query}#{link_name}"
 
 
+def is_browser_request(request):
+    """Определить, пришёл ли запрос из браузера"""
+    user_agent = request.headers.get('User-Agent', '').lower()
+    accept = request.headers.get('Accept', '')
+
+    # VPN клиенты обычно имеют специфичные User-Agent
+    vpn_clients = ['v2ray', 'clash', 'shadowrocket', 'quantumult', 'surge', 'stash',
+                   'loon', 'sing-box', 'hiddify', 'nekoray', 'nekobox', 'v2rayn', 'v2rayng']
+
+    for client in vpn_clients:
+        if client in user_agent:
+            return False
+
+    # Браузеры запрашивают text/html
+    if 'text/html' in accept:
+        # Но проверим что это не curl/wget
+        if 'curl' in user_agent or 'wget' in user_agent:
+            return False
+        return True
+
+    # Типичные браузерные User-Agent
+    browsers = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera']
+    for browser in browsers:
+        if browser in user_agent:
+            return True
+
+    return False
+
+
+async def get_client_info_from_panel(uuid_str, server):
+    """Получить информацию о клиенте с панели сервера"""
+    panel = server.get('panel', {})
+    if not panel:
+        return None
+
+    ip = server.get('ip', '')
+    port = panel.get('port', 1020)
+    path = panel.get('path', '')
+    username = panel.get('username', '')
+    password = panel.get('password', '')
+
+    if not all([ip, username, password]):
+        return None
+
+    try:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        cookie_jar = aiohttp.CookieJar(unsafe=True)
+
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar) as session:
+            base_url = f"https://{ip}:{port}{path}"
+
+            # Авторизация
+            async with session.post(
+                f"{base_url}/login",
+                data={'username': username, 'password': password},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                login_result = await resp.json()
+                if not login_result.get('success'):
+                    logger.warning(f"Failed to login to panel {server.get('name', ip)}")
+                    return None
+
+            # Получаем список inbounds
+            async with session.get(
+                f"{base_url}/panel/api/inbounds/list",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+
+                if not data.get('success'):
+                    return None
+
+                # Ищем клиента
+                for inbound in data.get('obj', []):
+                    settings_str = inbound.get('settings', '{}')
+                    try:
+                        settings = json.loads(settings_str)
+                        for client in settings.get('clients', []):
+                            if client.get('id') == uuid_str:
+                                # Получаем статистику трафика
+                                client_stats = inbound.get('clientStats', [])
+                                for stat in client_stats:
+                                    if stat.get('email') == client.get('email'):
+                                        return {
+                                            'email': client.get('email', 'client'),
+                                            'upload': stat.get('up', 0),
+                                            'download': stat.get('down', 0),
+                                            'total': stat.get('total', 0),
+                                            'expiry_time': client.get('expiryTime', 0),
+                                            'enable': client.get('enable', True),
+                                            'server': server.get('name', 'Server')
+                                        }
+                                # Если статистики нет, возвращаем базовую инфу
+                                return {
+                                    'email': client.get('email', 'client'),
+                                    'upload': 0,
+                                    'download': 0,
+                                    'total': client.get('totalGB', 0) * 1024 * 1024 * 1024 if client.get('totalGB') else 0,
+                                    'expiry_time': client.get('expiryTime', 0),
+                                    'enable': client.get('enable', True),
+                                    'server': server.get('name', 'Server')
+                                }
+                    except:
+                        continue
+
+        return None
+    except Exception as e:
+        logger.error(f"Error getting client info from panel {server.get('name', ip)}: {e}")
+        return None
+
+
+def render_subscription_page(client_id, client_info, links_count, servers_list):
+    """Рендер HTML страницы подписки"""
+    email = client_info.get('email', 'client')
+    upload = client_info.get('upload', 0)
+    download = client_info.get('download', 0)
+    total = client_info.get('total', 0)
+    expiry_time = client_info.get('expiry_time', 0)
+    enable = client_info.get('enable', True)
+    server_name = client_info.get('server', 'Server')
+
+    # Форматируем данные
+    def format_bytes(b):
+        if b == 0:
+            return "0 B"
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if abs(b) < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} PB"
+
+    upload_str = format_bytes(upload)
+    download_str = format_bytes(download)
+    used_str = format_bytes(upload + download)
+    total_str = "Безлимит" if total == 0 else format_bytes(total)
+
+    # Срок действия
+    if expiry_time == 0:
+        expiry_str = "Безлимит"
+        days_left = "∞"
+        expiry_class = "success"
+    else:
+        from datetime import datetime
+        expiry_ts = expiry_time / 1000 if expiry_time > 9999999999 else expiry_time
+        expiry_dt = datetime.fromtimestamp(expiry_ts)
+        expiry_str = expiry_dt.strftime("%d.%m.%Y")
+
+        now = datetime.now()
+        delta = expiry_dt - now
+        days_left = delta.days
+
+        if days_left < 0:
+            days_left = "Истёк"
+            expiry_class = "danger"
+        elif days_left <= 3:
+            expiry_class = "danger"
+        elif days_left <= 7:
+            expiry_class = "warning"
+        else:
+            expiry_class = "success"
+
+    status_str = "Активен" if enable else "Отключён"
+    status_class = "success" if enable else "danger"
+
+    sub_url = f"https://zov-gor.ru/sub/{client_id}"
+
+    # Серверы
+    servers_html = ""
+    for srv in servers_list:
+        servers_html += f'<div class="server-item"><span class="server-icon">🌐</span> {srv}</div>'
+
+    html = f'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZoVGoR VPN - Подписка</title>
+    <link rel="icon" href="/static/logo.png">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 500px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 30px;
+        }}
+        .logo {{
+            width: 80px;
+            height: 80px;
+            margin-bottom: 15px;
+            border-radius: 20px;
+        }}
+        .title {{
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }}
+        .subtitle {{
+            color: #888;
+            font-size: 14px;
+        }}
+        .card {{
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 16px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .card-title {{
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 12px;
+        }}
+        .info-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .info-row:last-child {{
+            border-bottom: none;
+        }}
+        .info-label {{
+            color: #aaa;
+            font-size: 14px;
+        }}
+        .info-value {{
+            font-size: 14px;
+            font-weight: 600;
+        }}
+        .badge {{
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        .badge.success {{
+            background: rgba(76, 175, 80, 0.2);
+            color: #4CAF50;
+        }}
+        .badge.warning {{
+            background: rgba(255, 193, 7, 0.2);
+            color: #FFC107;
+        }}
+        .badge.danger {{
+            background: rgba(244, 67, 54, 0.2);
+            color: #F44336;
+        }}
+        .traffic-bar {{
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            margin-top: 10px;
+            overflow: hidden;
+        }}
+        .traffic-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 4px;
+            transition: width 0.3s;
+        }}
+        .server-item {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+        }}
+        .server-icon {{
+            font-size: 18px;
+        }}
+        .btn {{
+            display: block;
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            text-decoration: none;
+            text-align: center;
+            cursor: pointer;
+            transition: transform 0.2s, opacity 0.2s;
+            margin-bottom: 10px;
+        }}
+        .btn:active {{
+            transform: scale(0.98);
+        }}
+        .btn-primary {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .btn-secondary {{
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }}
+        .btn-group {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }}
+        .copy-section {{
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 10px;
+        }}
+        .copy-url {{
+            font-family: monospace;
+            font-size: 11px;
+            color: #888;
+            word-break: break-all;
+            margin-bottom: 10px;
+        }}
+        .copy-btn {{
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            width: 100%;
+        }}
+        .toast {{
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 1000;
+        }}
+        .toast.show {{
+            opacity: 1;
+        }}
+        .support-link {{
+            text-align: center;
+            margin-top: 20px;
+            color: #888;
+            font-size: 13px;
+        }}
+        .support-link a {{
+            color: #667eea;
+            text-decoration: none;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="/static/logo.png" alt="ZoVGoR" class="logo">
+            <h1 class="title">ZoVGoR VPN</h1>
+            <p class="subtitle">Информация о подписке</p>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Аккаунт</div>
+            <div class="info-row">
+                <span class="info-label">Имя</span>
+                <span class="info-value">{email}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Статус</span>
+                <span class="badge {status_class}">{status_str}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Сервер</span>
+                <span class="info-value">{server_name}</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Срок действия</div>
+            <div class="info-row">
+                <span class="info-label">До</span>
+                <span class="info-value">{expiry_str}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Осталось дней</span>
+                <span class="badge {expiry_class}">{days_left}</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Трафик</div>
+            <div class="info-row">
+                <span class="info-label">Загружено</span>
+                <span class="info-value">{upload_str}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Скачано</span>
+                <span class="info-value">{download_str}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Использовано</span>
+                <span class="info-value">{used_str}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Лимит</span>
+                <span class="info-value">{total_str}</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Доступные серверы ({links_count})</div>
+            {servers_html}
+        </div>
+
+        <div class="card">
+            <div class="card-title">Подключение</div>
+            <a href="v2raytun://import/{sub_url}" class="btn btn-primary">
+                Открыть в v2RayTun
+            </a>
+            <div class="btn-group">
+                <a href="streisand://import/{sub_url}" class="btn btn-secondary">Streisand</a>
+                <a href="v2rayng://install-sub?url={sub_url}" class="btn btn-secondary">v2rayNG</a>
+            </div>
+
+            <div class="copy-section">
+                <div class="copy-url" id="sub-url">{sub_url}</div>
+                <button class="copy-btn" onclick="copyLink()">📋 Скопировать ссылку</button>
+            </div>
+        </div>
+
+        <div class="support-link">
+            Техподдержка: <a href="https://t.me/bagamedovit">@bagamedovit</a>
+        </div>
+    </div>
+
+    <div class="toast" id="toast">Ссылка скопирована!</div>
+
+    <script>
+        function copyLink() {{
+            const url = document.getElementById('sub-url').textContent;
+            navigator.clipboard.writeText(url).then(() => {{
+                const toast = document.getElementById('toast');
+                toast.classList.add('show');
+                setTimeout(() => toast.classList.remove('show'), 2000);
+            }});
+        }}
+    </script>
+</body>
+</html>'''
+    return html
+
+
 async def subscription_handler(request):
     """Обработчик подписки - возвращает ключи клиента с активных серверов"""
     client_id = request.match_info.get('client_id', '')
@@ -774,8 +1396,16 @@ async def subscription_handler(request):
     if not uuid_pattern.match(client_id):
         return web.Response(text="Invalid client ID format", status=400)
 
-    # Ищем ключи клиента на локальном сервере
-    client_keys = find_all_client_keys(client_id)
+    # Получаем связанные UUID (master + linked)
+    linked_uuids = await get_linked_clients_for_subscription(client_id)
+    all_client_ids = [client_id] + linked_uuids
+    logger.debug(f"Subscription for {client_id[:8]}... with {len(linked_uuids)} linked clients")
+
+    # Ищем ключи клиента на локальном сервере (для всех UUID)
+    client_keys = []
+    for uuid in all_client_ids:
+        keys = find_all_client_keys(uuid)
+        client_keys.extend(keys)
 
     # Загружаем конфиг серверов
     servers_config = load_servers_config()
@@ -842,21 +1472,100 @@ async def subscription_handler(request):
                 for inbound_name, inbound_config in server.get('inbounds', {}).items():
                     if inbound_name == 'main':
                         continue  # main уже добавлен выше
-                    link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
-                    if link:
-                        links.append(link)
+                    # Генерируем ссылки для всех связанных клиентов
+                    for uuid in all_client_ids:
+                        link = generate_vless_link_for_server(uuid, client_email, server, inbound_name)
+                        if link:
+                            links.append(link)
         else:
-            # Для внешних серверов - генерируем ключи для всех inbounds
-            for inbound_name in server.get('inbounds', {}).keys():
-                link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
-                if link:
-                    links.append(link)
+            # Для внешних серверов - проверяем наличие клиента перед генерацией
+            server_name = server.get('name', server.get('ip', 'Unknown'))
+            # Проверяем все UUID (master + linked)
+            for uuid in all_client_ids:
+                if check_client_exists_on_server(uuid, server):
+                    logger.debug(f"Client {uuid[:8]}... found on {server_name}")
+                    for inbound_name in server.get('inbounds', {}).keys():
+                        # Используем асинхронную функцию для получения актуальных настроек с панели
+                        link = await generate_vless_link_for_server_async(uuid, client_email, server, inbound_name)
+                        if link:
+                            links.append(link)
+                else:
+                    logger.debug(f"Client {uuid[:8]}... NOT found on {server_name}, skipping")
 
     # Если нет ключей - возвращаем 404
     if not links:
+        # Для браузера показываем красивую страницу с ошибкой
+        if is_browser_request(request):
+            error_html = '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZoVGoR VPN - Ошибка</title>
+<style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:20px;}
+.container{text-align:center;max-width:400px;}.icon{font-size:64px;margin-bottom:20px;}h1{margin-bottom:10px;}p{color:#888;}</style>
+</head><body><div class="container"><div class="icon">😔</div><h1>Клиент не найден</h1><p>Подписка не найдена или истекла. Обратитесь в поддержку: <a href="https://t.me/bagamedovit" style="color:#667eea">@bagamedovit</a></p></div></body></html>'''
+            return web.Response(text=error_html, content_type='text/html', status=404)
         return web.Response(text="Client not found or no active servers", status=404)
 
-    # Кодируем в base64 (стандартный формат подписки)
+    # Собираем информацию о клиенте для браузера
+    client_info = None
+
+    # Если клиент найден локально и есть данные - используем их
+    if client_keys and (upload_bytes > 0 or download_bytes > 0 or expire_timestamp > 0):
+        client_info = {
+            'email': client_email,
+            'upload': upload_bytes,
+            'download': download_bytes,
+            'total': total_bytes,
+            'expiry_time': expire_timestamp * 1000 if expire_timestamp else 0,
+            'enable': True,
+            'server': local_server.get('name', 'Local') if local_server else 'Local'
+        }
+
+    # Если локальных данных нет - получаем с удалённых серверов
+    if not client_info:
+        for server in servers_config.get('servers', []):
+            if server.get('local') or not server.get('enabled'):
+                continue
+            panel_info = await get_client_info_from_panel(client_id, server)
+            if panel_info:
+                client_info = panel_info
+                # Обновляем client_email для VPN ответа
+                client_email = panel_info.get('email', client_email)
+                # Обновляем данные для Subscription-Userinfo заголовка
+                upload_bytes = panel_info.get('upload', 0)
+                download_bytes = panel_info.get('download', 0)
+                total_bytes = panel_info.get('total', 0)
+                expire_time = panel_info.get('expiry_time', 0)
+                if expire_time:
+                    expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
+                break
+
+    # Fallback если ничего не нашли
+    if not client_info:
+        client_info = {
+            'email': client_email,
+            'upload': 0,
+            'download': 0,
+            'total': 0,
+            'expiry_time': 0,
+            'enable': True,
+            'server': 'Unknown'
+        }
+
+    # Собираем список серверов для отображения
+    servers_list = []
+    for link in links:
+        # Извлекаем имя сервера из фрагмента ссылки
+        if '#' in link:
+            name = link.split('#')[-1]
+            if name and name not in servers_list:
+                servers_list.append(name)
+
+    # Если запрос из браузера - показываем HTML страницу
+    if is_browser_request(request):
+        html = render_subscription_page(client_id, client_info, len(links), servers_list)
+        return web.Response(text=html, content_type='text/html')
+
+    # Для VPN клиентов - стандартный base64 ответ
     import base64
 
     # Название подписки с именем клиента
@@ -867,8 +1576,6 @@ async def subscription_handler(request):
     encoded = base64.b64encode(subscription_content.encode()).decode()
 
     # Возвращаем с правильными заголовками для VPN клиентов
-    # Announce с поддержкой для v2RayTun
-    import base64
     announce_text = "Тех. поддержка: @bagamedovit"
     announce_b64 = "base64:" + base64.b64encode(announce_text.encode()).decode()
 
@@ -1099,7 +1806,7 @@ async def subscription_json_handler(request):
             'server': 'ZoVGoR'
         })
 
-    # Внешние серверы
+    # Внешние серверы - только где клиент существует
     servers_config = load_servers_config()
     for server in servers_config.get('servers', []):
         if not server.get('enabled', True):
@@ -1108,8 +1815,14 @@ async def subscription_json_handler(request):
             continue
 
         server_name = server.get('name', 'Server')
+
+        # Проверяем наличие клиента на сервере
+        if not check_client_exists_on_server(client_id, server):
+            continue
+
         for inbound_name, inbound_config in server.get('inbounds', {}).items():
-            link = generate_vless_link_for_server(client_id, client_email, server, inbound_name)
+            # Используем асинхронную функцию для получения актуальных настроек с панели
+            link = await generate_vless_link_for_server_async(client_id, client_email, server, inbound_name)
             if link:
                 name_prefix = inbound_config.get('name_prefix', server_name)
                 # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
