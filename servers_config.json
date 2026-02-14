@@ -5,7 +5,7 @@
       "domain": "raphaelvpn.ru",
       "ip": "185.128.104.219",
       "port": 443,
-      "enabled": true,
+      "enabled": false,
       "active_for_new": false,
       "local": true,
       "description": "Основной сервер",
@@ -53,7 +53,7 @@
       "domain": "app.vpnpulse.ru",
       "ip": "85.239.151.89",
       "port": 443,
-      "enabled": true,
+      "enabled": false,
       "active_for_new": false,
       "local": false,
       "description": "Резервный сервер",
@@ -117,6 +117,65 @@
           "flow": "",
           "fp": "chrome",
           "name_prefix": "ГОС"
+        }
+      }
+    },
+    {
+      "name": "Niderland",
+      "domain": "94.156.117.172",
+      "ip": "94.156.117.172",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер Niderland",
+      "panel": {
+        "url": "https://94.156.117.172:1020/mGFMzstFOHD9HF0",
+        "port": 1020,
+        "path": "/mGFMzstFOHD9HF0",
+        "username": "itadmin",
+        "password": "20TQNF_Srld"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "max.ru",
+          "pbk": "SVmBsEEaEUIOlrhiwbCVJryCDOUAopEkI_mTRnOCsSA",
+          "sid": "87983e",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "network": "tcp",
+          "name_prefix": "🇳🇱 ГОС-Megafon-MTS"
+        }
+      }
+    },
+    {
+      "name": "🇺🇸USA",
+      "domain": "217.77.2.14",
+      "ip": "217.77.2.14",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер 🇺🇸USA",
+      "panel": {
+        "url": "https://217.77.2.14:43809/jrNtCeqNaeLxj3Qh4f",
+        "port": 43809,
+        "path": "/jrNtCeqNaeLxj3Qh4f",
+        "username": "ZMbVWuzqOu",
+        "password": "26vk9HTpQ9"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "ufous.dgtserv.xyz",
+          "pbk": "ZR8I3S5J_TQMc-UBHvDjC7PYMzSP5s-MKFVrf7GXrR8",
+          "sid": "ce",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "name_prefix": "🇺🇸 ГОС-USA"
         }
       }
     }

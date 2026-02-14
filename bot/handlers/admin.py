@@ -65,8 +65,10 @@ class SendNotificationStates(StatesGroup):
 
 
 class ManageSNIStates(StatesGroup):
-    """Состояния для управления SNI адресами"""
+    """Состояния для управления настройками сервера (SNI, Target, Transport)"""
     waiting_for_sni_domains = State()
+    waiting_for_dest = State()
+    waiting_for_action = State()
 
 
 class SearchKeyStates(StatesGroup):
@@ -444,6 +446,17 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
         vless_link_for_user = None
 
         if selected_server and selected_inbound:
+            from bot.api.remote_xui import get_inbound_settings_from_panel
+
+            # Получаем актуальные настройки inbound с панели сервера
+            inbound_id_for_settings = selected_inbound.get('id', 1)
+            panel_settings = await get_inbound_settings_from_panel(selected_server, inbound_id_for_settings)
+
+            # Если получили настройки с панели - используем их
+            if panel_settings:
+                selected_inbound = {**selected_inbound, **panel_settings}
+                logger.info(f"Используем актуальные настройки с панели: sni={panel_settings.get('sni')}")
+
             domain = selected_server.get('domain', selected_server.get('ip', ''))
             port = selected_server.get('port', 443)
             network = selected_inbound.get('network', 'tcp')
@@ -1601,84 +1614,543 @@ async def process_notification_message(message: Message, state: FSMContext, db: 
     await state.clear()
 
 
-# ===== УПРАВЛЕНИЕ SNI АДРЕСАМИ =====
+# ===== УПРАВЛЕНИЕ НАСТРОЙКАМИ СЕРВЕРОВ (SNI, Target, Transport) =====
 
 @router.message(F.text == "🌐 Управление SNI")
 @admin_only
-async def show_sni_management(message: Message, **kwargs):
-    """Показать список Reality inbound-ов для управления SNI"""
-    from bot.api.xui_client import XUIClient
-    from bot.config import XUI_HOST, XUI_USERNAME, XUI_PASSWORD
+async def show_server_management(message: Message, **kwargs):
+    """Показать список серверов для управления настройками"""
+    from bot.api.remote_xui import load_servers_config
+    import json
+
+    servers_config = load_servers_config()
+    servers = servers_config.get('servers', [])
+
+    # Фильтруем только включенные серверы
+    enabled_servers = [s for s in servers if s.get('enabled', True)]
+
+    if not enabled_servers:
+        await message.answer(
+            "❌ Нет активных серверов в конфигурации.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
+    text = "🖥 <b>УПРАВЛЕНИЕ НАСТРОЙКАМИ СЕРВЕРОВ</b>\n\n"
+    text += "Выберите сервер для изменения настроек:\n\n"
+
+    buttons = []
+    for srv in enabled_servers:
+        name = srv.get('name', 'Unknown')
+        domain = srv.get('domain', srv.get('ip', ''))
+        is_local = srv.get('local', False)
+        active = "🟢" if srv.get('active_for_new') else "🟡"
+
+        text += f"{active} <b>{name}</b>\n"
+        text += f"   🌐 {domain}\n"
+        text += f"   📍 {'Локальный' if is_local else 'Удалённый'}\n\n"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{active} {name}",
+                callback_data=f"srv_manage_{name}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sni_cancel")])
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("srv_manage_"))
+async def select_server_for_management(callback: CallbackQuery, state: FSMContext):
+    """Выбор сервера для управления настройками"""
+    from bot.api.remote_xui import load_servers_config, _get_panel_opener, _panel_login
+    import json
+
+    server_name = callback.data.replace("srv_manage_", "")
+    servers_config = load_servers_config()
+
+    # Находим сервер
+    server = None
+    for srv in servers_config.get('servers', []):
+        if srv.get('name') == server_name:
+            server = srv
+            break
+
+    if not server:
+        await callback.answer("❌ Сервер не найден", show_alert=True)
+        return
+
+    await callback.answer("⏳ Загружаю настройки...")
+
+    is_local = server.get('local', False)
+
+    try:
+        if is_local:
+            # Локальный сервер - читаем из SQLite
+            import sqlite3
+            conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, remark, port, streamSettings FROM inbounds WHERE enable=1")
+            rows = cursor.fetchall()
+            conn.close()
+
+            inbounds_info = []
+            for inbound_id, remark, port, stream_str in rows:
+                stream = json.loads(stream_str) if stream_str else {}
+                if stream.get('security') == 'reality':
+                    reality = stream.get('realitySettings', {})
+                    inbounds_info.append({
+                        'id': inbound_id,
+                        'remark': remark,
+                        'port': port,
+                        'network': stream.get('network', 'tcp'),
+                        'dest': reality.get('dest', 'не указан'),
+                        'sni': reality.get('serverNames', [])
+                    })
+        else:
+            # Удалённый сервер - через API панели
+            panel = server.get('panel', {})
+            if not panel:
+                await callback.message.edit_text("❌ У сервера нет настроек панели")
+                return
+
+            session = await _get_panel_opener(server_name)
+            if not session.get('logged_in'):
+                if not await _panel_login(server):
+                    await callback.message.edit_text("❌ Не удалось авторизоваться в панели")
+                    return
+
+            import urllib.request
+            base_url = session.get('base_url', '')
+            opener = session.get('opener')
+
+            list_url = f"{base_url}/panel/api/inbounds/list"
+            list_req = urllib.request.Request(list_url)
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, opener.open, list_req)
+            data = json.loads(response.read().decode())
+
+            if not data.get('success'):
+                await callback.message.edit_text("❌ Не удалось получить список inbounds")
+                return
+
+            inbounds_info = []
+            for inb in data.get('obj', []):
+                stream = json.loads(inb.get('streamSettings', '{}'))
+                if stream.get('security') == 'reality':
+                    reality = stream.get('realitySettings', {})
+                    inbounds_info.append({
+                        'id': inb.get('id'),
+                        'remark': inb.get('remark', ''),
+                        'port': inb.get('port'),
+                        'network': stream.get('network', 'tcp'),
+                        'dest': reality.get('dest', 'не указан'),
+                        'sni': reality.get('serverNames', [])
+                    })
+
+        if not inbounds_info:
+            await callback.message.edit_text(
+                f"📋 Reality inbound-ы не найдены на {server_name}."
+            )
+            return
+
+        # Сохраняем данные сервера
+        await state.update_data(
+            manage_server_name=server_name,
+            manage_server_local=is_local,
+            manage_server_config=server
+        )
+
+        # Показываем inbounds сервера
+        text = f"🖥 <b>{server_name}</b>\n\n"
+        text += "Reality inbound-ы:\n\n"
+
+        buttons = []
+        for inb in inbounds_info:
+            text += f"📍 <b>{inb['remark']}</b> (ID: {inb['id']})\n"
+            text += f"   📡 Transport: <code>{inb['network']}</code>\n"
+            text += f"   🎯 Target: <code>{inb['dest']}</code>\n"
+            text += f"   🌐 SNI: <code>{', '.join(inb['sni'][:2]) if inb['sni'] else 'нет'}</code>\n\n"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"⚙️ {inb['remark']}",
+                    callback_data=f"inb_manage_{inb['id']}"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_srv_list")])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sni_cancel")])
+
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке настроек сервера {server_name}: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+
+@router.callback_query(F.data == "back_to_srv_list")
+async def back_to_server_list(callback: CallbackQuery, state: FSMContext):
+    """Вернуться к списку серверов"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer()
+    # Вызываем показ списка серверов заново
+    from bot.api.remote_xui import load_servers_config
+
+    servers_config = load_servers_config()
+    servers = servers_config.get('servers', [])
+    enabled_servers = [s for s in servers if s.get('enabled', True)]
+
+    text = "🖥 <b>УПРАВЛЕНИЕ НАСТРОЙКАМИ СЕРВЕРОВ</b>\n\n"
+    buttons = []
+    for srv in enabled_servers:
+        name = srv.get('name', 'Unknown')
+        active = "🟢" if srv.get('active_for_new') else "🟡"
+        buttons.append([
+            InlineKeyboardButton(text=f"{active} {name}", callback_data=f"srv_manage_{name}")
+        ])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="sni_cancel")])
+
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("inb_manage_"))
+async def select_inbound_action(callback: CallbackQuery, state: FSMContext):
+    """Выбор действия для inbound"""
+    from bot.api.remote_xui import _get_panel_opener
+    import json
+
+    inbound_id = int(callback.data.replace("inb_manage_", ""))
+    data = await state.get_data()
+
+    server_name = data.get('manage_server_name')
+    is_local = data.get('manage_server_local', False)
+    server_config = data.get('manage_server_config', {})
+
+    # Получаем актуальные данные inbound
+    try:
+        if is_local:
+            import sqlite3
+            conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT remark, port, streamSettings FROM inbounds WHERE id=?", (inbound_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                await callback.answer("❌ Inbound не найден", show_alert=True)
+                return
+
+            remark, port, stream_str = row
+            stream = json.loads(stream_str) if stream_str else {}
+        else:
+            session = await _get_panel_opener(server_name)
+            base_url = session.get('base_url', '')
+            opener = session.get('opener')
+
+            import urllib.request
+            get_url = f"{base_url}/panel/api/inbounds/get/{inbound_id}"
+            get_req = urllib.request.Request(get_url)
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, opener.open, get_req)
+            result = json.loads(response.read().decode())
+
+            if not result.get('success'):
+                await callback.answer("❌ Не удалось получить inbound", show_alert=True)
+                return
+
+            inb = result.get('obj', {})
+            remark = inb.get('remark', '')
+            port = inb.get('port')
+            stream = json.loads(inb.get('streamSettings', '{}'))
+
+        reality = stream.get('realitySettings', {})
+        network = stream.get('network', 'tcp')
+        dest = reality.get('dest', '')
+        sni_list = reality.get('serverNames', [])
+
+        # Сохраняем в state
+        await state.update_data(
+            manage_inbound_id=inbound_id,
+            manage_inbound_remark=remark,
+            manage_current_network=network,
+            manage_current_dest=dest,
+            manage_current_sni=sni_list
+        )
+
+        text = f"⚙️ <b>НАСТРОЙКИ INBOUND</b>\n\n"
+        text += f"🖥 Сервер: <b>{server_name}</b>\n"
+        text += f"📍 Inbound: <b>{remark}</b> (ID: {inbound_id})\n\n"
+        text += f"━━━━━━━━━━━━━━━━\n\n"
+        text += f"📡 <b>Transport:</b> <code>{network}</code>\n"
+        text += f"🎯 <b>Target (Dest):</b> <code>{dest or 'не указан'}</code>\n"
+        text += f"🌐 <b>SNI:</b>\n"
+        if sni_list:
+            for sni in sni_list[:5]:
+                text += f"   • <code>{sni}</code>\n"
+            if len(sni_list) > 5:
+                text += f"   <i>...и ещё {len(sni_list) - 5}</i>\n"
+        else:
+            text += f"   <i>не указаны</i>\n"
+
+        text += f"\n━━━━━━━━━━━━━━━━\n\n"
+        text += f"Выберите что изменить:"
+
+        buttons = [
+            [InlineKeyboardButton(text="🎯 Изменить Target", callback_data="change_dest")],
+            [InlineKeyboardButton(text="🌐 Изменить SNI", callback_data="change_sni")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"srv_manage_{server_name}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="sni_cancel")]
+        ]
+
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении настроек inbound: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+
+
+@router.callback_query(F.data == "change_dest")
+async def start_change_dest(callback: CallbackQuery, state: FSMContext):
+    """Начать изменение Target (Dest)"""
+    data = await state.get_data()
+    current_dest = data.get('manage_current_dest', '')
+    remark = data.get('manage_inbound_remark', '')
+
+    text = f"🎯 <b>ИЗМЕНЕНИЕ TARGET</b>\n\n"
+    text += f"📍 Inbound: <b>{remark}</b>\n\n"
+    text += f"Текущий Target: <code>{current_dest or 'не указан'}</code>\n\n"
+    text += f"━━━━━━━━━━━━━━━━\n\n"
+    text += f"📝 <b>Введите новый Target</b>\n\n"
+    text += f"Формат: <code>домен:порт</code>\n\n"
+    text += f"<b>Примеры:</b>\n"
+    text += f"• <code>www.google.com:443</code>\n"
+    text += f"• <code>ozon.ru:443</code>\n"
+    text += f"• <code>m.vk.com:443</code>\n\n"
+    text += f"<i>Или отправьте /cancel для отмены</i>"
+
+    await state.set_state(ManageSNIStates.waiting_for_dest)
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(ManageSNIStates.waiting_for_dest, F.text == "/cancel")
+async def cancel_dest_edit(message: Message, state: FSMContext):
+    """Отмена изменения Target"""
+    await state.clear()
+    await message.answer("❌ Изменение отменено.", reply_markup=Keyboards.admin_menu())
+
+
+@router.message(ManageSNIStates.waiting_for_dest)
+async def process_new_dest(message: Message, state: FSMContext):
+    """Обработка нового Target"""
+    import re
+
+    new_dest = message.text.strip()
+
+    # Валидация формата домен:порт
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]+:\d+$', new_dest):
+        await message.answer(
+            "❌ Неверный формат!\n\n"
+            "Используйте формат: <code>домен:порт</code>\n"
+            "Например: <code>ozon.ru:443</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    server_name = data.get('manage_server_name')
+    is_local = data.get('manage_server_local', False)
+    inbound_id = data.get('manage_inbound_id')
+    current_sni = data.get('manage_current_sni', [])
+
+    # Извлекаем домен из dest для SNI если SNI пустой
+    domain = new_dest.split(':')[0]
+    if not current_sni:
+        current_sni = [domain]
+
+    msg = await message.answer(f"⏳ Обновляю Target на {server_name}...")
+
+    try:
+        success = await update_inbound_reality_settings(
+            server_name=server_name,
+            is_local=is_local,
+            inbound_id=inbound_id,
+            new_dest=new_dest,
+            new_sni=current_sni,
+            server_config=data.get('manage_server_config', {})
+        )
+
+        if success:
+            await msg.edit_text(
+                f"✅ <b>Target успешно обновлён!</b>\n\n"
+                f"🖥 Сервер: {server_name}\n"
+                f"🎯 Новый Target: <code>{new_dest}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.edit_text("❌ Не удалось обновить Target")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении Target: {e}")
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+    await state.clear()
+    await message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
+
+
+@router.callback_query(F.data == "change_sni")
+async def start_change_sni(callback: CallbackQuery, state: FSMContext):
+    """Начать изменение SNI"""
+    data = await state.get_data()
+    current_sni = data.get('manage_current_sni', [])
+    remark = data.get('manage_inbound_remark', '')
+
+    text = f"🌐 <b>ИЗМЕНЕНИЕ SNI</b>\n\n"
+    text += f"📍 Inbound: <b>{remark}</b>\n\n"
+    text += f"<b>Текущие SNI:</b>\n"
+    if current_sni:
+        for sni in current_sni:
+            text += f"   • <code>{sni}</code>\n"
+    else:
+        text += f"   <i>не указаны</i>\n"
+
+    text += f"\n━━━━━━━━━━━━━━━━\n\n"
+    text += f"📝 <b>Введите новые SNI домены</b>\n\n"
+    text += f"Формат: домены через запятую или пробел\n\n"
+    text += f"<b>Примеры:</b>\n"
+    text += f"• <code>ozon.ru, www.ozon.ru</code>\n"
+    text += f"• <code>m.vk.com vk.com</code>\n\n"
+    text += f"<i>Или отправьте /cancel для отмены</i>"
+
+    await state.set_state(ManageSNIStates.waiting_for_sni_domains)
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+async def update_inbound_reality_settings(
+    server_name: str,
+    is_local: bool,
+    inbound_id: int,
+    new_dest: str,
+    new_sni: list,
+    server_config: dict
+) -> bool:
+    """Обновить настройки Reality на сервере"""
     import json
     import subprocess
 
-    await message.answer("⏳ Получаю список Reality inbound-ов...")
-
     try:
-        # Подключаемся к X-UI API
-        async with XUIClient(XUI_HOST, XUI_USERNAME, XUI_PASSWORD) as xui:
-            inbounds = await xui.list_inbounds()
+        if is_local:
+            # Локальный сервер - обновляем через SQLite и API
+            from bot.api.xui_client import XUIClient
+            from bot.config import XUI_HOST, XUI_USERNAME, XUI_PASSWORD
 
-            if not inbounds:
-                await message.answer(
-                    "❌ Не удалось получить список inbound-ов.\n"
-                    "Проверьте подключение к X-UI панели.",
-                    reply_markup=Keyboards.admin_menu()
+            async with XUIClient(XUI_HOST, XUI_USERNAME, XUI_PASSWORD) as xui:
+                success = await xui.update_reality_settings(
+                    inbound_id=inbound_id,
+                    dest=new_dest,
+                    server_names=new_sni
                 )
-                return
 
-            # Фильтруем только Reality inbound-ы
-            reality_inbounds = []
-            for inbound in inbounds:
-                try:
-                    stream_settings = json.loads(inbound.get('streamSettings', '{}'))
-                    if stream_settings.get('security') == 'reality':
-                        reality_inbounds.append(inbound)
-                except:
-                    continue
+                if success:
+                    # Перезапускаем x-ui
+                    subprocess.run(['systemctl', 'restart', 'x-ui'], timeout=30, check=False)
+                    await asyncio.sleep(2)
 
-            if not reality_inbounds:
-                await message.answer(
-                    "📋 Reality inbound-ы не найдены.\n\n"
-                    "В системе нет inbound-ов с Reality протоколом.",
-                    reply_markup=Keyboards.admin_menu()
-                )
-                return
+                return success
+        else:
+            # Удалённый сервер - через API панели
+            from bot.api.remote_xui import _get_panel_opener
+            import urllib.request
+            import urllib.parse
 
-            # Формируем список с текущими SNI
-            text = "🌐 <b>УПРАВЛЕНИЕ SNI АДРЕСАМИ</b>\n\n"
-            text += "Список Reality inbound-ов:\n\n"
+            session = await _get_panel_opener(server_name)
+            base_url = session.get('base_url', '')
+            opener = session.get('opener')
 
-            for inbound in reality_inbounds:
-                inbound_id = inbound.get('id')
-                remark = inbound.get('remark', f'Inbound {inbound_id}')
-                port = inbound.get('port', '?')
+            # Получаем текущий inbound
+            get_url = f"{base_url}/panel/api/inbounds/get/{inbound_id}"
+            get_req = urllib.request.Request(get_url)
 
-                # Получаем текущие SNI
-                stream_settings = json.loads(inbound.get('streamSettings', '{}'))
-                reality_settings = stream_settings.get('realitySettings', {})
-                server_names = reality_settings.get('serverNames', [])
-                dest = reality_settings.get('dest', 'не указан')
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, opener.open, get_req)
+            result = json.loads(response.read().decode())
 
-                text += f"📍 <b>{remark}</b> (ID: {inbound_id}, Port: {port}→443)\n"
-                text += f"   🎯 Dest: <code>{dest}</code>\n"
-                text += f"   🌐 SNI: <code>{', '.join(server_names) if server_names else 'не указаны'}</code>\n\n"
+            if not result.get('success'):
+                return False
 
-            text += "━━━━━━━━━━━━━━━━\n\n"
-            text += "Выберите inbound для изменения SNI адресов:"
+            inbound = result.get('obj', {})
 
-            await message.answer(
-                text,
-                parse_mode="HTML",
-                reply_markup=Keyboards.sni_inbound_list(reality_inbounds)
+            # Обновляем streamSettings
+            stream = json.loads(inbound.get('streamSettings', '{}'))
+            reality = stream.get('realitySettings', {})
+            reality['dest'] = new_dest
+            reality['serverNames'] = new_sni
+            stream['realitySettings'] = reality
+            inbound['streamSettings'] = json.dumps(stream)
+
+            # Отправляем обновление
+            update_url = f"{base_url}/panel/api/inbounds/update/{inbound_id}"
+            update_data = {
+                "id": inbound_id,
+                "up": inbound.get('up', 0),
+                "down": inbound.get('down', 0),
+                "total": inbound.get('total', 0),
+                "remark": inbound.get('remark', ''),
+                "enable": inbound.get('enable', True),
+                "expiryTime": inbound.get('expiryTime', 0),
+                "listen": inbound.get('listen', ''),
+                "port": inbound.get('port'),
+                "protocol": inbound.get('protocol'),
+                "settings": inbound.get('settings'),
+                "streamSettings": inbound['streamSettings'],
+                "sniffing": inbound.get('sniffing', '{}')
+            }
+
+            payload = json.dumps(update_data).encode()
+            update_req = urllib.request.Request(
+                update_url,
+                data=payload,
+                method='POST',
+                headers={'Content-Type': 'application/json'}
             )
 
+            resp = await loop.run_in_executor(None, opener.open, update_req)
+            update_result = json.loads(resp.read().decode())
+
+            if update_result.get('success'):
+                logger.info(f"Reality настройки обновлены на {server_name}: dest={new_dest}, sni={new_sni}")
+                return True
+            else:
+                logger.error(f"Ошибка обновления на {server_name}: {update_result.get('msg')}")
+                return False
+
     except Exception as e:
-        logger.error(f"Ошибка при получении списка Reality inbound-ов: {e}")
-        await message.answer(
-            f"❌ Произошла ошибка при получении данных:\n{str(e)}",
-            reply_markup=Keyboards.admin_menu()
-        )
+        logger.error(f"Ошибка при обновлении настроек на {server_name}: {e}")
+        return False
 
 
 @router.callback_query(F.data.startswith("sni_inbound_"))
@@ -1758,19 +2230,21 @@ async def cancel_sni_edit(message: Message, state: FSMContext):
 
 
 @router.message(ManageSNIStates.waiting_for_sni_domains)
-async def process_new_sni_domains(message: Message, state: FSMContext, xui_client):
-    """Обработка новых SNI доменов"""
-    from bot.api.xui_client import XUIClient
-    from bot.config import XUI_HOST, XUI_USERNAME, XUI_PASSWORD
+async def process_new_sni_domains(message: Message, state: FSMContext, **kwargs):
+    """Обработка новых SNI доменов (универсальный для всех серверов)"""
     import re
-    import subprocess
 
     # Получаем данные из состояния
     data = await state.get_data()
-    inbound_id = data.get('inbound_id')
-    inbound_remark = data.get('inbound_remark')
-    current_dest = data.get('current_dest')
-    current_sni = data.get('current_sni', [])
+
+    # Проверяем откуда пришли - от нового интерфейса или старого
+    inbound_id = data.get('manage_inbound_id') or data.get('inbound_id')
+    inbound_remark = data.get('manage_inbound_remark') or data.get('inbound_remark', '')
+    current_dest = data.get('manage_current_dest') or data.get('current_dest', '')
+    current_sni = data.get('manage_current_sni') or data.get('current_sni', [])
+    server_name = data.get('manage_server_name', 'Local')
+    is_local = data.get('manage_server_local', True)
+    server_config = data.get('manage_server_config', {})
 
     if not inbound_id:
         await message.answer("❌ Ошибка: данные inbound не найдены")
@@ -1801,117 +2275,45 @@ async def process_new_sni_domains(message: Message, state: FSMContext, xui_clien
         )
         return
 
-    # Показываем подтверждение
-    text = f"🌐 <b>ПОДТВЕРЖДЕНИЕ ИЗМЕНЕНИЙ</b>\n\n"
-    text += f"📍 <b>Inbound:</b> {inbound_remark} (ID: {inbound_id})\n"
-    text += f"🎯 <b>Dest:</b> <code>{current_dest}</code>\n\n"
-    text += f"━━━━━━━━━━━━━━━━\n\n"
-
-    text += f"<b>Текущие SNI:</b>\n"
-    if current_sni:
-        for sni in current_sni:
-            text += f"  • <code>{sni}</code>\n"
-    else:
-        text += f"  <i>Не указаны</i>\n"
-
-    text += f"\n<b>⬇️ Новые SNI:</b>\n"
-    for sni in domains:
-        text += f"  • <code>{sni}</code>\n"
-
-    text += f"\n━━━━━━━━━━━━━━━━\n\n"
-    text += f"⏳ Применяю изменения..."
-
-    msg = await message.answer(text, parse_mode="HTML")
+    msg = await message.answer(f"⏳ Обновляю SNI на {server_name}...")
 
     try:
-        # Обновляем SNI через API
-        async with XUIClient(XUI_HOST, XUI_USERNAME, XUI_PASSWORD) as xui:
-            success = await xui.update_reality_settings(
-                inbound_id=inbound_id,
-                dest=current_dest,
-                server_names=domains
-            )
-
-            if not success:
-                await msg.edit_text(
-                    f"{text}\n\n❌ <b>Ошибка при обновлении SNI!</b>\n"
-                    f"Не удалось применить изменения через X-UI API.",
-                    parse_mode="HTML"
-                )
-                await state.clear()
-                return
-
-        # Перезапускаем x-ui
-        await msg.edit_text(
-            f"{text}\n\n✅ <b>SNI обновлены!</b>\n⏳ Перезапускаю x-ui...",
-            parse_mode="HTML"
+        success = await update_inbound_reality_settings(
+            server_name=server_name,
+            is_local=is_local,
+            inbound_id=inbound_id,
+            new_dest=current_dest,
+            new_sni=domains,
+            server_config=server_config
         )
 
-        restart_result = subprocess.run(
-            ["systemctl", "restart", "x-ui"],
-            capture_output=True,
-            text=True
-        )
-
-        if restart_result.returncode == 0:
-            # Даём x-ui время на инициализацию и очистку базы
-            await asyncio.sleep(5)
-
-            # Сбрасываем сессию основного xui_client для переавторизации
-            xui_client.session_cookie = None
-
-            # Проверяем статус
-            status_result = subprocess.run(
-                ["systemctl", "is-active", "x-ui"],
-                capture_output=True,
-                text=True
-            )
-
-            if "active" in status_result.stdout:
-                await msg.edit_text(
-                    f"{text}\n\n"
-                    f"✅ <b>УСПЕШНО ОБНОВЛЕНО!</b>\n\n"
-                    f"🔄 x-ui перезапущен\n"
-                    f"🌐 Новые SNI активны\n\n"
-                    f"Изменения вступили в силу!",
-                    parse_mode="HTML"
-                )
-            else:
-                await msg.edit_text(
-                    f"{text}\n\n"
-                    f"⚠️ <b>SNI обновлены, но x-ui не запустился!</b>\n\n"
-                    f"Проверьте статус сервиса вручную:\n"
-                    f"<code>systemctl status x-ui</code>",
-                    parse_mode="HTML"
-                )
-        else:
+        if success:
             await msg.edit_text(
-                f"{text}\n\n"
-                f"⚠️ <b>SNI обновлены, но не удалось перезапустить x-ui!</b>\n\n"
-                f"Ошибка: <code>{restart_result.stderr}</code>\n\n"
-                f"Перезапустите вручную:\n"
-                f"<code>systemctl restart x-ui</code>",
+                f"✅ <b>SNI успешно обновлены!</b>\n\n"
+                f"🖥 Сервер: {server_name}\n"
+                f"📍 Inbound: {inbound_remark}\n"
+                f"🌐 Новые SNI:\n" +
+                "\n".join(f"   • <code>{d}</code>" for d in domains),
                 parse_mode="HTML"
             )
+        else:
+            await msg.edit_text("❌ Не удалось обновить SNI")
 
     except Exception as e:
         logger.error(f"Ошибка при обновлении SNI: {e}")
-        await msg.edit_text(
-            f"{text}\n\n"
-            f"❌ <b>ОШИБКА!</b>\n\n"
-            f"Не удалось обновить SNI:\n"
-            f"<code>{str(e)}</code>",
-            parse_mode="HTML"
-        )
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
     await state.clear()
+    await message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
 
 
 @router.callback_query(F.data == "sni_cancel")
-async def cancel_sni_management(callback: CallbackQuery):
-    """Отмена управления SNI"""
+async def cancel_sni_management(callback: CallbackQuery, state: FSMContext):
+    """Отмена управления настройками"""
+    await state.clear()
     await callback.message.delete()
     await callback.answer("Отменено")
+    await callback.message.answer("Панель администратора:", reply_markup=Keyboards.admin_menu())
 
 
 # ===== ПОИСК КЛЮЧЕЙ =====
@@ -2178,17 +2580,18 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
             text += f"   🔑 UUID: <code>{uuid_short}</code>\n\n"
 
             # Кнопки для клиента: ссылка и продление
-            # UUID = 36 символов, callback_data лимит = 64 байта
-            # get_link_ = 9 + 36 = 45 символов - вмещается
+            # Формат: exts_{server}_{uuid} - продление на конкретном сервере
+            # exts_ = 5, server = ~10, _ = 1, uuid = 36 = ~52 символов (лимит 64)
             if client.get('uuid'):
+                server_short = server[:10]  # Ограничиваем имя сервера
                 buttons.append([
                     InlineKeyboardButton(
                         text=f"🔗 {email[:15]}",
                         callback_data=f"get_link_{client['uuid']}"
                     ),
                     InlineKeyboardButton(
-                        text=f"📅 Продлить",
-                        callback_data=f"extend_{client['uuid']}"
+                        text=f"📅 {server_short}",
+                        callback_data=f"exts_{server_short}_{client['uuid']}"
                     )
                 ])
 
@@ -2261,9 +2664,123 @@ async def new_search(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("exts_"))
+async def extend_on_server_callback(callback: CallbackQuery):
+    """Показать меню выбора периода продления на конкретном сервере"""
+    # Формат: exts_{server}_{uuid}
+    data = callback.data.replace("exts_", "")
+    # Ищем первый _ после имени сервера (UUID содержит дефисы, не подчёркивания)
+    parts = data.split("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+
+    server_name = parts[0]
+    client_uuid = parts[1]
+    uuid_short = client_uuid[:8] + "..."
+
+    # Кнопки выбора периода - формат: dexts_{server}_{uuid}_{days}
+    buttons = [
+        [
+            InlineKeyboardButton(text="1 мес", callback_data=f"dexts_{server_name}_{client_uuid}_30"),
+            InlineKeyboardButton(text="3 мес", callback_data=f"dexts_{server_name}_{client_uuid}_90"),
+        ],
+        [
+            InlineKeyboardButton(text="6 мес", callback_data=f"dexts_{server_name}_{client_uuid}_180"),
+            InlineKeyboardButton(text="1 год", callback_data=f"dexts_{server_name}_{client_uuid}_365"),
+        ],
+        [
+            InlineKeyboardButton(text="◀️ Назад", callback_data="new_search")
+        ]
+    ]
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(
+        f"📅 <b>ПРОДЛЕНИЕ КЛЮЧА</b>\n\n"
+        f"🖥 Сервер: <b>{server_name}</b>\n"
+        f"🔑 UUID: <code>{uuid_short}</code>\n\n"
+        f"Выберите период продления:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dexts_"))
+async def do_extend_on_server_callback(callback: CallbackQuery):
+    """Выполнить продление ключа на конкретном сервере"""
+    from bot.api.remote_xui import extend_client_on_server, load_servers_config
+    from datetime import datetime
+
+    # Формат: dexts_{server}_{uuid}_{days}
+    data = callback.data.replace("dexts_", "")
+    # Парсим: сервер_uuid_дни (дни в конце после последнего _)
+    parts = data.rsplit("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+
+    try:
+        extend_days = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Ошибка: неверное количество дней", show_alert=True)
+        return
+
+    # Парсим сервер и UUID
+    server_uuid = parts[0]
+    server_parts = server_uuid.split("_", 1)
+    if len(server_parts) != 2:
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+
+    server_name = server_parts[0]
+    client_uuid = server_parts[1]
+
+    await callback.answer(f"⏳ Продлеваю ключ на {server_name}...")
+
+    # Продлеваем на указанном сервере
+    result = await extend_client_on_server(server_name, client_uuid, extend_days)
+
+    if result.get('success'):
+        new_expiry_ms = result.get('new_expiry', 0)
+        if new_expiry_ms:
+            new_expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000).strftime('%d.%m.%Y %H:%M')
+        else:
+            new_expiry_date = "неизвестно"
+
+        period_text = {30: "1 месяц", 90: "3 месяца", 180: "6 месяцев", 365: "1 год"}.get(extend_days, f"{extend_days} дней")
+
+        await callback.message.edit_text(
+            f"✅ <b>Ключ успешно продлён!</b>\n\n"
+            f"🖥 Сервер: <b>{server_name}</b>\n"
+            f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n"
+            f"📅 Период: +{period_text}\n"
+            f"⏰ Новый срок: <b>{new_expiry_date}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="cancel_key_delete")]
+            ])
+        )
+    else:
+        error_msg = result.get('error', 'Неизвестная ошибка')
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка продления</b>\n\n"
+            f"🖥 Сервер: {server_name}\n"
+            f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n\n"
+            f"Причина: {error_msg}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"exts_{server_name}_{client_uuid}")],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")]
+            ])
+        )
+
+
 @router.callback_query(F.data.startswith("extend_"))
 async def extend_client_callback(callback: CallbackQuery):
-    """Показать меню выбора периода продления"""
+    """Показать меню выбора периода продления (старый формат - на всех серверах)"""
     uuid_prefix = callback.data.replace("extend_", "")
 
     # Кнопки выбора периода
@@ -2608,11 +3125,49 @@ async def get_client_link_callback(callback: CallbackQuery):
         await callback.message.answer("❌ Клиент не найден")
         return
 
-    # Генерируем VLESS ссылку
-    from bot.api.remote_xui import get_client_link_from_active_server
-
+    # Генерируем VLESS ссылку с параметрами ТОГО сервера, где найден клиент
     email = client_info.get('email', 'client')
-    vless_link = await get_client_link_from_active_server(full_uuid, email)
+    vless_link = None
+
+    if target_server:
+        # Используем параметры сервера, где реально найден клиент
+        domain = target_server.get('domain', target_server.get('ip', ''))
+        port = target_server.get('port', 443)
+        inbounds = target_server.get('inbounds', {})
+        main_inbound = inbounds.get('main', {})
+
+        sni = main_inbound.get('sni', '')
+        pbk = main_inbound.get('pbk', '')
+        sid = main_inbound.get('sid', '')
+        fp = main_inbound.get('fp', 'chrome')
+        security = main_inbound.get('security', 'reality')
+        flow = main_inbound.get('flow', '')
+        name_prefix = main_inbound.get('name_prefix', '')
+        network = main_inbound.get('network', 'tcp')
+
+        params = [f"type={network}", "encryption=none"]
+        if network == 'grpc':
+            params.append(f"serviceName={main_inbound.get('serviceName', '')}")
+            params.append(f"authority={main_inbound.get('authority', '')}")
+        params.append(f"security={security}")
+        if security == 'reality':
+            if pbk:
+                params.append(f"pbk={pbk}")
+            params.append(f"fp={fp or 'chrome'}")
+            if sni:
+                params.append(f"sni={sni}")
+            if sid:
+                params.append(f"sid={sid}")
+            if flow:
+                params.append(f"flow={flow}")
+            params.append("spx=%2F")
+
+        link_name = f"{name_prefix} {email}" if name_prefix else email
+        vless_link = f"vless://{full_uuid}@{domain}:{port}?" + "&".join(params) + f"#{link_name}"
+    else:
+        # Fallback на старую функцию
+        from bot.api.remote_xui import get_client_link_from_active_server
+        vless_link = await get_client_link_from_active_server(full_uuid, email)
 
     if vless_link:
         sub_url = f"https://zov-gor.ru/sub/{full_uuid}"
@@ -3539,6 +4094,83 @@ async def check_servers_status(message: Message, **kwargs):
     )
 
 
+# ============ ПАНЕЛИ УПРАВЛЕНИЯ X-UI ============
+
+@router.message(F.text == "🔧 Панели X-UI")
+@admin_only
+async def show_xui_panels(message: Message, **kwargs):
+    """Показать ссылки на панели управления X-UI серверов"""
+    import json
+    from pathlib import Path
+
+    config_path = Path('/root/manager_vpn/servers_config.json')
+    if not config_path.exists():
+        await message.answer(
+            "❌ Файл конфигурации серверов не найден.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    servers = config.get('servers', [])
+    if not servers:
+        await message.answer(
+            "❌ Серверы не настроены.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
+    text = "🔧 <b>ПАНЕЛИ УПРАВЛЕНИЯ X-UI</b>\n\n"
+
+    buttons = []
+    for server in servers:
+        name = server.get('name', 'Unknown')
+        is_enabled = server.get('enabled', True)
+        is_local = server.get('local', False)
+        panel = server.get('panel', {})
+
+        status_emoji = "🟢" if is_enabled else "⚫"
+        text += f"{status_emoji} <b>{name}</b>"
+        if is_local:
+            text += " (локальный)"
+        text += "\n"
+
+        if is_local:
+            # Локальный сервер - панель на localhost
+            text += f"   🔗 Локальная панель X-UI\n"
+            text += f"   📍 IP: {server.get('ip', 'N/A')}\n\n"
+        elif panel.get('url'):
+            panel_url = panel.get('url')
+            panel_user = panel.get('username', 'N/A')
+            panel_pass = panel.get('password', 'N/A')
+
+            text += f"   🔗 <code>{panel_url}</code>\n"
+            text += f"   👤 Логин: <code>{panel_user}</code>\n"
+            text += f"   🔑 Пароль: <code>{panel_pass}</code>\n\n"
+
+            # Кнопка для быстрого перехода
+            buttons.append([InlineKeyboardButton(
+                text=f"🌐 {name}",
+                url=panel_url
+            )])
+        else:
+            text += f"   ⚠️ Панель не настроена\n"
+            text += f"   📍 IP: {server.get('ip', 'N/A')}\n\n"
+
+    text += "━━━━━━━━━━━━━━━━\n"
+    text += "💡 <i>Нажмите на кнопку для перехода в панель</i>"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
 # ============ УПРАВЛЕНИЕ СЕРВЕРАМИ ДЛЯ НОВЫХ ПОДПИСОК ============
 
 @router.message(F.text == "/servers")
@@ -3956,7 +4588,13 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
         async with aiohttp.ClientSession(connector=connector) as session:
             # Авторизация (form-data, не JSON!)
             login_url = f"{panel_url}/login"
-            await session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
+            login_resp = await session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
+            if login_resp.status != 200:
+                logger.error(f"Ошибка авторизации в панели: статус {login_resp.status}")
+            else:
+                login_data = await login_resp.json()
+                if not login_data.get('success'):
+                    logger.error(f"Авторизация в панели не удалась: {login_data.get('msg')}")
 
             # Получаем inbound'ы через API
             inbounds_url = f"{panel_url}/panel/api/inbounds/list"
@@ -3977,35 +4615,55 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                                 stream_settings = json.loads(inbound.get('streamSettings', '{}'))
                                 security = stream_settings.get('security', 'none')
                                 network = stream_settings.get('network', 'tcp')
+                                settings = json.loads(inbound.get('settings', '{}'))
+
+                                # Извлекаем flow из существующих клиентов
+                                flow = ''
+                                for c in settings.get('clients', []):
+                                    if c.get('flow'):
+                                        flow = c.get('flow')
+                                        break
+
+                                inbound_config = {
+                                    "id": int(inbound_id),
+                                    "security": security,
+                                    "flow": flow,
+                                    "fp": "chrome",
+                                    "name_prefix": f"🌐 {remark}"
+                                }
 
                                 if security == 'reality':
                                     reality = stream_settings.get('realitySettings', {})
                                     sni_list = reality.get('serverNames', [])
-                                    sni = sni_list[0] if sni_list else ''
-                                    pbk = reality.get('settings', {}).get('publicKey', '')
                                     short_ids = reality.get('shortIds', [])
-                                    sid = short_ids[0] if short_ids else ''
-                                    fp = reality.get('settings', {}).get('fingerprint', 'chrome')
+                                    inbound_config.update({
+                                        "sni": sni_list[0] if sni_list else '',
+                                        "pbk": reality.get('settings', {}).get('publicKey', ''),
+                                        "sid": short_ids[0] if short_ids else '',
+                                        "fp": reality.get('settings', {}).get('fingerprint', 'chrome'),
+                                    })
+                                elif security == 'tls':
+                                    tls = stream_settings.get('tlsSettings', {})
+                                    inbound_config["sni"] = tls.get('serverName', '')
 
-                                    inbound_key = remark.lower().replace(' ', '_').replace('-', '_')
-                                    inbound_config = {
-                                        "id": int(inbound_id),
-                                        "security": "reality",
-                                        "sni": sni,
-                                        "pbk": pbk,
-                                        "sid": sid,
-                                        "flow": "",
-                                        "fp": fp,
-                                        "name_prefix": f"🌐 {remark}"
-                                    }
-                                    # Добавляем network если не tcp (по умолчанию)
-                                    if network and network != 'tcp':
-                                        inbound_config["network"] = network
-                                    inbounds_data[inbound_key] = inbound_config
-                            except:
-                                pass
+                                # Добавляем network если не tcp
+                                if network and network != 'tcp':
+                                    inbound_config["network"] = network
+
+                                inbounds_data[remark] = inbound_config
+                            except Exception as parse_err:
+                                logger.error(f"Ошибка парсинга inbound {inbound_id} ({remark}): {parse_err}")
+                    else:
+                        logger.error(f"API вернул ошибку: {response_data.get('msg')}")
+                else:
+                    logger.error(f"Ошибка получения inbound'ов: статус {resp.status}")
     except Exception as e:
         logger.error(f"Ошибка получения inbound'ов через API: {e}")
+
+    # Первый inbound (или единственный) всегда должен быть "main"
+    if inbounds_data and 'main' not in inbounds_data:
+        first_key = next(iter(inbounds_data))
+        inbounds_data['main'] = inbounds_data.pop(first_key)
 
     # Создаём конфигурацию сервера (без SSH)
     new_server = {
