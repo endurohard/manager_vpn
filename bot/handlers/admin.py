@@ -90,6 +90,13 @@ class AdminCreateKeyStates(StatesGroup):
     confirming = State()
 
 
+class AddToSubscriptionStates(StatesGroup):
+    """Состояния для добавления сервера в подписку"""
+    waiting_for_search = State()
+    waiting_for_server_select = State()
+    confirming = State()
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -2336,6 +2343,13 @@ async def search_clients_on_servers(query: str) -> list:
     with open(servers_file, 'r') as f:
         config = json.load(f)
 
+    # Определяем имя локального сервера из конфига
+    local_server_name = 'Local'
+    for server in config.get('servers', []):
+        if server.get('local', False):
+            local_server_name = server.get('name', 'Local')
+            break
+
     # Поиск на локальном сервере
     try:
         import sqlite3
@@ -2361,7 +2375,7 @@ async def search_clients_on_servers(query: str) -> list:
                         results.append({
                             'email': email,
                             'uuid': client.get('id', ''),
-                            'server': 'Local',
+                            'server': local_server_name,
                             'inbound_id': inbound_id,
                             'expiry_time': expiry_time,
                             'expiry_str': expiry_str,
@@ -2574,10 +2588,15 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
             expiry = client.get('expiry_str', 'N/A')
             uuid_short = client.get('uuid', '')[:8] + '...' if client.get('uuid') else 'N/A'
 
+            sub_url = f"https://zov-gor.ru/sub/{client.get('uuid', '')}" if client.get('uuid') else ''
+
             text += f"{idx}. <b>{email}</b>\n"
             text += f"   🖥 Сервер: {server}\n"
             text += f"   ⏰ Истекает: {expiry}\n"
-            text += f"   🔑 UUID: <code>{uuid_short}</code>\n\n"
+            text += f"   🔑 UUID: <code>{uuid_short}</code>\n"
+            if sub_url:
+                text += f"   📱 Подписка: <code>{sub_url}</code>\n"
+            text += "\n"
 
             # Кнопки для клиента: ссылка и продление
             # Формат: exts_{server}_{uuid} - продление на конкретном сервере
@@ -4586,77 +4605,98 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Авторизация (form-data, не JSON!)
+            # Авторизация (JSON, как в xui_client)
             login_url = f"{panel_url}/login"
-            login_resp = await session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15))
-            if login_resp.status != 200:
-                logger.error(f"Ошибка авторизации в панели: статус {login_resp.status}")
-            else:
-                login_data = await login_resp.json()
-                if not login_data.get('success'):
-                    logger.error(f"Авторизация в панели не удалась: {login_data.get('msg')}")
-
-            # Получаем inbound'ы через API
-            inbounds_url = f"{panel_url}/panel/api/inbounds/list"
-            async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    response_data = await resp.json()
-                    if response_data.get('success'):
-                        for inbound in response_data.get('obj', []):
-                            if not inbound.get('enable'):
-                                continue
-
-                            inbound_id = inbound.get('id')
-                            remark = inbound.get('remark', f'inbound_{inbound_id}')
-                            port = inbound.get('port')
-                            protocol = inbound.get('protocol')
-
-                            try:
-                                stream_settings = json.loads(inbound.get('streamSettings', '{}'))
-                                security = stream_settings.get('security', 'none')
-                                network = stream_settings.get('network', 'tcp')
-                                settings = json.loads(inbound.get('settings', '{}'))
-
-                                # Извлекаем flow из существующих клиентов
-                                flow = ''
-                                for c in settings.get('clients', []):
-                                    if c.get('flow'):
-                                        flow = c.get('flow')
-                                        break
-
-                                inbound_config = {
-                                    "id": int(inbound_id),
-                                    "security": security,
-                                    "flow": flow,
-                                    "fp": "chrome",
-                                    "name_prefix": f"🌐 {remark}"
-                                }
-
-                                if security == 'reality':
-                                    reality = stream_settings.get('realitySettings', {})
-                                    sni_list = reality.get('serverNames', [])
-                                    short_ids = reality.get('shortIds', [])
-                                    inbound_config.update({
-                                        "sni": sni_list[0] if sni_list else '',
-                                        "pbk": reality.get('settings', {}).get('publicKey', ''),
-                                        "sid": short_ids[0] if short_ids else '',
-                                        "fp": reality.get('settings', {}).get('fingerprint', 'chrome'),
-                                    })
-                                elif security == 'tls':
-                                    tls = stream_settings.get('tlsSettings', {})
-                                    inbound_config["sni"] = tls.get('serverName', '')
-
-                                # Добавляем network если не tcp
-                                if network and network != 'tcp':
-                                    inbound_config["network"] = network
-
-                                inbounds_data[remark] = inbound_config
-                            except Exception as parse_err:
-                                logger.error(f"Ошибка парсинга inbound {inbound_id} ({remark}): {parse_err}")
+            logged_in = False
+            async with session.post(login_url, json={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as login_resp:
+                if login_resp.status == 200:
+                    login_data = await login_resp.json()
+                    if login_data.get('success'):
+                        logged_in = True
+                        logger.info(f"Авторизация в панели успешна (JSON)")
                     else:
-                        logger.error(f"API вернул ошибку: {response_data.get('msg')}")
+                        logger.error(f"Авторизация в панели не удалась (JSON): {login_data.get('msg')}")
                 else:
-                    logger.error(f"Ошибка получения inbound'ов: статус {resp.status}")
+                    logger.error(f"Ошибка авторизации в панели (JSON): статус {login_resp.status}")
+
+            # Если JSON не сработал, пробуем form-data
+            if not logged_in:
+                logger.info("Пробуем авторизацию через form-data...")
+                async with session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as login_resp:
+                    if login_resp.status == 200:
+                        login_data = await login_resp.json()
+                        if login_data.get('success'):
+                            logged_in = True
+                            logger.info(f"Авторизация в панели успешна (form-data)")
+                        else:
+                            logger.error(f"Авторизация в панели не удалась (form-data): {login_data.get('msg')}")
+                    else:
+                        logger.error(f"Ошибка авторизации в панели (form-data): статус {login_resp.status}")
+
+            if not logged_in:
+                logger.error("Не удалось авторизоваться в панели ни одним способом")
+            else:
+                # Получаем inbound'ы через API только если авторизация успешна
+                inbounds_url = f"{panel_url}/panel/api/inbounds/list"
+                async with session.get(inbounds_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        response_data = await resp.json()
+                        if response_data.get('success'):
+                            for inbound in response_data.get('obj', []):
+                                if not inbound.get('enable'):
+                                    continue
+
+                                inbound_id = inbound.get('id')
+                                remark = inbound.get('remark', f'inbound_{inbound_id}')
+                                port = inbound.get('port')
+                                protocol = inbound.get('protocol')
+
+                                try:
+                                    stream_settings = json.loads(inbound.get('streamSettings', '{}'))
+                                    security = stream_settings.get('security', 'none')
+                                    network = stream_settings.get('network', 'tcp')
+                                    settings = json.loads(inbound.get('settings', '{}'))
+
+                                    # Извлекаем flow из существующих клиентов
+                                    flow = ''
+                                    for c in settings.get('clients', []):
+                                        if c.get('flow'):
+                                            flow = c.get('flow')
+                                            break
+
+                                    inbound_config = {
+                                        "id": int(inbound_id),
+                                        "security": security,
+                                        "flow": flow,
+                                        "fp": "chrome",
+                                        "name_prefix": f"🌐 {remark}"
+                                    }
+
+                                    if security == 'reality':
+                                        reality = stream_settings.get('realitySettings', {})
+                                        sni_list = reality.get('serverNames', [])
+                                        short_ids = reality.get('shortIds', [])
+                                        inbound_config.update({
+                                            "sni": sni_list[0] if sni_list else '',
+                                            "pbk": reality.get('settings', {}).get('publicKey', ''),
+                                            "sid": short_ids[0] if short_ids else '',
+                                            "fp": reality.get('settings', {}).get('fingerprint', 'chrome'),
+                                        })
+                                    elif security == 'tls':
+                                        tls = stream_settings.get('tlsSettings', {})
+                                        inbound_config["sni"] = tls.get('serverName', '')
+
+                                    # Добавляем network если не tcp
+                                    if network and network != 'tcp':
+                                        inbound_config["network"] = network
+
+                                    inbounds_data[remark] = inbound_config
+                                except Exception as parse_err:
+                                    logger.error(f"Ошибка парсинга inbound {inbound_id} ({remark}): {parse_err}")
+                        else:
+                            logger.error(f"API вернул ошибку: {response_data.get('msg')}")
+                    else:
+                        logger.error(f"Ошибка получения inbound'ов: статус {resp.status}")
     except Exception as e:
         logger.error(f"Ошибка получения inbound'ов через API: {e}")
 
@@ -4766,3 +4806,556 @@ async def show_pending_keys(message: Message, db: DatabaseManager, **kwargs):
     text += "\n\n💡 <i>Retry каждые 2 минуты автоматически</i>"
 
     await message.answer(text, parse_mode="HTML")
+
+
+# ============ ДОБАВЛЕНИЕ СЕРВЕРА В ПОДПИСКУ ============
+
+@router.message(F.text == "📡 Добавить сервер")
+@admin_only
+async def start_add_server_to_sub(message: Message, state: FSMContext, **kwargs):
+    """Начало добавления сервера в подписку клиента"""
+    await state.set_state(AddToSubscriptionStates.waiting_for_search)
+    await message.answer(
+        "📡 <b>ДОБАВИТЬ СЕРВЕР В ПОДПИСКУ</b>\n\n"
+        "Введите номер телефона, email или UUID клиента для поиска.\n\n"
+        "Примеры:\n"
+        "• <code>79001234567</code>\n"
+        "• <code>Иван</code>\n\n"
+        "Или нажмите 'Отмена' для возврата.",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel()
+    )
+
+
+@router.message(AddToSubscriptionStates.waiting_for_search, F.text == "Отмена")
+async def cancel_add_server_to_sub(message: Message, state: FSMContext):
+    """Отмена добавления сервера"""
+    await state.clear()
+    await message.answer(
+        "Операция отменена.",
+        reply_markup=Keyboards.admin_menu()
+    )
+
+
+@router.message(AddToSubscriptionStates.waiting_for_search)
+async def process_add_sub_search(message: Message, state: FSMContext):
+    """Обработка поискового запроса для добавления сервера"""
+    query = message.text.strip()
+
+    if len(query) < 2:
+        await message.answer("❌ Введите минимум 2 символа для поиска.")
+        return
+
+    status_msg = await message.answer("🔍 Поиск клиента на серверах...")
+
+    xui_clients = await search_clients_on_servers(query)
+
+    if not xui_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено на серверах.\n\n"
+            "Попробуйте другой запрос.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Группируем по UUID
+    clients_by_uuid = {}
+    for client in xui_clients:
+        uuid = client.get('uuid', '')
+        if not uuid:
+            continue
+        if uuid not in clients_by_uuid:
+            clients_by_uuid[uuid] = {
+                'email': client.get('email', ''),
+                'uuid': uuid,
+                'servers': [],
+                'expiry_time': client.get('expiry_time', 0),
+                'ip_limit': client.get('limit_ip', 2)
+            }
+        clients_by_uuid[uuid]['servers'].append(client.get('server', 'Unknown'))
+
+    unique_clients = list(clients_by_uuid.values())
+
+    if not unique_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Сохраняем в FSM для следующего шага
+    await state.update_data(search_results=unique_clients)
+
+    text = f"🔍 <b>Найдено клиентов:</b> {len(unique_clients)}\n\n"
+    buttons = []
+
+    for idx, client in enumerate(unique_clients[:10]):
+        email = client['email']
+        uuid_short = client['uuid'][:8] + '...'
+        servers_str = ', '.join(client['servers'])
+        expiry_time = client.get('expiry_time', 0)
+
+        if expiry_time > 0:
+            from datetime import datetime
+            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_dt.strftime("%d.%m.%Y")
+        else:
+            expiry_str = "Безлимит"
+
+        sub_url = f"https://zov-gor.ru/sub/{client['uuid']}"
+
+        text += f"{idx + 1}. <b>{email}</b>\n"
+        text += f"   🔑 UUID: <code>{uuid_short}</code>\n"
+        text += f"   🖥 Серверы: {servers_str}\n"
+        text += f"   ⏰ Истекает: {expiry_str}\n"
+        text += f"   📱 Подписка: <code>{sub_url}</code>\n\n"
+
+        buttons.append([InlineKeyboardButton(
+            text=f"📡 {email[:30]}",
+            callback_data=f"addsub_sel_{idx}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("addsub_sel_"))
+async def select_client_for_add(callback: CallbackQuery, state: FSMContext):
+    """Выбор клиента — показ серверов где он есть и где нет"""
+    from bot.api.remote_xui import find_client_presence_on_all_servers
+    from datetime import datetime
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    search_results = data.get('search_results', [])
+
+    if idx >= len(search_results):
+        await callback.answer("Ошибка: клиент не найден")
+        return
+
+    client = search_results[idx]
+    client_uuid = client['uuid']
+    email = client['email']
+
+    await callback.message.edit_text("🔍 Проверяю серверы...")
+
+    presence = await find_client_presence_on_all_servers(client_uuid)
+    found_on = presence.get('found_on', [])
+    not_found_on = presence.get('not_found_on', [])
+
+    # Берём expiry и ip_limit из первого найденного сервера
+    expiry_time_ms = 0
+    ip_limit = 2
+    if found_on:
+        expiry_time_ms = found_on[0].get('expiry_time', 0)
+        ip_limit = found_on[0].get('ip_limit', 2)
+
+    # Сохраняем в FSM
+    available_servers = []
+    for srv in not_found_on:
+        available_servers.append({
+            'server_name': srv['server_name'],
+            'name_prefix': srv.get('name_prefix', srv['server_name']),
+            'server_config': srv['server_config']
+        })
+
+    await state.update_data(
+        client_uuid=client_uuid,
+        client_email=email,
+        expiry_time_ms=expiry_time_ms,
+        ip_limit=ip_limit,
+        available_servers=available_servers,
+        selected_server_indices=[]
+    )
+    await state.set_state(AddToSubscriptionStates.waiting_for_server_select)
+
+    # Формируем текст
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n"
+    text += f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n\n"
+
+    if found_on:
+        text += "<b>✅ Уже на серверах:</b>\n"
+        for srv in found_on:
+            exp = srv.get('expiry_time', 0)
+            if exp > 0:
+                exp_str = datetime.fromtimestamp(exp / 1000).strftime("%d.%m.%Y")
+            else:
+                exp_str = "Безлимит"
+            prefix = srv.get('name_prefix', '')
+            label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            text += f"  ✅ {label} — до {exp_str}\n"
+        text += "\n"
+
+    if not not_found_on:
+        text += "🎉 <b>Клиент уже на всех серверах!</b>"
+        buttons = [
+            [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="addsub_newsearch")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="addsub_cancel")]
+        ]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        await callback.answer()
+        return
+
+    text += "<b>➕ Доступные серверы:</b>\n"
+    for srv in not_found_on:
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  ➕ {label}\n"
+    text += "\nВыберите серверы для добавления:"
+
+    # Кнопки серверов
+    buttons = []
+    for idx, srv in enumerate(not_found_on):
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"➕ {btn_label}",
+            callback_data=f"addsub_srv_{idx}"
+        )])
+
+    if len(not_found_on) > 1:
+        buttons.append([InlineKeyboardButton(
+            text="📡 Добавить на ВСЕ",
+            callback_data="addsub_all"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddToSubscriptionStates.waiting_for_server_select, F.data.startswith("addsub_srv_"))
+async def pick_server_toggle(callback: CallbackQuery, state: FSMContext):
+    """Переключение выбора конкретного сервера"""
+    from datetime import datetime
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    selected = data.get('selected_server_indices', [])
+    available = data.get('available_servers', [])
+    found_expiry = data.get('expiry_time_ms', 0)
+    email = data.get('client_email', '')
+    client_uuid = data.get('client_uuid', '')
+
+    if idx >= len(available):
+        await callback.answer("Ошибка")
+        return
+
+    # Toggle
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+    await state.update_data(selected_server_indices=selected)
+
+    # Обновляем клавиатуру
+    buttons = []
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {btn_label}",
+            callback_data=f"addsub_srv_{i}"
+        )])
+
+    if len(available) > 1:
+        buttons.append([InlineKeyboardButton(
+            text="📡 Добавить на ВСЕ",
+            callback_data="addsub_all"
+        )])
+
+    if selected:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Подтвердить ({len(selected)})",
+            callback_data="addsub_go"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    # Обновляем текст
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n"
+    text += f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n\n"
+    text += "<b>Выбранные серверы:</b>\n"
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  {mark} {label}\n"
+
+    if found_expiry > 0:
+        exp_str = datetime.fromtimestamp(found_expiry / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+    else:
+        text += "\n⏰ Срок: Безлимит"
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddToSubscriptionStates.waiting_for_server_select, F.data == "addsub_all")
+async def pick_all_servers(callback: CallbackQuery, state: FSMContext):
+    """Выбрать все доступные серверы и перейти к подтверждению"""
+    from datetime import datetime
+
+    data = await state.get_data()
+    available = data.get('available_servers', [])
+    email = data.get('client_email', '')
+    client_uuid = data.get('client_uuid', '')
+    expiry_time_ms = data.get('expiry_time_ms', 0)
+
+    selected = list(range(len(available)))
+    await state.update_data(selected_server_indices=selected)
+    await state.set_state(AddToSubscriptionStates.confirming)
+
+    # Формируем подтверждение
+    text = f"📡 <b>Подтверждение</b>\n\n"
+    text += f"Клиент: <code>{email}</code>\n"
+    text += f"UUID: <code>{client_uuid[:8]}...</code>\n\n"
+    text += "<b>Добавить на серверы:</b>\n"
+    for srv in available:
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  • {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+    else:
+        text += "\n⏰ Срок: Безлимит"
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    if expiry_time_ms > 0 and expiry_time_ms < now_ms:
+        text += "\n⚠️ <i>Внимание: ключ просрочен!</i>"
+
+    buttons = [
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="addsub_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddToSubscriptionStates.waiting_for_server_select, F.data == "addsub_go")
+async def go_to_confirm(callback: CallbackQuery, state: FSMContext):
+    """Перейти к подтверждению выбранных серверов"""
+    from datetime import datetime
+
+    data = await state.get_data()
+    selected = data.get('selected_server_indices', [])
+    available = data.get('available_servers', [])
+    email = data.get('client_email', '')
+    client_uuid = data.get('client_uuid', '')
+    expiry_time_ms = data.get('expiry_time_ms', 0)
+
+    if not selected:
+        await callback.answer("Выберите хотя бы один сервер")
+        return
+
+    await state.set_state(AddToSubscriptionStates.confirming)
+
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    text = f"📡 <b>Подтверждение</b>\n\n"
+    text += f"Клиент: <code>{email}</code>\n"
+    text += f"UUID: <code>{client_uuid[:8]}...</code>\n\n"
+    text += "<b>Добавить на серверы:</b>\n"
+    for srv in selected_servers:
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  • {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+    else:
+        text += "\n⏰ Срок: Безлимит"
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    if expiry_time_ms > 0 and expiry_time_ms < now_ms:
+        text += "\n⚠️ <i>Внимание: ключ просрочен!</i>"
+
+    buttons = [
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="addsub_confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="addsub_back")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddToSubscriptionStates.confirming, F.data == "addsub_back")
+async def back_to_server_select(callback: CallbackQuery, state: FSMContext):
+    """Назад к выбору серверов"""
+    await state.set_state(AddToSubscriptionStates.waiting_for_server_select)
+    # Симулируем нажатие на toggle чтобы перерисовать экран
+    data = await state.get_data()
+    selected = data.get('selected_server_indices', [])
+    available = data.get('available_servers', [])
+    email = data.get('client_email', '')
+    client_uuid = data.get('client_uuid', '')
+    expiry_time_ms = data.get('expiry_time_ms', 0)
+
+    from datetime import datetime
+
+    buttons = []
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {btn_label}",
+            callback_data=f"addsub_srv_{i}"
+        )])
+
+    if len(available) > 1:
+        buttons.append([InlineKeyboardButton(
+            text="📡 Добавить на ВСЕ",
+            callback_data="addsub_all"
+        )])
+
+    if selected:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Подтвердить ({len(selected)})",
+            callback_data="addsub_go"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n"
+    text += f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n\n"
+    text += "<b>Выбранные серверы:</b>\n"
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  {mark} {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+    else:
+        text += "\n⏰ Срок: Безлимит"
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddToSubscriptionStates.confirming, F.data == "addsub_confirm")
+async def confirm_add_to_sub(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение — создаём клиента на выбранных серверах"""
+    from bot.api.remote_xui import create_client_via_panel, create_client_on_remote_server
+    from datetime import datetime
+
+    data = await state.get_data()
+    client_uuid = data.get('client_uuid', '')
+    email = data.get('client_email', '')
+    expiry_time_ms = data.get('expiry_time_ms', 0)
+    ip_limit = data.get('ip_limit', 2)
+    selected = data.get('selected_server_indices', [])
+    available = data.get('available_servers', [])
+
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    if not selected_servers:
+        await callback.answer("Нет выбранных серверов")
+        return
+
+    await callback.message.edit_text("⏳ Добавление клиента на серверы...")
+
+    results = []
+    for srv in selected_servers:
+        server_config = srv['server_config']
+        server_name = srv['server_name']
+
+        try:
+            if server_config.get('local', False):
+                # Локальный сервер — через xui_client напрямую нельзя с заданным UUID,
+                # используем create_client_via_panel-подобную логику через SQLite
+                from bot.api.remote_xui import _create_client_local_with_uuid
+                success = await _create_client_local_with_uuid(
+                    client_uuid=client_uuid,
+                    email=email,
+                    expire_time_ms=expiry_time_ms,
+                    ip_limit=ip_limit
+                )
+                results.append({'server': server_name, 'success': success})
+            else:
+                # Удалённый сервер — через API панели
+                result = await create_client_via_panel(
+                    server_config=server_config,
+                    client_uuid=client_uuid,
+                    email=email,
+                    expire_days=30,  # fallback, не используется если expire_time_ms задан
+                    ip_limit=ip_limit,
+                    expire_time_ms=expiry_time_ms
+                )
+                success = result.get('success', False)
+                existing = result.get('existing', False)
+                results.append({
+                    'server': server_name,
+                    'success': success,
+                    'existing': existing
+                })
+        except Exception as e:
+            logger.error(f"Ошибка добавления на {server_name}: {e}")
+            results.append({'server': server_name, 'success': False})
+
+    await state.clear()
+
+    # Формируем результат
+    text = "📡 <b>Результат:</b>\n\n"
+    for r in results:
+        if r.get('success'):
+            if r.get('existing'):
+                text += f"✅ {r['server']} — клиент уже существовал\n"
+            else:
+                text += f"✅ {r['server']} — клиент добавлен\n"
+        else:
+            text += f"❌ {r['server']} — ошибка\n"
+
+    text += "\n📱 Подписка обновлена автоматически."
+
+    buttons = [
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="addsub_newsearch")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="addsub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "addsub_newsearch")
+async def addsub_new_search(callback: CallbackQuery, state: FSMContext):
+    """Новый поиск для добавления сервера"""
+    await state.set_state(AddToSubscriptionStates.waiting_for_search)
+    await callback.message.edit_text(
+        "📡 <b>ДОБАВИТЬ СЕРВЕР В ПОДПИСКУ</b>\n\n"
+        "Введите номер телефона, email или UUID клиента для поиска.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "addsub_cancel")
+async def cancel_add_sub_callback(callback: CallbackQuery, state: FSMContext):
+    """Отмена добавления сервера (inline кнопка)"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer(
+        "Панель администратора:",
+        reply_markup=Keyboards.admin_menu()
+    )
+    await callback.answer()

@@ -116,7 +116,7 @@
           "sid": "2672b3",
           "flow": "",
           "fp": "chrome",
-          "name_prefix": "ГОС"
+          "name_prefix": "🇩🇪 ГОС"
         }
       }
     },
@@ -176,6 +176,35 @@
           "flow": "xtls-rprx-vision",
           "fp": "chrome",
           "name_prefix": "🇺🇸 ГОС-USA"
+        }
+      }
+    },
+    {
+      "name": "📶 LTE: Билайн [ 50 Гб ]",
+      "domain": "vk.peakvip.ru",
+      "ip": "138.124.14.245",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер 📶 LTE: Билайн [ 50 Гб ]",
+      "panel": {
+        "url": "https://138.124.14.245:30458/1IuVIKhxAK1KscXXgg",
+        "port": 30458,
+        "path": "/1IuVIKhxAK1KscXXgg",
+        "username": "zXLh29byYZ",
+        "password": "xQiIeS99Rq"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "example.com",
+          "pbk": "",
+          "sid": "",
+          "flow": "",
+          "fp": "chrome",
+          "name_prefix": "📶 LTE: Билайн"
         }
       }
     }

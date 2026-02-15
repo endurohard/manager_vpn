@@ -131,6 +131,123 @@ async def _panel_login(server_config: dict) -> bool:
         return False
 
 
+async def get_inbound_settings_from_panel(
+    server_config: dict,
+    inbound_id: int = None
+) -> dict:
+    """
+    Получить актуальные настройки inbound с панели сервера.
+
+    Возвращает реальные параметры reality/tls/grpc с сервера, а не из статического конфига.
+
+    :param server_config: Конфигурация сервера из servers_config.json
+    :param inbound_id: ID inbound (если не указан, используется из конфига)
+    :return: dict с настройками или None
+    """
+    server_name = server_config.get('name', 'Unknown')
+    panel = server_config.get('panel', {})
+
+    if not panel:
+        logger.debug(f"Нет конфигурации панели для {server_name}, используем статический конфиг")
+        return None
+
+    # Определяем inbound_id
+    if inbound_id is None:
+        inbounds = server_config.get('inbounds', {})
+        main_inbound = inbounds.get('main', {})
+        inbound_id = main_inbound.get('id', 1)
+
+    session = await _get_panel_opener(server_name)
+    if not session.get('logged_in'):
+        if not await _panel_login(server_config):
+            logger.warning(f"Не удалось авторизоваться в панели {server_name}")
+            return None
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        # Получаем список всех inbound'ов
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        list_req = urllib.request.Request(list_url)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, opener.open, list_req)
+        data = json.loads(response.read().decode())
+
+        if not data.get('success'):
+            logger.warning(f"Ошибка получения inbounds с {server_name}")
+            return None
+
+        # Ищем нужный inbound
+        for inbound in data.get('obj', []):
+            if inbound.get('id') == inbound_id:
+                stream_str = inbound.get('streamSettings', '{}')
+                settings_str = inbound.get('settings', '{}')
+
+                try:
+                    stream = json.loads(stream_str)
+                    settings = json.loads(settings_str)
+
+                    # Извлекаем реальные параметры
+                    security = stream.get('security', 'reality')
+                    network = stream.get('network', 'tcp')
+
+                    result = {
+                        'security': security,
+                        'network': network,
+                        'fp': 'chrome'  # default
+                    }
+
+                    # Получаем flow из первого клиента (все клиенты в inbound обычно используют одинаковый flow)
+                    clients = settings.get('clients', [])
+                    if clients and clients[0].get('flow'):
+                        result['flow'] = clients[0].get('flow')
+
+                    # Reality настройки
+                    if security == 'reality':
+                        reality = stream.get('realitySettings', {})
+                        reality_settings = reality.get('settings', {})
+
+                        sni_list = reality.get('serverNames', [])
+                        short_ids = reality.get('shortIds', [])
+
+                        result['sni'] = sni_list[0] if sni_list else ''
+                        result['pbk'] = reality_settings.get('publicKey', '')
+                        result['sid'] = short_ids[0] if short_ids else ''
+                        result['fp'] = reality.get('settings', {}).get('fingerprint') or reality.get('fingerprint') or 'chrome'
+
+                    # gRPC настройки
+                    if network == 'grpc':
+                        grpc_settings = stream.get('grpcSettings', {})
+                        result['serviceName'] = grpc_settings.get('serviceName', '')
+                        result['authority'] = grpc_settings.get('authority', '')
+
+                    # Сохраняем name_prefix из статического конфига (его нет на панели)
+                    inbounds_config = server_config.get('inbounds', {})
+                    for name, cfg in inbounds_config.items():
+                        if cfg.get('id') == inbound_id:
+                            result['name_prefix'] = cfg.get('name_prefix', server_name)
+                            break
+                    else:
+                        result['name_prefix'] = server_name
+
+                    logger.info(f"Получены актуальные настройки inbound {inbound_id} с {server_name}: sni={result.get('sni')}, flow={result.get('flow', '')}")
+                    return result
+
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.error(f"Ошибка парсинга streamSettings inbound {inbound_id}: {e}")
+                    return None
+
+        logger.warning(f"Inbound {inbound_id} не найден на {server_name}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Ошибка получения настроек inbound с {server_name}: {e}")
+        session['logged_in'] = False
+        return None
+
+
 async def create_client_via_panel(
     server_config: dict,
     client_uuid: str,
@@ -138,7 +255,8 @@ async def create_client_via_panel(
     expire_days: int,
     ip_limit: int = 2,
     max_retries: int = 2,
-    inbound_id: int = None
+    inbound_id: int = None,
+    expire_time_ms: int = None
 ) -> dict:
     """
     Создать клиента через API панели X-UI с retry при ошибках
@@ -154,13 +272,33 @@ async def create_client_via_panel(
         logger.warning(f"Нет конфигурации панели для {server_name}")
         return {'success': False}
 
-    expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
+    if expire_time_ms is not None:
+        expire_time = expire_time_ms
+    else:
+        expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
-    # Получаем inbound ID - используем переданный или из конфигурации
+    # Получаем inbound ID из конфигурации
+    inbounds = server_config.get('inbounds', {})
+    main_inbound = inbounds.get('main', {})
     if inbound_id is None:
-        inbounds = server_config.get('inbounds', {})
-        main_inbound = inbounds.get('main', {})
         inbound_id = main_inbound.get('id', 1)
+
+    # Получаем flow из существующих клиентов на сервере (приоритет)
+    # или из конфигурации (fallback)
+    flow = ''
+    try:
+        inbound_settings = await get_inbound_settings_from_panel(server_config, inbound_id)
+        if inbound_settings and inbound_settings.get('flow'):
+            flow = inbound_settings.get('flow')
+            logger.debug(f"Flow '{flow}' получен из существующих клиентов на {server_name}")
+        else:
+            # Fallback на статический конфиг
+            flow = main_inbound.get('flow', '')
+            if flow:
+                logger.debug(f"Flow '{flow}' получен из статического конфига для {server_name}")
+    except Exception as e:
+        logger.warning(f"Не удалось получить flow с сервера {server_name}, используем конфиг: {e}")
+        flow = main_inbound.get('flow', '')
 
     client_settings = {
         "clients": [{
@@ -173,7 +311,7 @@ async def create_client_via_panel(
             "enable": True,
             "tgId": "",
             "subId": "",
-            "flow": ""
+            "flow": flow
         }]
     }
 
@@ -385,12 +523,13 @@ async def create_client_on_remote_server(
     expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
     # Получаем inbound_id из конфигурации если не указан
+    inbounds = server_config.get('inbounds', {})
+    main_inbound = inbounds.get('main', {})
     if inbound_id is None:
-        inbounds = server_config.get('inbounds', {})
-        main_inbound = inbounds.get('main', {})
         inbound_id = main_inbound.get('id', 1)  # По умолчанию id=1
 
-    # Python скрипт для добавления клиента в конкретный inbound (не во все!)
+    # Python скрипт для добавления клиента в конкретный inbound
+    # Flow берётся из первого существующего клиента на сервере
     sql_script = f"""
 import json
 import sqlite3
@@ -422,6 +561,13 @@ try:
     if existing_by_uuid or existing_by_email:
         print("EXISTS")
     else:
+        # Получаем flow из первого существующего клиента
+        flow = ''
+        for c in clients:
+            if c.get('flow'):
+                flow = c.get('flow')
+                break
+
         new_client = {{
             "id": "{client_uuid}",
             "alterId": 0,
@@ -432,7 +578,7 @@ try:
             "enable": True,
             "tgId": "",
             "subId": "",
-            "flow": ""
+            "flow": flow
         }}
         clients.append(new_client)
         settings['clients'] = clients
@@ -945,21 +1091,32 @@ async def find_client_on_server(server_config: dict, client_uuid: str) -> dict:
                         sni_list = reality.get('serverNames', [])
                         short_ids = reality.get('shortIds', [])
                         pbk = reality_settings.get('publicKey', '')
-                        fp = reality.get('fingerprint', 'chrome')
+                        # fingerprint может быть в reality.settings.fingerprint или reality.fingerprint
+                        fp = reality_settings.get('fingerprint') or reality.get('fingerprint') or 'chrome'
 
                         # Параметры для gRPC
                         grpc_settings = stream.get('grpcSettings', {})
                         service_name = grpc_settings.get('serviceName', '')
                         authority = grpc_settings.get('authority', '')
 
+                        # Flow берём из клиента или из первого клиента inbound
+                        client_flow = client.get('flow', '')
+                        if not client_flow:
+                            # Ищем flow у других клиентов в этом inbound
+                            for c in settings.get('clients', []):
+                                if c.get('flow'):
+                                    client_flow = c.get('flow')
+                                    break
+
                         return {
                             'email': client.get('email', ''),
                             'inbound_name': inbound_name,
                             'inbound_remark': inbound.get('remark', ''),
                             'inbound_id': inbound_id,
+                            'inbound_port': inbound.get('port', 443),
                             'expiry_time': client.get('expiryTime', 0),
                             'limit_ip': client.get('limitIp', 2),
-                            'flow': client.get('flow', ''),
+                            'flow': client_flow,
                             'enable': client.get('enable', True),
                             # Реальные параметры inbound с сервера
                             'inbound_settings': {
@@ -969,6 +1126,7 @@ async def find_client_on_server(server_config: dict, client_uuid: str) -> dict:
                                 'pbk': pbk,
                                 'sid': short_ids[0] if short_ids else '',
                                 'fp': fp,
+                                'flow': client_flow,
                                 'serviceName': service_name,
                                 'authority': authority
                             }
@@ -1081,7 +1239,7 @@ async def find_client_on_local_server(client_uuid: str) -> dict:
                                 'sni': server_names[0] if server_names else '',
                                 'pbk': reality.get('settings', {}).get('publicKey', ''),
                                 'sid': short_ids[0] if short_ids else '',
-                                'fp': reality.get('settings', {}).get('fingerprint', 'chrome'),
+                                'fp': reality.get('fingerprint') or 'chrome',
                                 'flow': client.get('flow', '')
                             }
                         except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -1105,6 +1263,134 @@ async def find_client_on_local_server(client_uuid: str) -> dict:
     except Exception as e:
         logger.error(f"Ошибка поиска в локальной базе: {e}")
         return None
+
+
+async def _create_client_local_with_uuid(
+    client_uuid: str,
+    email: str,
+    expire_time_ms: int = 0,
+    ip_limit: int = 2
+) -> bool:
+    """Создать клиента в локальной базе X-UI с заданным UUID"""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, settings FROM inbounds WHERE enable=1 LIMIT 1")
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return False
+
+        inbound_id, settings_str = row
+        settings = json.loads(settings_str)
+        clients = settings.get('clients', [])
+
+        # Проверяем, не существует ли уже
+        for c in clients:
+            if c.get('id') == client_uuid or c.get('email') == email:
+                conn.close()
+                return True  # Уже существует — считаем успехом
+
+        # Получаем flow из существующих клиентов
+        flow = ''
+        for c in clients:
+            if c.get('flow'):
+                flow = c.get('flow')
+                break
+
+        new_client = {
+            "id": client_uuid,
+            "alterId": 0,
+            "email": email,
+            "limitIp": ip_limit,
+            "totalGB": 0,
+            "expiryTime": expire_time_ms,
+            "enable": True,
+            "tgId": "",
+            "subId": "",
+            "flow": flow
+        }
+        clients.append(new_client)
+        settings['clients'] = clients
+
+        cursor.execute(
+            "UPDATE inbounds SET settings=? WHERE id=?",
+            (json.dumps(settings), inbound_id)
+        )
+        conn.commit()
+        conn.close()
+
+        # Перезапускаем x-ui
+        import subprocess
+        try:
+            subprocess.run(['systemctl', 'restart', 'x-ui'], timeout=30, check=False)
+            logger.info(f"Клиент {email} создан локально, x-ui перезапущен")
+        except Exception as e:
+            logger.warning(f"Не удалось перезапустить x-ui: {e}")
+
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка создания клиента локально: {e}")
+        return False
+
+
+async def find_client_presence_on_all_servers(client_uuid: str) -> dict:
+    """
+    Проверить наличие клиента на всех enabled серверах.
+
+    :param client_uuid: UUID клиента
+    :return: {'found_on': [...], 'not_found_on': [...]}
+    """
+    config = load_servers_config()
+    found_on = []
+    not_found_on = []
+
+    for server in config.get('servers', []):
+        if not server.get('enabled', True):
+            continue
+
+        server_name = server.get('name', 'Unknown')
+        # Получаем name_prefix из main inbound
+        main_inbound = server.get('inbounds', {}).get('main', {})
+        name_prefix = main_inbound.get('name_prefix', server_name)
+
+        try:
+            if server.get('local', False):
+                client_info = await find_client_on_local_server(client_uuid)
+            else:
+                client_info = await find_client_on_server(server, client_uuid)
+
+            if client_info:
+                found_on.append({
+                    'server_name': server_name,
+                    'name_prefix': name_prefix,
+                    'server_config': server,
+                    'email': client_info.get('email', ''),
+                    'expiry_time': client_info.get('expiry_time', 0),
+                    'ip_limit': client_info.get('limit_ip', 2),
+                    'inbound_id': client_info.get('inbound_id', 1)
+                })
+            else:
+                not_found_on.append({
+                    'server_name': server_name,
+                    'name_prefix': name_prefix,
+                    'server_config': server
+                })
+        except Exception as e:
+            logger.error(f"Ошибка проверки клиента на {server_name}: {e}")
+            not_found_on.append({
+                'server_name': server_name,
+                'name_prefix': name_prefix,
+                'server_config': server
+            })
+
+    return {
+        'found_on': found_on,
+        'not_found_on': not_found_on
+    }
 
 
 async def extend_client_expiry_via_panel(
@@ -1250,6 +1536,46 @@ async def extend_client_on_all_servers(client_uuid: str, extend_days: int) -> di
         'results': results,
         'new_expiry': new_expiry
     }
+
+
+async def extend_client_on_server(server_name: str, client_uuid: str, extend_days: int) -> dict:
+    """
+    Продлить срок действия клиента на конкретном сервере
+
+    :param server_name: Имя сервера (или начало имени)
+    :param client_uuid: UUID клиента
+    :param extend_days: Количество дней для продления
+    :return: {'success': bool, 'new_expiry': timestamp, 'error': str}
+    """
+    config = load_servers_config()
+
+    # Ищем сервер по имени (поддержка частичного совпадения)
+    target_server = None
+    for server in config.get('servers', []):
+        name = server.get('name', '')
+        if name.lower().startswith(server_name.lower()) or server_name.lower() in name.lower():
+            target_server = server
+            break
+
+    if not target_server:
+        return {'success': False, 'error': f'Сервер "{server_name}" не найден'}
+
+    if not target_server.get('enabled', True):
+        return {'success': False, 'error': f'Сервер "{server_name}" отключён'}
+
+    actual_name = target_server.get('name', server_name)
+
+    if target_server.get('local', False):
+        # Локальный сервер
+        result = await _extend_client_local(client_uuid, extend_days)
+    else:
+        # Удалённый сервер через API
+        result = await extend_client_expiry_via_panel(target_server, client_uuid, extend_days)
+
+    if result.get('success'):
+        logger.info(f"Клиент {client_uuid[:8]}... продлён на {extend_days} дней на сервере {actual_name}")
+
+    return result
 
 
 async def _extend_client_local(client_uuid: str, extend_days: int) -> dict:

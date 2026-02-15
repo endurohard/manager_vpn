@@ -817,11 +817,10 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
 
     query = '&'.join(params)
 
-    # Имя для ключа
+    # Имя для ключа — только name_prefix без email (email уже в названии подписки)
     name_prefix = inbound.get('name_prefix', server_name)
-    link_name = f"{name_prefix} {email}" if email else name_prefix
 
-    return f"vless://{uuid}@{domain}:{port}?{query}#{link_name}"
+    return f"vless://{uuid}@{domain}:{port}?{query}#{name_prefix}"
 
 
 async def generate_vless_link_for_server_async(uuid, email, server_config, inbound_name='main'):
@@ -1416,6 +1415,16 @@ async def subscription_handler(request):
     client_email = 'client'
     if client_keys:
         client_email = client_keys[0]['client'].get('email', 'client')
+
+    # Если клиента нет локально — получаем email с удалённых серверов
+    if client_email == 'client':
+        for server in servers_config.get('servers', []):
+            if server.get('local') or not server.get('enabled', True):
+                continue
+            panel_info = await get_client_info_from_panel(client_id, server)
+            if panel_info and panel_info.get('email'):
+                client_email = panel_info['email']
+                break
 
     # Получаем данные клиента из базы данных (срок, трафик)
     upload_bytes = 0

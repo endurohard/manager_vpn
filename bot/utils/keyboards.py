@@ -45,7 +45,8 @@ class Keyboards:
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
-            [KeyboardButton(text="🖥 Статус серверов")],
+            [KeyboardButton(text="📡 Добавить сервер")],
+            [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(
@@ -270,8 +271,13 @@ class Keyboards:
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
-    def server_selection(servers: list):
-        """Клавиатура для выбора сервера (только для админа)"""
+    def server_selection(servers: list, prefix: str = "server_"):
+        """Клавиатура для выбора сервера (только для админа)
+
+        Args:
+            servers: Список серверов
+            prefix: Префикс для callback_data (по умолчанию "server_")
+        """
         buttons = []
         for i, server in enumerate(servers):
             name = server.get('name', f'Server {i}')
@@ -292,7 +298,7 @@ class Keyboards:
             buttons.append([
                 InlineKeyboardButton(
                     text=button_text,
-                    callback_data=f"server_{i}"
+                    callback_data=f"{prefix}{i}"
                 )
             ])
 
