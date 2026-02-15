@@ -256,7 +256,8 @@ async def create_client_via_panel(
     ip_limit: int = 2,
     max_retries: int = 2,
     inbound_id: int = None,
-    expire_time_ms: int = None
+    expire_time_ms: int = None,
+    total_gb: int = 0
 ) -> dict:
     """
     Создать клиента через API панели X-UI с retry при ошибках
@@ -300,13 +301,15 @@ async def create_client_via_panel(
         logger.warning(f"Не удалось получить flow с сервера {server_name}, используем конфиг: {e}")
         flow = main_inbound.get('flow', '')
 
+    total_gb_bytes = total_gb * 1024 * 1024 * 1024 if total_gb > 0 else 0
+
     client_settings = {
         "clients": [{
             "id": client_uuid,
             "alterId": 0,
             "email": email,
             "limitIp": ip_limit,
-            "totalGB": 0,
+            "totalGB": total_gb_bytes,
             "expiryTime": expire_time,
             "enable": True,
             "tgId": "",
@@ -469,7 +472,8 @@ async def create_client_on_remote_server(
     email: str,
     expire_days: int,
     ip_limit: int = 2,
-    inbound_id: int = None
+    inbound_id: int = None,
+    total_gb: int = 0
 ) -> dict:
     """
     Создать клиента на удалённом сервере через SSH или API панели
@@ -496,7 +500,8 @@ async def create_client_on_remote_server(
             email=email,
             expire_days=expire_days,
             ip_limit=ip_limit,
-            inbound_id=inbound_id
+            inbound_id=inbound_id,
+            total_gb=total_gb
         )
         # Возвращаем UUID - либо переданный, либо существующий на сервере
         return {
@@ -530,6 +535,7 @@ async def create_client_on_remote_server(
 
     # Python скрипт для добавления клиента в конкретный inbound
     # Flow берётся из первого существующего клиента на сервере
+    total_gb_bytes = total_gb * 1024 * 1024 * 1024 if total_gb > 0 else 0
     sql_script = f"""
 import json
 import sqlite3
@@ -573,7 +579,7 @@ try:
             "alterId": 0,
             "email": "{email}",
             "limitIp": {ip_limit},
-            "totalGB": 0,
+            "totalGB": {total_gb_bytes},
             "expiryTime": {expire_time},
             "enable": True,
             "tgId": "",
@@ -731,12 +737,14 @@ async def create_client_on_active_servers(
     has_failure = False
     for server in active_servers:
         server_name = server.get('name', 'Unknown')
+        server_total_gb = server.get('traffic_limit_gb', 0)
         result = await create_client_on_remote_server(
             server_config=server,
             client_uuid=client_uuid,
             email=email,
             expire_days=expire_days,
-            ip_limit=ip_limit
+            ip_limit=ip_limit,
+            total_gb=server_total_gb
         )
         success = result.get('success', False)
         results[server_name] = success
@@ -1269,7 +1277,8 @@ async def _create_client_local_with_uuid(
     client_uuid: str,
     email: str,
     expire_time_ms: int = 0,
-    ip_limit: int = 2
+    ip_limit: int = 2,
+    total_gb: int = 0
 ) -> bool:
     """Создать клиента в локальной базе X-UI с заданным UUID"""
     import sqlite3
@@ -1301,12 +1310,13 @@ async def _create_client_local_with_uuid(
                 flow = c.get('flow')
                 break
 
+        total_gb_bytes = total_gb * 1024 * 1024 * 1024 if total_gb > 0 else 0
         new_client = {
             "id": client_uuid,
             "alterId": 0,
             "email": email,
             "limitIp": ip_limit,
-            "totalGB": 0,
+            "totalGB": total_gb_bytes,
             "expiryTime": expire_time_ms,
             "enable": True,
             "tgId": "",

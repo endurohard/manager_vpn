@@ -48,6 +48,7 @@ class ReplaceKeyStates(StatesGroup):
 class FixKeyStates(StatesGroup):
     """Состояния для исправления ключа"""
     waiting_for_key = State()
+    waiting_for_server_selection = State()  # Для админа - выбор сервера
 
 
 @router.message(F.text == "Создать ключ")
@@ -532,16 +533,18 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         # Если выбран конкретный сервер - создаём только на нём
         if selected_server and not selected_server.get('local', False):
             import uuid as uuid_module
-            from bot.api.remote_xui import create_client_on_remote_server
+            from bot.api.remote_xui import create_client_on_remote_server, load_servers_config
 
             client_uuid = str(uuid_module.uuid4())
+            server_total_gb = selected_server.get('traffic_limit_gb', 0)
             success = await create_client_on_remote_server(
                 server_config=selected_server,
                 client_uuid=client_uuid,
                 email=phone,
                 expire_days=period_days,
                 ip_limit=2,
-                inbound_id=inbound_id
+                inbound_id=inbound_id,
+                total_gb=server_total_gb
             )
 
             if success:
@@ -549,6 +552,27 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     'client_id': client_uuid,
                     'local_created': False
                 }
+
+                # Авто-добавление на серверы с лимитом трафика (LTE Билайн)
+                selected_name = selected_server.get('name', '')
+                all_servers = load_servers_config().get('servers', [])
+                for srv in all_servers:
+                    if (srv.get('traffic_limit_gb', 0) > 0
+                            and srv.get('enabled', True)
+                            and not srv.get('local', False)
+                            and srv.get('name') != selected_name):
+                        try:
+                            await create_client_on_remote_server(
+                                server_config=srv,
+                                client_uuid=client_uuid,
+                                email=phone,
+                                expire_days=period_days,
+                                ip_limit=2,
+                                total_gb=srv.get('traffic_limit_gb', 0)
+                            )
+                            logger.info(f"Авто-добавлен на {srv.get('name')} с лимитом {srv.get('traffic_limit_gb')} ГБ")
+                        except Exception as e:
+                            logger.error(f"Ошибка авто-добавления на {srv.get('name')}: {e}")
             else:
                 client_data = None
         else:
@@ -684,13 +708,13 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         # Если локально не создан или не получилось - генерируем из конфига сервера
         if not vless_link_for_user:
             import urllib.parse
+            from bot.api.remote_xui import load_servers_config, get_inbound_settings_from_panel
 
             # Если есть выбранный сервер - используем его, иначе ищем первый активный
             target_server = selected_server
             target_inbound = selected_inbound
 
             if not target_server:
-                from bot.api.remote_xui import load_servers_config
                 servers_config = load_servers_config()
                 for server in servers_config.get('servers', []):
                     if not server.get('enabled', True):
@@ -702,6 +726,15 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     break
 
             if target_server and target_inbound:
+                # Получаем актуальные настройки inbound с панели сервера
+                inbound_id = target_inbound.get('id', 1)
+                panel_settings = await get_inbound_settings_from_panel(target_server, inbound_id)
+
+                # Если получили настройки с панели - используем их, иначе статический конфиг
+                if panel_settings:
+                    target_inbound = {**target_inbound, **panel_settings}
+                    logger.info(f"Используем актуальные настройки с панели: sni={panel_settings.get('sni')}")
+
                 domain = target_server.get('domain', target_server.get('ip', ''))
                 port = target_server.get('port', 443)
                 network = target_inbound.get('network', 'tcp')
@@ -1352,13 +1385,9 @@ async def cancel_fix_key(message: Message, state: FSMContext):
 
 @router.message(FixKeyStates.waiting_for_key)
 async def process_fix_key(message: Message, state: FSMContext):
-    """Обработка VLESS ключа для исправления - ищет клиента на сервере по UUID"""
+    """Обработка VLESS ключа для исправления"""
     import urllib.parse
-    from datetime import datetime, timedelta
-    from bot.api.remote_xui import (
-        load_servers_config, find_client_on_server,
-        find_client_on_local_server, create_client_via_panel
-    )
+    from bot.api.remote_xui import load_servers_config
 
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
@@ -1391,238 +1420,487 @@ async def process_fix_key(message: Message, state: FSMContext):
 
         uuid_part, host_port = address_part.rsplit('@', 1)
 
+        # Сохраняем данные в state
+        await state.update_data(
+            uuid_part=uuid_part,
+            original_fragment=original_fragment,
+            vless_link=vless_link
+        )
+
         # Загружаем конфиг серверов
         servers_config = load_servers_config()
 
-        # Находим Germany сервер (active_for_new)
-        target_server = None
-        for srv in servers_config.get('servers', []):
-            if srv.get('active_for_new') and srv.get('enabled', True) and not srv.get('local', False):
-                target_server = srv
-                break
+        # Получаем список серверов с панелью
+        servers = [s for s in servers_config.get('servers', [])
+                  if s.get('enabled', True) and not s.get('local', False) and s.get('panel', {})]
 
-        if not target_server:
-            await message.answer("❌ Активный сервер (Germany) не найден в конфиге")
+        if not servers:
+            await message.answer("❌ Нет доступных серверов с панелью")
             await state.clear()
             return
 
-        await message.answer(f"🔍 Ищу клиента на {target_server.get('name')}...")
+        if is_admin:
+            # Для админа - показываем выбор сервера для ПЕРЕСОЗДАНИЯ
+            await state.update_data(fix_servers=servers)
+            await state.set_state(FixKeyStates.waiting_for_server_selection)
 
-        # Сначала ищем на Germany
-        client_info = await find_client_on_server(target_server, uuid_part)
-        found_on_server_name = None
-        created_on_server = False
-
-        if client_info:
-            found_on_server_name = target_server.get('name')
-            logger.info(f"Клиент найден на сервере {found_on_server_name}")
+            await message.answer(
+                f"🔧 <b>Исправление ключа (Админ)</b>\n\n"
+                f"🔑 UUID: <code>{uuid_part[:8]}...</code>\n\n"
+                f"Выберите сервер для пересоздания клиента:",
+                reply_markup=Keyboards.server_selection(servers, prefix="fixserver_"),
+                parse_mode="HTML"
+            )
         else:
-            # Не нашли на Germany - ищем на локальном сервере
-            await message.answer("🔍 Не найден на Germany, ищу на локальном...")
-            local_client = await find_client_on_local_server(uuid_part)
-
-            if local_client:
-                # Нашли на локальном - берём данные и создаём на Germany
-                client_email = local_client.get('email', '')
-                expiry_time = local_client.get('expiry_time', 0)
-                limit_ip = local_client.get('limit_ip', 2)
-
-                # Вычисляем оставшиеся дни
-                if expiry_time > 0:
-                    expiry_date = datetime.fromtimestamp(expiry_time / 1000)
-                    now = datetime.now()
-                    if expiry_date > now:
-                        expire_days = (expiry_date - now).days + 1
-                    else:
-                        expire_days = 30  # Истёк - даём 30 дней
-                else:
-                    expire_days = 365  # Безлимит
-
-                await message.answer(f"📤 Создаю клиента {client_email} на {target_server.get('name')}...")
-
-                # Создаём на Germany через API панели
-                create_result = await create_client_via_panel(
-                    server_config=target_server,
-                    client_uuid=uuid_part,
-                    email=client_email,
-                    expire_days=expire_days,
-                    ip_limit=limit_ip
-                )
-
-                if create_result.get('success'):
-                    created_on_server = True
-                    found_on_server_name = target_server.get('name')
-                    actual_uuid = create_result.get('uuid', uuid_part)
-                    if create_result.get('existing'):
-                        await message.answer(f"✅ Клиент уже есть на {target_server.get('name')}!")
-                    else:
-                        await message.answer(f"✅ Клиент создан на {target_server.get('name')}!")
-
-                    # Ищем клиента заново для получения реальных параметров inbound
-                    client_info = await find_client_on_server(target_server, actual_uuid)
-                    if not client_info:
-                        # Fallback если поиск не удался
-                        client_info = {
-                            'email': client_email,
-                            'inbound_name': 'main',
-                            'inbound_remark': target_server.get('inbounds', {}).get('main', {}).get('name_prefix', 'VPN'),
-                            'expiry_time': expiry_time,
-                            'limit_ip': limit_ip
-                        }
-                else:
-                    error_msg = create_result.get('error', 'Неизвестная ошибка')
-                    await message.answer(f"⚠️ Не удалось создать: {error_msg}")
-
-        if client_info:
-            # Нашли клиента - берём данные
-            client_email = client_info.get('email', '')
-            client_inbound = client_info.get('inbound_name', 'main')
-            inbound_remark = client_info.get('inbound_remark', client_inbound)
-
-            # Используем РЕАЛЬНЫЕ параметры inbound с Germany
-            real_inbound = client_info.get('inbound_settings', {})
-            if real_inbound:
-                inbound_config = real_inbound
-            else:
-                # Fallback на конфиг Germany
-                inbound_config = target_server.get('inbounds', {}).get(client_inbound, {})
-                if not inbound_config:
-                    inbound_config = target_server.get('inbounds', {}).get('main', {})
-
-            # Формируем имя для ключа: PREFIX пробел EMAIL (БЕЗ url-encode, как в get_client_link_from_active_server)
-            link_name = f"{inbound_remark} {client_email}"
-            found_on_server = True
-        else:
-            # Не нашли нигде - используем оригинальный fragment и первый активный сервер
-            link_name = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
-            # Находим первый активный сервер для fallback
-            if not target_server:
-                for srv in servers_config.get('servers', []):
-                    if srv.get('active_for_new') and srv.get('enabled', True) and not srv.get('local', False):
-                        target_server = srv
-                        break
-            if not target_server:
-                await message.answer("❌ Активный сервер не найден в конфиге")
-                await state.clear()
-                return
-            inbound_config = target_server.get('inbounds', {}).get('main', {})
-            client_email = link_name
-            inbound_remark = "Unknown"
-            found_on_server = False
-
-        # Формируем исправленный ключ с настройками найденного сервера
-        # Порядок параметров как в get_client_link_from_active_server: type, encryption, security, pbk, fp, sni, sid, flow, spx
-        target_domain = target_server.get('domain', target_server.get('ip'))
-        target_port = target_server.get('port', 443)
-
-        security = inbound_config.get('security', 'reality')
-        network = inbound_config.get('network', 'tcp')
-        client_flow = client_info.get('flow', '') if client_info else ''
-
-        params = [
-            f"type={network}",
-            "encryption=none"
-        ]
-
-        # Добавляем gRPC параметры если нужно
-        if network == 'grpc':
-            params.append(f"serviceName={inbound_config.get('serviceName', '')}")
-            params.append(f"authority={inbound_config.get('authority', '')}")
-
-        params.append(f"security={security}")
-
-        if security == 'reality':
-            if inbound_config.get('pbk'):
-                params.append(f"pbk={inbound_config['pbk']}")
-            params.append(f"fp={inbound_config.get('fp', 'chrome')}")
-            if inbound_config.get('sni'):
-                params.append(f"sni={inbound_config['sni']}")
-            if inbound_config.get('sid'):
-                params.append(f"sid={inbound_config['sid']}")
-            if client_flow:
-                params.append(f"flow={client_flow}")
-            params.append("spx=%2F")
-
-        new_query = '&'.join(params)
-
-        fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
-
-        # Генерируем QR код
-        qr_code = generate_qr_code(fixed_link)
-
-        # Формируем информацию об изменениях
-        changes = []
-        if target_domain not in vless_link:
-            changes.append(f"• Хост: {target_domain}")
-        if str(target_port) not in vless_link:
-            changes.append(f"• Порт: {target_port}")
-        if inbound_config.get('sni') and inbound_config['sni'] not in vless_link:
-            changes.append(f"• SNI: {inbound_config['sni']}")
-        if inbound_config.get('pbk') and inbound_config['pbk'] not in vless_link:
-            changes.append(f"• Public Key: обновлён")
-        if 'flow=' in vless_link and not client_flow:
-            changes.append("• Flow: убран")
-        elif client_flow and client_flow not in vless_link:
-            changes.append(f"• Flow: {client_flow}")
-        original_name = urllib.parse.unquote(original_fragment) if original_fragment else ""
-        if found_on_server and original_name != link_name:
-            changes.append(f"• Имя: из базы сервера")
-
-        changes_text = "\n".join(changes) if changes else "Параметры актуальны"
-
-        if created_on_server:
-            status_text = f"✅ Создан на {target_server.get('name', 'Unknown')} (из локальной базы)"
-        elif found_on_server:
-            status_text = f"✅ Найден на {target_server.get('name', 'Unknown')}"
-        else:
-            status_text = f"⚠️ Не найден, использованы параметры {target_server.get('name', 'Unknown')}"
-
-        # Форматируем дату окончания
-        expiry_time = client_info.get('expiry_time', 0) if client_info else 0
-        if expiry_time and expiry_time > 0:
-            expiry_date = datetime.fromtimestamp(expiry_time / 1000)
-            expiry_str = expiry_date.strftime('%d.%m.%Y %H:%M')
-            if expiry_date < datetime.now():
-                expiry_str += " ⚠️ (истёк)"
-        else:
-            expiry_str = "Безлимит"
-
-        await message.answer_photo(
-            BufferedInputFile(qr_code.read(), filename="qrcode.png"),
-            caption=(
-                f"✅ <b>Ключ исправлен!</b>\n\n"
-                f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
-                f"📍 Inbound: {inbound_remark}\n"
-                f"👤 Клиент: {client_email}\n"
-                f"📅 Действует до: {expiry_str}\n"
-                f"🔍 Статус: {status_text}\n"
-                f"🌐 Хост: {target_domain}:{target_port}\n"
-                f"🔒 SNI: {inbound_config.get('sni', 'N/A')}\n"
-                f"📡 Flow: {client_flow or 'пусто'}\n\n"
-                f"<b>Изменения:</b>\n{changes_text}"
-            ),
-            parse_mode="HTML"
-        )
-
-        await message.answer(
-            f"📋 <b>Исправленный VLESS ключ:</b>\n\n"
-            f"<code>{fixed_link}</code>\n\n"
-            f"💡 Скопируйте и отправьте клиенту.",
-            parse_mode="HTML"
-        )
+            # Для менеджера - ищем клиента на ВСЕХ серверах, используем параметры того где нашли
+            await _execute_fix_key_search_all(message, state, servers, uuid_part, original_fragment, is_admin)
 
     except Exception as e:
-        logger.error(f"Error fixing key: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error parsing key: {e}")
         await message.answer(f"❌ Ошибка при обработке ключа: {str(e)[:100]}")
-
-    finally:
         await state.clear()
-        await message.answer(
-            "Главное меню:",
-            reply_markup=Keyboards.main_menu(is_admin)
-        )
+        await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+
+
+@router.callback_query(FixKeyStates.waiting_for_server_selection, F.data.startswith("fixserver_"))
+async def process_fix_server_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора сервера админом для исправления ключа"""
+    server_idx = int(callback.data.split("_", 1)[1])
+    data = await state.get_data()
+    servers = data.get('fix_servers', [])
+    uuid_part = data.get('uuid_part', '')
+    original_fragment = data.get('original_fragment', '')
+
+    if server_idx >= len(servers):
+        await callback.answer("Ошибка: сервер не найден", show_alert=True)
+        return
+
+    target_server = servers[server_idx]
+    await callback.message.edit_text(f"🔧 Исправляю ключ на {target_server.get('name')}...")
+
+    # Выполняем исправление
+    await _execute_fix_key(callback.message, state, target_server, uuid_part, original_fragment, is_admin=True)
+    await callback.answer()
+
+
+async def _execute_fix_key_search_all(message: Message, state: FSMContext, servers: list, uuid_part: str, original_fragment: str, is_admin: bool):
+    """Поиск клиента на всех серверах и исправление ключа (для менеджера)"""
+    import urllib.parse
+    from datetime import datetime, timedelta
+    from bot.api.remote_xui import (
+        find_client_on_server, find_client_on_local_server, create_client_via_panel
+    )
+
+    await message.answer("🔍 Ищу клиента на серверах...")
+
+    client_info = None
+    target_server = None
+    found_on_server_name = None
+
+    # Ищем клиента на ВСЕХ удалённых серверах
+    for srv in servers:
+        srv_name = srv.get('name', 'Unknown')
+        client_info = await find_client_on_server(srv, uuid_part)
+
+        if client_info:
+            target_server = srv
+            found_on_server_name = srv_name
+            logger.info(f"Клиент найден на сервере {found_on_server_name}")
+            await message.answer(f"✅ Найден на {found_on_server_name}")
+            break
+
+    if not client_info:
+        # Не нашли на удалённых - ищем на локальном
+        await message.answer("🔍 Не найден на удалённых серверах, ищу на локальном...")
+        local_client = await find_client_on_local_server(uuid_part)
+
+        if local_client:
+            # Нашли на локальном - создаём на первом active_for_new сервере
+            for srv in servers:
+                if srv.get('active_for_new'):
+                    target_server = srv
+                    break
+
+            if not target_server and servers:
+                target_server = servers[0]
+
+            if not target_server:
+                await message.answer("❌ Нет доступного сервера")
+                await state.clear()
+                await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+                return
+
+            client_email = local_client.get('email', '')
+            expiry_time = local_client.get('expiry_time', 0)
+            limit_ip = local_client.get('limit_ip', 2)
+
+            # Вычисляем оставшиеся дни
+            if expiry_time > 0:
+                expiry_date = datetime.fromtimestamp(expiry_time / 1000)
+                now = datetime.now()
+                if expiry_date > now:
+                    expire_days = (expiry_date - now).days + 1
+                else:
+                    expire_days = 30
+            else:
+                expire_days = 365
+
+            await message.answer(f"📤 Создаю клиента на {target_server.get('name')}...")
+
+            create_result = await create_client_via_panel(
+                server_config=target_server,
+                client_uuid=uuid_part,
+                email=client_email,
+                expire_days=expire_days,
+                ip_limit=limit_ip
+            )
+
+            if create_result.get('success'):
+                found_on_server_name = target_server.get('name')
+                actual_uuid = create_result.get('uuid', uuid_part)
+                await message.answer(f"✅ Клиент создан на {target_server.get('name')}!")
+
+                client_info = await find_client_on_server(target_server, actual_uuid)
+                if not client_info:
+                    client_info = {
+                        'email': client_email,
+                        'inbound_name': 'main',
+                        'inbound_remark': target_server.get('inbounds', {}).get('main', {}).get('name_prefix', 'VPN'),
+                        'expiry_time': expiry_time,
+                        'limit_ip': limit_ip
+                    }
+            else:
+                await message.answer(f"⚠️ Не удалось создать: {create_result.get('error', 'Ошибка')}")
+        else:
+            # Не нашли нигде - используем первый active сервер
+            for srv in servers:
+                if srv.get('active_for_new'):
+                    target_server = srv
+                    break
+            if not target_server and servers:
+                target_server = servers[0]
+
+    if not target_server:
+        await message.answer("❌ Сервер не определён")
+        await state.clear()
+        await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+        return
+
+    # Формируем ссылку с параметрами найденного сервера
+    await _generate_fixed_link(message, state, target_server, client_info, uuid_part, original_fragment, is_admin)
+
+
+async def _execute_fix_key(message: Message, state: FSMContext, target_server: dict, uuid_part: str, original_fragment: str, is_admin: bool):
+    """Выполнение исправления ключа на ВЫБРАННОМ сервере (для админа)"""
+    import urllib.parse
+    from datetime import datetime, timedelta
+    from bot.api.remote_xui import (
+        load_servers_config, find_client_on_server,
+        find_client_on_local_server, create_client_via_panel
+    )
+
+    await message.answer(f"🔍 Ищу клиента на {target_server.get('name')}...")
+
+    client_info = None
+    found_on_server_name = None
+    created_on_server = False
+
+    # Сначала ищем на выбранном сервере
+    client_info = await find_client_on_server(target_server, uuid_part)
+
+    if client_info:
+        found_on_server_name = target_server.get('name')
+        logger.info(f"Клиент найден на сервере {found_on_server_name}")
+        await message.answer(f"✅ Найден на {found_on_server_name}")
+    else:
+        # Не нашли на выбранном сервере - ищем на локальном
+        await message.answer(f"🔍 Не найден на {target_server.get('name')}, ищу на локальном...")
+        local_client = await find_client_on_local_server(uuid_part)
+
+        if local_client:
+            # Нашли на локальном - создаём на выбранном сервере
+            client_email = local_client.get('email', '')
+            expiry_time = local_client.get('expiry_time', 0)
+            limit_ip = local_client.get('limit_ip', 2)
+
+            # Вычисляем оставшиеся дни
+            if expiry_time > 0:
+                expiry_date = datetime.fromtimestamp(expiry_time / 1000)
+                now = datetime.now()
+                if expiry_date > now:
+                    expire_days = (expiry_date - now).days + 1
+                else:
+                    expire_days = 30  # Истёк - даём 30 дней
+            else:
+                expire_days = 365  # Безлимит
+
+            await message.answer(f"📤 Создаю клиента {client_email} на {target_server.get('name')}...")
+
+            # Создаём на выбранном сервере через API панели
+            create_result = await create_client_via_panel(
+                server_config=target_server,
+                client_uuid=uuid_part,
+                email=client_email,
+                expire_days=expire_days,
+                ip_limit=limit_ip
+            )
+
+            if create_result.get('success'):
+                created_on_server = True
+                found_on_server_name = target_server.get('name')
+                actual_uuid = create_result.get('uuid', uuid_part)
+                if create_result.get('existing'):
+                    await message.answer(f"✅ Клиент уже есть на {target_server.get('name')}!")
+                else:
+                    await message.answer(f"✅ Клиент создан на {target_server.get('name')}!")
+
+                # Ищем клиента заново для получения реальных параметров inbound
+                client_info = await find_client_on_server(target_server, actual_uuid)
+                if not client_info:
+                    # Fallback если поиск не удался
+                    client_info = {
+                        'email': client_email,
+                        'inbound_name': 'main',
+                        'inbound_remark': target_server.get('inbounds', {}).get('main', {}).get('name_prefix', 'VPN'),
+                        'expiry_time': expiry_time,
+                        'limit_ip': limit_ip
+                    }
+            else:
+                error_msg = create_result.get('error', 'Неизвестная ошибка')
+                await message.answer(f"⚠️ Не удалось создать: {error_msg}")
+
+    if client_info:
+        # Нашли клиента - берём данные
+        client_email = client_info.get('email', '')
+        client_inbound = client_info.get('inbound_name', 'main')
+        inbound_remark = client_info.get('inbound_remark', client_inbound)
+
+        # Используем РЕАЛЬНЫЕ параметры inbound с сервера
+        real_inbound = client_info.get('inbound_settings', {})
+        if real_inbound:
+            inbound_config = real_inbound
+        else:
+            # Fallback на статический конфиг сервера
+            inbound_config = target_server.get('inbounds', {}).get(client_inbound, {})
+            if not inbound_config:
+                inbound_config = target_server.get('inbounds', {}).get('main', {})
+
+        # Формируем имя для ключа
+        link_name = f"{inbound_remark} {client_email}"
+        found_on_server = True
+    else:
+        # Не нашли - используем оригинальный fragment
+        link_name = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
+        inbound_config = target_server.get('inbounds', {}).get('main', {})
+        client_email = link_name
+        inbound_remark = "Unknown"
+        found_on_server = False
+
+    # Формируем исправленный ключ с настройками сервера
+    target_domain = target_server.get('domain', target_server.get('ip'))
+    target_port = target_server.get('port', 443)
+
+    security = inbound_config.get('security', 'reality')
+    network = inbound_config.get('network', 'tcp')
+    client_flow = client_info.get('flow', '') if client_info else ''
+
+    # Также берём flow из конфига inbound если нет у клиента
+    if not client_flow:
+        client_flow = inbound_config.get('flow', '')
+
+    params = [
+        f"type={network}",
+        "encryption=none"
+    ]
+
+    if network == 'grpc':
+        params.append(f"serviceName={inbound_config.get('serviceName', '')}")
+        params.append(f"authority={inbound_config.get('authority', '')}")
+
+    params.append(f"security={security}")
+
+    if security == 'reality':
+        if inbound_config.get('pbk'):
+            params.append(f"pbk={inbound_config['pbk']}")
+        params.append(f"fp={inbound_config.get('fp', 'chrome')}")
+        if inbound_config.get('sni'):
+            params.append(f"sni={inbound_config['sni']}")
+        if inbound_config.get('sid'):
+            params.append(f"sid={inbound_config['sid']}")
+        if client_flow:
+            params.append(f"flow={client_flow}")
+        params.append("spx=%2F")
+
+    new_query = '&'.join(params)
+    fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
+
+    # Генерируем QR код
+    qr_code = generate_qr_code(fixed_link)
+
+    # Формируем информацию об изменениях
+    changes = []
+    changes.append(f"• Хост: {target_domain}")
+    changes.append(f"• SNI: {inbound_config.get('sni', 'N/A')}")
+    if client_flow:
+        changes.append(f"• Flow: {client_flow}")
+
+    changes_text = "\n".join(changes)
+
+    if created_on_server:
+        status_text = f"✅ Создан на {target_server.get('name', 'Unknown')} (из локальной базы)"
+    elif found_on_server:
+        status_text = f"✅ Найден на {target_server.get('name', 'Unknown')}"
+    else:
+        status_text = f"⚠️ Не найден, использованы параметры {target_server.get('name', 'Unknown')}"
+
+    # Форматируем дату окончания
+    expiry_time = client_info.get('expiry_time', 0) if client_info else 0
+    if expiry_time and expiry_time > 0:
+        expiry_date = datetime.fromtimestamp(expiry_time / 1000)
+        expiry_str = expiry_date.strftime('%d.%m.%Y %H:%M')
+        if expiry_date < datetime.now():
+            expiry_str += " ⚠️ (истёк)"
+    else:
+        expiry_str = "Безлимит"
+
+    await message.answer_photo(
+        BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+        caption=(
+            f"✅ <b>Ключ исправлен!</b>\n\n"
+            f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
+            f"📍 Inbound: {inbound_remark}\n"
+            f"👤 Клиент: {client_email}\n"
+            f"📅 Действует до: {expiry_str}\n"
+            f"🔍 Статус: {status_text}\n"
+            f"🌐 Хост: {target_domain}:{target_port}\n"
+            f"🔒 SNI: {inbound_config.get('sni', 'N/A')}\n"
+            f"📡 Flow: {client_flow or 'пусто'}\n\n"
+            f"<b>Изменения:</b>\n{changes_text}"
+        ),
+        parse_mode="HTML"
+    )
+
+    await message.answer(
+        f"📋 <b>Исправленный VLESS ключ:</b>\n\n"
+        f"<code>{fixed_link}</code>\n\n"
+        f"💡 Скопируйте и отправьте клиенту.",
+        parse_mode="HTML"
+    )
+
+    await state.clear()
+    await message.answer(
+        "Главное меню:",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+
+
+async def _generate_fixed_link(message: Message, state: FSMContext, target_server: dict, client_info: dict, uuid_part: str, original_fragment: str, is_admin: bool):
+    """Генерация исправленной VLESS ссылки"""
+    import urllib.parse
+    from datetime import datetime
+
+    if client_info:
+        # Нашли клиента - берём данные
+        client_email = client_info.get('email', '')
+        client_inbound = client_info.get('inbound_name', 'main')
+        inbound_remark = client_info.get('inbound_remark', client_inbound)
+
+        # Используем РЕАЛЬНЫЕ параметры inbound с сервера
+        real_inbound = client_info.get('inbound_settings', {})
+        if real_inbound:
+            inbound_config = real_inbound
+        else:
+            inbound_config = target_server.get('inbounds', {}).get(client_inbound, {})
+            if not inbound_config:
+                inbound_config = target_server.get('inbounds', {}).get('main', {})
+
+        link_name = f"{inbound_remark} {client_email}"
+        found_on_server = True
+    else:
+        link_name = urllib.parse.unquote(original_fragment) if original_fragment else "Unknown"
+        inbound_config = target_server.get('inbounds', {}).get('main', {})
+        client_email = link_name
+        inbound_remark = "Unknown"
+        found_on_server = False
+
+    # Формируем исправленный ключ
+    target_domain = target_server.get('domain', target_server.get('ip'))
+    target_port = target_server.get('port', 443)
+
+    security = inbound_config.get('security', 'reality')
+    network = inbound_config.get('network', 'tcp')
+    client_flow = client_info.get('flow', '') if client_info else ''
+
+    if not client_flow:
+        client_flow = inbound_config.get('flow', '')
+
+    params = [f"type={network}", "encryption=none"]
+
+    if network == 'grpc':
+        params.append(f"serviceName={inbound_config.get('serviceName', '')}")
+        params.append(f"authority={inbound_config.get('authority', '')}")
+
+    params.append(f"security={security}")
+
+    if security == 'reality':
+        if inbound_config.get('pbk'):
+            params.append(f"pbk={inbound_config['pbk']}")
+        params.append(f"fp={inbound_config.get('fp') or 'chrome'}")
+        if inbound_config.get('sni'):
+            params.append(f"sni={inbound_config['sni']}")
+        if inbound_config.get('sid'):
+            params.append(f"sid={inbound_config['sid']}")
+        if client_flow:
+            params.append(f"flow={client_flow}")
+        params.append("spx=%2F")
+
+    new_query = '&'.join(params)
+    fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
+
+    # Генерируем QR код
+    qr_code = generate_qr_code(fixed_link)
+
+    # Статус
+    if found_on_server:
+        status_text = f"✅ Найден на {target_server.get('name', 'Unknown')}"
+    else:
+        status_text = f"⚠️ Не найден, использованы параметры {target_server.get('name', 'Unknown')}"
+
+    # Дата окончания
+    expiry_time = client_info.get('expiry_time', 0) if client_info else 0
+    if expiry_time and expiry_time > 0:
+        expiry_date = datetime.fromtimestamp(expiry_time / 1000)
+        expiry_str = expiry_date.strftime('%d.%m.%Y %H:%M')
+        if expiry_date < datetime.now():
+            expiry_str += " ⚠️ (истёк)"
+    else:
+        expiry_str = "Безлимит"
+
+    await message.answer_photo(
+        BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+        caption=(
+            f"✅ <b>Ключ исправлен!</b>\n\n"
+            f"🖥 Сервер: {target_server.get('name', 'Unknown')}\n"
+            f"📍 Inbound: {inbound_remark}\n"
+            f"👤 Клиент: {client_email}\n"
+            f"📅 Действует до: {expiry_str}\n"
+            f"🔍 Статус: {status_text}\n"
+            f"🌐 Хост: {target_domain}:{target_port}\n"
+            f"🔒 SNI: {inbound_config.get('sni', 'N/A')}\n"
+            f"📡 Flow: {client_flow or 'пусто'}"
+        ),
+        parse_mode="HTML"
+    )
+
+    await message.answer(
+        f"📋 <b>Исправленный VLESS ключ:</b>\n\n"
+        f"<code>{fixed_link}</code>\n\n"
+        f"💡 Скопируйте и отправьте клиенту.",
+        parse_mode="HTML"
+    )
+
+    await state.clear()
+    await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
 
 
 @router.message(F.text == "Моя статистика")

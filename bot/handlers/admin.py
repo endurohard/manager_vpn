@@ -87,6 +87,7 @@ class AdminCreateKeyStates(StatesGroup):
     waiting_for_server = State()  # Выбор сервера
     waiting_for_inbound = State()
     waiting_for_period = State()
+    waiting_for_traffic = State()  # Выбор трафика (если сервер имеет лимит)
     confirming = State()
 
 
@@ -94,6 +95,7 @@ class AddToSubscriptionStates(StatesGroup):
     """Состояния для добавления сервера в подписку"""
     waiting_for_search = State()
     waiting_for_server_select = State()
+    waiting_for_traffic_choice = State()  # Выбор трафика для серверов с лимитом
     confirming = State()
 
 
@@ -335,14 +337,62 @@ async def admin_process_period(callback: CallbackQuery, state: FSMContext):
     )
 
     data = await state.get_data()
+    selected_server = data.get('selected_server', {})
+    traffic_limit = selected_server.get('traffic_limit_gb', 0)
+
+    if traffic_limit > 0:
+        # Сервер имеет лимит трафика — показываем выбор
+        await state.set_state(AdminCreateKeyStates.waiting_for_traffic)
+        await callback.message.edit_text(
+            f"📋 <b>Выбор трафика:</b>\n\n"
+            f"🆔 ID: <code>{data['phone']}</code>\n"
+            f"🖥 Сервер: <b>{selected_server.get('name', 'Unknown')}</b>\n"
+            f"⏰ Период: {period_data['name']}\n\n"
+            f"Сервер имеет ограничение трафика <b>{traffic_limit} ГБ</b>.\n"
+            f"Выберите лимит трафика:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"📊 {traffic_limit} ГБ (рекомендуется)", callback_data=f"admkey_traffic_{traffic_limit}")],
+                [InlineKeyboardButton(text="♾ Без ограничений", callback_data="admkey_traffic_0")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_key")]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        # Без лимита — сразу к подтверждению
+        await state.set_state(AdminCreateKeyStates.confirming)
+        await callback.message.edit_text(
+            f"📋 <b>Подтверждение создания ключа:</b>\n\n"
+            f"🆔 ID: <code>{data['phone']}</code>\n"
+            f"🔌 Inbound: <b>{data['inbound_id']}</b>\n"
+            f"⏰ Период: {period_data['name']}\n"
+            f"💰 Цена: {period_data['price']} ₽\n\n"
+            f"Создать ключ?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Создать", callback_data="admin_confirm_key")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_key")]
+            ]),
+            parse_mode="HTML"
+        )
+    await callback.answer()
+
+
+@router.callback_query(AdminCreateKeyStates.waiting_for_traffic, F.data.startswith("admkey_traffic_"))
+async def admin_process_traffic_choice(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора трафика для ключа"""
+    total_gb = int(callback.data.split("_")[-1])
+    await state.update_data(admin_total_gb=total_gb)
+
+    data = await state.get_data()
+    traffic_text = f"{total_gb} ГБ" if total_gb > 0 else "безлимит"
 
     await state.set_state(AdminCreateKeyStates.confirming)
     await callback.message.edit_text(
         f"📋 <b>Подтверждение создания ключа:</b>\n\n"
         f"🆔 ID: <code>{data['phone']}</code>\n"
         f"🔌 Inbound: <b>{data['inbound_id']}</b>\n"
-        f"⏰ Период: {period_data['name']}\n"
-        f"💰 Цена: {period_data['price']} ₽\n\n"
+        f"⏰ Период: {data['period_name']}\n"
+        f"💰 Цена: {data['period_price']} ₽\n"
+        f"📊 Трафик: {traffic_text}\n\n"
         f"Создать ключ?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Создать", callback_data="admin_confirm_key")],
@@ -383,10 +433,11 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
     period_price = data.get("period_price", 0)
     selected_server = data.get("selected_server")
     selected_inbound = data.get("selected_inbound")
+    admin_total_gb = data.get("admin_total_gb", 0)
 
     # Логируем для отладки
     logger.info(f"Admin create key: server={selected_server.get('name') if selected_server else 'None'}, "
-                f"inbound_id={inbound_id}, inbound_key={inbound_key}")
+                f"inbound_id={inbound_id}, inbound_key={inbound_key}, total_gb={admin_total_gb}")
 
     await callback.message.edit_text("⏳ Создание ключа...")
 
@@ -428,8 +479,31 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
                     email=phone,
                     expire_days=period_days,
                     ip_limit=2,
-                    inbound_id=inbound_id
+                    inbound_id=inbound_id,
+                    total_gb=admin_total_gb
                 )
+
+                # Авто-добавление на серверы с лимитом трафика (LTE Билайн)
+                if success:
+                    selected_name = selected_server.get('name', '')
+                    all_servers = load_servers_config().get('servers', [])
+                    for srv in all_servers:
+                        if (srv.get('traffic_limit_gb', 0) > 0
+                                and srv.get('enabled', True)
+                                and not srv.get('local', False)
+                                and srv.get('name') != selected_name):
+                            try:
+                                await create_client_on_remote_server(
+                                    server_config=srv,
+                                    client_uuid=client_uuid,
+                                    email=phone,
+                                    expire_days=period_days,
+                                    ip_limit=2,
+                                    total_gb=srv.get('traffic_limit_gb', 0)
+                                )
+                                logger.info(f"Авто-добавлен на {srv.get('name')} с лимитом {srv.get('traffic_limit_gb')} ГБ")
+                            except Exception as e:
+                                logger.error(f"Ошибка авто-добавления на {srv.get('name')}: {e}")
         else:
             # Старый режим - на локальном сервере
             client_data = await xui_client.add_client(
@@ -5265,12 +5339,67 @@ async def confirm_add_to_sub(callback: CallbackQuery, state: FSMContext):
     ip_limit = data.get('ip_limit', 2)
     selected = data.get('selected_server_indices', [])
     available = data.get('available_servers', [])
+    admin_total_gb = data.get('admin_total_gb')
 
     selected_servers = [available[i] for i in selected if i < len(available)]
 
     if not selected_servers:
         await callback.answer("Нет выбранных серверов")
         return
+
+    # Проверяем, есть ли среди выбранных серверов серверы с лимитом трафика
+    if admin_total_gb is None:
+        traffic_servers = [
+            srv for srv in selected_servers
+            if srv['server_config'].get('traffic_limit_gb', 0) > 0
+        ]
+        if traffic_servers:
+            # Берём значение лимита из первого сервера с лимитом
+            traffic_limit = traffic_servers[0]['server_config']['traffic_limit_gb']
+            server_names = ", ".join(s['server_name'] for s in traffic_servers)
+
+            await state.set_state(AddToSubscriptionStates.waiting_for_traffic_choice)
+            await callback.message.edit_text(
+                f"📊 <b>Выбор трафика</b>\n\n"
+                f"Серверы с ограничением трафика:\n"
+                f"  {server_names}\n\n"
+                f"Выберите лимит трафика для этих серверов:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=f"📊 {traffic_limit} ГБ (рекомендуется)", callback_data=f"addsub_traffic_{traffic_limit}")],
+                    [InlineKeyboardButton(text="♾ Без ограничений", callback_data="addsub_traffic_0")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="addsub_cancel")]
+                ]),
+                parse_mode="HTML"
+            )
+            await callback.answer()
+            return
+
+    await _execute_add_to_sub(callback, state, data, selected_servers)
+
+
+@router.callback_query(AddToSubscriptionStates.waiting_for_traffic_choice, F.data.startswith("addsub_traffic_"))
+async def addsub_traffic_choice(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора трафика при добавлении сервера в подписку"""
+    total_gb = int(callback.data.split("_")[-1])
+    await state.update_data(admin_total_gb=total_gb)
+
+    data = await state.get_data()
+    selected = data.get('selected_server_indices', [])
+    available = data.get('available_servers', [])
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    await _execute_add_to_sub(callback, state, data, selected_servers)
+
+
+async def _execute_add_to_sub(callback: CallbackQuery, state: FSMContext, data: dict, selected_servers: list):
+    """Выполнить добавление клиента на выбранные серверы"""
+    from bot.api.remote_xui import create_client_via_panel, _create_client_local_with_uuid
+
+    client_uuid = data.get('client_uuid', '')
+    email = data.get('client_email', '')
+    expiry_time_ms = data.get('expiry_time_ms', 0)
+    ip_limit = data.get('ip_limit', 2)
+    admin_total_gb = data.get('admin_total_gb', 0) or 0
 
     await callback.message.edit_text("⏳ Добавление клиента на серверы...")
 
@@ -5279,16 +5408,19 @@ async def confirm_add_to_sub(callback: CallbackQuery, state: FSMContext):
         server_config = srv['server_config']
         server_name = srv['server_name']
 
+        # Определяем лимит трафика для сервера
+        server_traffic_limit = server_config.get('traffic_limit_gb', 0)
+        total_gb = admin_total_gb if server_traffic_limit > 0 else 0
+
         try:
             if server_config.get('local', False):
-                # Локальный сервер — через xui_client напрямую нельзя с заданным UUID,
-                # используем create_client_via_panel-подобную логику через SQLite
-                from bot.api.remote_xui import _create_client_local_with_uuid
+                # Локальный сервер
                 success = await _create_client_local_with_uuid(
                     client_uuid=client_uuid,
                     email=email,
                     expire_time_ms=expiry_time_ms,
-                    ip_limit=ip_limit
+                    ip_limit=ip_limit,
+                    total_gb=total_gb
                 )
                 results.append({'server': server_name, 'success': success})
             else:
@@ -5299,7 +5431,8 @@ async def confirm_add_to_sub(callback: CallbackQuery, state: FSMContext):
                     email=email,
                     expire_days=30,  # fallback, не используется если expire_time_ms задан
                     ip_limit=ip_limit,
-                    expire_time_ms=expiry_time_ms
+                    expire_time_ms=expiry_time_ms,
+                    total_gb=total_gb
                 )
                 success = result.get('success', False)
                 existing = result.get('existing', False)

@@ -181,6 +181,7 @@
     },
     {
       "name": "📶 LTE: Билайн [ 50 Гб ]",
+      "traffic_limit_gb": 50,
       "domain": "vk.peakvip.ru",
       "ip": "138.124.14.245",
       "port": 443,
