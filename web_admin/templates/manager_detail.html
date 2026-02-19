@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div class="breadcrumb">
+        <a href="{{ request.app.root_path }}/managers">Менеджеры</a>
+        <span>/</span>
+        <span>{{ manager.custom_name or manager.full_name or manager.username or 'ID: ' ~ manager.user_id }}</span>
+    </div>
+</div>
+
+<div class="manager-profile">
+    <div class="profile-header">
+        <div class="profile-avatar">
+            {{ (manager.custom_name or manager.full_name or 'M')[0] | upper }}
+        </div>
+        <div class="profile-info">
+            <h1>{{ manager.custom_name or manager.full_name or 'Без имени' }}</h1>
+            <div class="profile-meta">
+                <span class="meta-item">ID: {{ manager.user_id }}</span>
+                {% if manager.username %}
+                <span class="meta-item">@{{ manager.username }}</span>
+                {% endif %}
+                <span class="badge {% if manager.is_active %}badge-success{% else %}badge-danger{% endif %}">
+                    {{ 'Активен' if manager.is_active else 'Заблокирован' }}
+                </span>
+            </div>
+            <div class="profile-date">
+                Добавлен: {{ manager.added_at[:10] if manager.added_at else 'N/A' }}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Статистика -->
+<div class="stats-cards">
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.total_keys }}</div>
+        <div class="stat-label">Всего ключей</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.today }}</div>
+        <div class="stat-label">Сегодня</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.week }}</div>
+        <div class="stat-label">За неделю</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.month }}</div>
+        <div class="stat-label">За месяц</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ '{:,.0f}'.format(stats.total_revenue) }} ₽</div>
+        <div class="stat-label">Выручка</div>
+    </div>
+</div>
+
+<div class="content-grid">
+    <!-- Статистика по периодам -->
+    <div class="card">
+        <h3>По тарифам</h3>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Период</th>
+                    <th>Ключей</th>
+                    <th>Выручка</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in periods_stats %}
+                <tr>
+                    <td>{{ p.period }}</td>
+                    <td>{{ p.count }}</td>
+                    <td>{{ '{:,.0f}'.format(p.revenue) }} ₽</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="3" class="text-center text-muted">Нет данных</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Последние ключи -->
+    <div class="card wide">
+        <h3>Последние ключи</h3>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Клиент</th>
+                    <th>Период</th>
+                    <th>Цена</th>
+                    <th>Дата</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for key in recent_keys %}
+                <tr>
+                    <td>
+                        <a href="{{ request.app.root_path }}/keys/{{ key.id }}" class="link">
+                            {{ key.client_email or key.phone_number or key.client_id[:8] ~ '...' }}
+                        </a>
+                    </td>
+                    <td>{{ key.period }}</td>
+                    <td>{{ key.price or 0 }} ₽</td>
+                    <td>{{ key.created_at[:16] if key.created_at else 'N/A' }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="4" class="text-center text-muted">Нет ключей</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<style>
+.manager-profile {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.profile-header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+}
+
+.profile-avatar {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    font-weight: 600;
+    color: white;
+}
+
+.profile-info h1 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.5rem;
+}
+
+.profile-meta {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.meta-item {
+    color: var(--text-muted);
+    font-family: monospace;
+}
+
+.profile-date {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.stats-cards {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+}
+
+.stat-card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 1rem 1.5rem;
+    text-align: center;
+    flex: 1;
+    min-width: 120px;
+}
+
+.stat-value {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--primary);
+}
+
+.stat-label {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.content-grid {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 1rem;
+}
+
+.content-grid .wide {
+    grid-column: span 1;
+}
+
+@media (max-width: 900px) {
+    .content-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-muted);
+}
+
+.breadcrumb a {
+    color: var(--primary);
+    text-decoration: none;
+}
+
+.breadcrumb a:hover {
+    text-decoration: underline;
+}
+</style>
+{% endblock %}

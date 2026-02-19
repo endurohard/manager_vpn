@@ -2,8 +2,11 @@
 Менеджер базы данных для хранения информации о менеджерах и ключах
 """
 import aiosqlite
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
@@ -44,13 +47,13 @@ class DatabaseManager:
             # Добавляем колонку price если её нет (для обновления существующих баз)
             try:
                 await db.execute('ALTER TABLE keys_history ADD COLUMN price INTEGER DEFAULT 0')
-            except:
+            except Exception:
                 pass  # Колонка уже существует
 
             # Добавляем колонку custom_name для пользовательских имен менеджеров
             try:
                 await db.execute('ALTER TABLE managers ADD COLUMN custom_name TEXT')
-            except:
+            except Exception:
                 pass  # Колонка уже существует
 
             # Таблица замен ключей (без цены)
@@ -90,6 +93,40 @@ class DatabaseManager:
                 )
             ''')
 
+            # ==================== ИНДЕКСЫ ДЛЯ ОПТИМИЗАЦИИ ЗАПРОСОВ ====================
+            # Индексы для keys_history - основная таблица с большим количеством записей
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_manager_id ON keys_history(manager_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_created_at ON keys_history(created_at)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_client_email ON keys_history(client_email)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_phone_number ON keys_history(phone_number)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_manager_date ON keys_history(manager_id, created_at)')
+
+            # Индексы для pending_keys - частые запросы по статусу
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_pending_keys_status ON pending_keys(status)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_pending_keys_telegram_id ON pending_keys(telegram_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_pending_keys_status_retry ON pending_keys(status, retry_count)')
+
+            # Индексы для key_replacements
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_key_replacements_manager_id ON key_replacements(manager_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_key_replacements_created_at ON key_replacements(created_at)')
+
+            # Индекс для managers
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_managers_is_active ON managers(is_active)')
+
+            # Таблица связанных ключей (для привязки нескольких ключей к одной подписке)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS linked_clients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    master_uuid TEXT NOT NULL,
+                    linked_uuid TEXT NOT NULL,
+                    linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(master_uuid, linked_uuid)
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_linked_clients_master ON linked_clients(master_uuid)')
+
+            logger.info("Индексы базы данных созданы/проверены")
+
             await db.commit()
 
     async def add_manager(self, user_id: int, username: str, full_name: str, added_by: int) -> bool:
@@ -103,7 +140,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error adding manager: {e}")
+            logger.error(f"Error adding manager: {e}")
             return False
 
     async def remove_manager(self, user_id: int) -> bool:
@@ -117,7 +154,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error removing manager: {e}")
+            logger.error(f"Error removing manager: {e}")
             return False
 
     async def is_manager(self, user_id: int) -> bool:
@@ -141,7 +178,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error updating manager info: {e}")
+            logger.error(f"Error updating manager info: {e}")
             return False
 
     async def set_manager_custom_name(self, user_id: int, custom_name: str) -> bool:
@@ -155,7 +192,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error setting custom name: {e}")
+            logger.error(f"Error setting custom name: {e}")
             return False
 
     async def get_all_managers(self) -> List[Dict]:
@@ -182,7 +219,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error adding key to history: {e}")
+            logger.error(f"Error adding key to history: {e}")
             return False
 
     async def get_manager_stats(self, manager_id: int) -> Dict:
@@ -479,7 +516,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error deleting key record: {e}")
+            logger.error(f"Error deleting key record: {e}")
             return False
 
     async def get_managers_detailed_stats(self) -> List[Dict]:
@@ -648,7 +685,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error adding key replacement: {e}")
+            logger.error(f"Error adding key replacement: {e}")
             return False
 
     async def get_replacement_stats(self, manager_id: int) -> Dict:
@@ -744,7 +781,7 @@ class DatabaseManager:
                 await db.commit()
                 return cursor.lastrowid
         except Exception as e:
-            print(f"Error adding pending key: {e}")
+            logger.error(f"Error adding pending key: {e}")
             return 0
 
     async def get_pending_keys(self, limit: int = 10) -> List[Dict]:
@@ -776,7 +813,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error updating pending key retry: {e}")
+            logger.error(f"Error updating pending key retry: {e}")
             return False
 
     async def mark_pending_key_completed(self, key_id: int, client_id: str = None) -> bool:
@@ -793,7 +830,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error marking pending key as completed: {e}")
+            logger.error(f"Error marking pending key as completed: {e}")
             return False
 
     async def mark_pending_key_failed(self, key_id: int) -> bool:
@@ -809,7 +846,7 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error marking pending key as failed: {e}")
+            logger.error(f"Error marking pending key as failed: {e}")
             return False
 
     async def get_pending_keys_count(self) -> Dict:
@@ -860,5 +897,94 @@ class DatabaseManager:
                 await db.commit()
                 return True
         except Exception as e:
-            print(f"Error deleting pending key: {e}")
+            logger.error(f"Error deleting pending key: {e}")
             return False
+
+    # ==================== МЕТОДЫ ДЛЯ СВЯЗАННЫХ КЛЮЧЕЙ (LINKED CLIENTS) ====================
+
+    async def add_linked_client(self, master_uuid: str, linked_uuid: str) -> bool:
+        """Привязать ключ к главному ключу"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'INSERT OR IGNORE INTO linked_clients (master_uuid, linked_uuid) VALUES (?, ?)',
+                    (master_uuid, linked_uuid)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error adding linked client: {e}")
+            return False
+
+    async def remove_linked_client(self, master_uuid: str, linked_uuid: str) -> bool:
+        """Отвязать ключ от главного ключа"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'DELETE FROM linked_clients WHERE master_uuid = ? AND linked_uuid = ?',
+                    (master_uuid, linked_uuid)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error removing linked client: {e}")
+            return False
+
+    async def get_linked_clients(self, master_uuid: str) -> List[str]:
+        """Получить список всех UUID, связанных с главным ключом"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'SELECT linked_uuid FROM linked_clients WHERE master_uuid = ?',
+                (master_uuid,)
+            )
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def get_linked_clients_with_info(self, master_uuid: str) -> List[Dict]:
+        """Получить связанные ключи с информацией из keys_history"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('''
+                SELECT lc.id as link_id, lc.linked_uuid, lc.linked_at,
+                       kh.id as key_id, kh.client_email, kh.phone_number,
+                       kh.expire_days, kh.created_at
+                FROM linked_clients lc
+                LEFT JOIN keys_history kh ON lc.linked_uuid = kh.client_id
+                WHERE lc.master_uuid = ?
+                ORDER BY lc.linked_at DESC
+            ''', (master_uuid,))
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_master_for_linked(self, linked_uuid: str) -> Optional[str]:
+        """Получить UUID главного ключа, к которому привязан данный ключ"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'SELECT master_uuid FROM linked_clients WHERE linked_uuid = ?',
+                (linked_uuid,)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def is_linked_to_any(self, uuid: str) -> bool:
+        """Проверить, привязан ли ключ к какому-либо главному ключу"""
+        master = await self.get_master_for_linked(uuid)
+        return master is not None
+
+    async def get_all_linked_uuids_for_subscription(self, master_uuid: str) -> List[str]:
+        """Получить все UUID для подписки (включая master и все linked)"""
+        linked = await self.get_linked_clients(master_uuid)
+        return [master_uuid] + linked
+
+    async def get_key_by_uuid(self, client_uuid: str) -> Optional[Dict]:
+        """Получить информацию о ключе по UUID"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('''
+                SELECT kh.*, m.full_name as manager_name, m.custom_name
+                FROM keys_history kh
+                LEFT JOIN managers m ON kh.manager_id = m.user_id
+                WHERE kh.client_id = ?
+            ''', (client_uuid,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None

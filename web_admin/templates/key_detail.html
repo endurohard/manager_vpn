@@ -1,0 +1,890 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header">
+    <div>
+        <a href="{{ request.app.root_path }}/keys" class="back-link">← Назад к списку</a>
+        <h2>Ключ #{{ key.id }}</h2>
+    </div>
+    <div class="header-actions">
+        {% if key.status == 'active' %}
+        <span class="badge badge-success">{{ key.days_left }}</span>
+        {% elif key.status == 'expired' %}
+        <span class="badge badge-danger">{{ key.days_left }}</span>
+        {% else %}
+        <span class="badge badge-secondary">{{ key.days_left }}</span>
+        {% endif %}
+    </div>
+</div>
+
+<div class="detail-grid">
+    <div class="card">
+        <h3>Информация о ключе</h3>
+        <table class="info-table">
+            <tr>
+                <td>Email клиента:</td>
+                <td><strong>{{ key.client_email or '-' }}</strong></td>
+            </tr>
+            <tr>
+                <td>Телефон:</td>
+                <td>{{ key.phone_number or '-' }}</td>
+            </tr>
+            <tr>
+                <td>UUID:</td>
+                <td><code class="uuid-full">{{ key.client_id }}</code></td>
+            </tr>
+            <tr>
+                <td>Период:</td>
+                <td>{{ key.period or '-' }} ({{ key.expire_days or '?' }} дн.)</td>
+            </tr>
+            <tr>
+                <td>Создан:</td>
+                <td>{{ key.created_at }}</td>
+            </tr>
+            <tr>
+                <td>Менеджер:</td>
+                <td>{{ key.manager_display }}</td>
+            </tr>
+            <tr>
+                <td>Цена:</td>
+                <td>{{ key.price or 0 }} ₽</td>
+            </tr>
+        </table>
+
+        <!-- Действия с ключом -->
+        <div class="key-actions">
+            <button type="button" class="btn btn-success" onclick="showExtendModal()">
+                Продлить
+            </button>
+            <button type="button" class="btn btn-danger" onclick="confirmDelete()">
+                Удалить
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Секция связанных ключей -->
+<div class="card linked-section">
+    <div class="linked-header">
+        <h3>🔗 Связанные ключи</h3>
+        {% if not is_linked_to %}
+        <button type="button" class="btn btn-primary btn-sm" onclick="showLinkModal()">
+            + Привязать ключ
+        </button>
+        {% endif %}
+    </div>
+
+    {% if is_linked_to %}
+    <div class="linked-notice warning">
+        <span class="notice-icon">⚠️</span>
+        <div class="notice-text">
+            Этот ключ привязан к главному ключу
+            {% if master_key_info %}
+            <a href="{{ request.app.root_path }}/keys/{{ master_key_info.id }}">
+                {{ master_key_info.client_email or master_key_info.phone_number or is_linked_to[:8] }}...
+            </a>
+            {% else %}
+            <code>{{ is_linked_to[:8] }}...</code>
+            {% endif %}
+            и не может иметь собственных связанных ключей.
+        </div>
+    </div>
+    {% else %}
+        {% if linked_keys %}
+        <p class="hint">При запросе подписки по URL этого ключа будут возвращаться ключи всех связанных клиентов</p>
+        <div class="linked-list">
+            {% for lk in linked_keys %}
+            <div class="linked-item" data-link-id="{{ lk.link_id }}">
+                <div class="linked-info">
+                    <div class="linked-main">
+                        {% if lk.key_id %}
+                        <a href="{{ request.app.root_path }}/keys/{{ lk.key_id }}">
+                            {{ lk.client_email or lk.phone_number or 'Без имени' }}
+                        </a>
+                        {% else %}
+                        <span class="uuid-only">{{ lk.linked_uuid[:8] }}...</span>
+                        <span class="badge badge-warning">Не в БД</span>
+                        {% endif %}
+                    </div>
+                    <div class="linked-meta">
+                        <span class="uuid"><code>{{ lk.linked_uuid[:12] }}...</code></span>
+                        <span class="linked-date">Привязан: {{ lk.linked_at[:10] if lk.linked_at else '-' }}</span>
+                    </div>
+                </div>
+                <button type="button" class="btn btn-danger btn-xs" onclick="unlinkKey({{ lk.link_id }})">
+                    Отвязать
+                </button>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="no-linked">Нет связанных ключей. Привяжите ключи, чтобы объединить их в одну подписку.</p>
+        {% endif %}
+    {% endif %}
+</div>
+
+<div class="card vless-section">
+    <h3>VLESS ключи</h3>
+    <p class="hint">Нажмите на ключ для копирования</p>
+
+    {% if vless_keys %}
+    <div class="vless-list">
+        {% for vk in vless_keys %}
+        <div class="vless-item">
+            <div class="vless-header">
+                <span class="server-name">{{ vk.server }}</span>
+                <span class="inbound-name">{{ vk.inbound }}</span>
+            </div>
+            <div class="vless-url" onclick="copyToClipboard(this)" title="Нажмите для копирования">
+                <code>{{ vk.url }}</code>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="no-keys">VLESS ключи не найдены</p>
+    {% endif %}
+</div>
+
+<!-- Модальное окно продления -->
+<div id="extendModal" class="modal">
+    <div class="modal-content">
+        <h3>Продлить ключ</h3>
+        <form id="extendForm">
+            <div class="period-options">
+                {% for key_name, period in prices.items() %}
+                <label class="period-option">
+                    <input type="radio" name="period" value="{{ key_name }}"
+                           {% if key_name == '1_month' %}checked{% endif %}>
+                    <div class="period-box">
+                        <div class="period-name">{{ period.name }}</div>
+                        <div class="period-price">+{{ period.price }} ₽</div>
+                    </div>
+                </label>
+                {% endfor %}
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal()">Отмена</button>
+                <button type="submit" class="btn btn-success">Продлить</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Модальное окно привязки ключа -->
+<div id="linkModal" class="modal">
+    <div class="modal-content modal-wide">
+        <h3>🔗 Привязать ключ</h3>
+        <p class="modal-hint">Найдите ключ по email, телефону или UUID</p>
+
+        <div class="search-input-wrap">
+            <input type="text" id="linkSearchInput" placeholder="Поиск..."
+                   oninput="searchKeysForLink(this.value)" autocomplete="off">
+            <div id="linkSearchSpinner" class="spinner" style="display:none;"></div>
+        </div>
+
+        <div id="linkSearchResults" class="search-results">
+            <p class="search-hint">Введите минимум 3 символа для поиска</p>
+        </div>
+
+        <div class="modal-divider">
+            <span>или введите UUID напрямую</span>
+        </div>
+
+        <form id="linkForm" onsubmit="submitLinkForm(event)">
+            <div class="form-group">
+                <label for="linkedUuidInput">UUID ключа:</label>
+                <input type="text" id="linkedUuidInput" name="linked_uuid"
+                       placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                       pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}">
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeLinkModal()">Отмена</button>
+                <button type="submit" class="btn btn-primary">Привязать</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div id="toast" class="toast">Скопировано!</div>
+
+<style>
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+.back-link {
+    color: var(--primary);
+    text-decoration: none;
+    display: block;
+    margin-bottom: 5px;
+}
+.back-link:hover {
+    text-decoration: underline;
+}
+.header-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+.badge {
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-weight: 500;
+}
+.badge-success { background: #28a745; color: #fff; }
+.badge-danger { background: #dc3545; color: #fff; }
+.badge-secondary { background: #6c757d; color: #fff; }
+.detail-grid {
+    display: grid;
+    gap: 20px;
+    margin-bottom: 20px;
+}
+.card {
+    background: var(--card-bg);
+    padding: 20px;
+    border-radius: 8px;
+}
+.card h3 {
+    margin: 0 0 15px 0;
+    color: var(--text);
+}
+.info-table {
+    width: 100%;
+}
+.info-table tr {
+    border-bottom: 1px solid var(--border);
+}
+.info-table td {
+    padding: 10px 0;
+}
+.info-table td:first-child {
+    color: var(--text-muted);
+    width: 150px;
+}
+.uuid-full {
+    background: rgba(0,0,0,0.2);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.85em;
+    word-break: break-all;
+}
+.key-actions {
+    display: flex;
+    gap: 1rem;
+    margin-top: 1.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+}
+.vless-section {
+    margin-top: 20px;
+}
+.hint {
+    color: var(--text-muted);
+    font-size: 0.85em;
+    margin-bottom: 15px;
+}
+.vless-list {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+.vless-item {
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.vless-header {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 15px;
+    background: rgba(0,0,0,0.2);
+}
+.server-name {
+    font-weight: 600;
+    color: var(--primary);
+}
+.inbound-name {
+    color: var(--text-muted);
+    font-size: 0.9em;
+}
+.vless-url {
+    padding: 12px 15px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.vless-url:hover {
+    background: rgba(255,255,255,0.05);
+}
+.vless-url code {
+    word-break: break-all;
+    font-size: 0.8em;
+    color: var(--text-muted);
+    display: block;
+}
+.no-keys {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 20px;
+}
+
+/* Modal */
+.modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+}
+.modal.show {
+    display: flex;
+}
+.modal-content {
+    background: var(--card-bg);
+    padding: 1.5rem;
+    border-radius: 12px;
+    width: 100%;
+    max-width: 400px;
+}
+.modal-content h3 {
+    margin: 0 0 1rem 0;
+}
+.period-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+.period-option input {
+    display: none;
+}
+.period-box {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.period-option input:checked + .period-box {
+    border-color: var(--primary);
+    background: rgba(99, 102, 241, 0.1);
+}
+.period-name {
+    font-weight: 500;
+}
+.period-price {
+    color: #22c55e;
+    font-weight: 600;
+}
+.modal-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: flex-end;
+}
+
+.toast {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #28a745;
+    color: #fff;
+    padding: 12px 24px;
+    border-radius: 6px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    pointer-events: none;
+    z-index: 1001;
+}
+.toast.show {
+    opacity: 1;
+}
+
+/* Linked keys section */
+.linked-section {
+    margin-top: 20px;
+}
+.linked-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+.linked-header h3 {
+    margin: 0;
+}
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 0.85em;
+}
+.btn-xs {
+    padding: 4px 8px;
+    font-size: 0.8em;
+}
+.linked-notice {
+    display: flex;
+    gap: 10px;
+    padding: 12px 15px;
+    border-radius: 8px;
+    margin-bottom: 15px;
+}
+.linked-notice.warning {
+    background: rgba(255, 193, 7, 0.15);
+    border: 1px solid rgba(255, 193, 7, 0.3);
+}
+.notice-icon {
+    font-size: 1.2em;
+}
+.notice-text {
+    color: var(--text);
+    line-height: 1.5;
+}
+.notice-text a {
+    color: var(--primary);
+    text-decoration: none;
+}
+.notice-text a:hover {
+    text-decoration: underline;
+}
+.linked-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.linked-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 15px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 8px;
+}
+.linked-info {
+    flex: 1;
+}
+.linked-main {
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+.linked-main a {
+    color: var(--primary);
+    text-decoration: none;
+}
+.linked-main a:hover {
+    text-decoration: underline;
+}
+.uuid-only {
+    color: var(--text-muted);
+}
+.linked-meta {
+    display: flex;
+    gap: 15px;
+    font-size: 0.85em;
+    color: var(--text-muted);
+}
+.linked-meta .uuid code {
+    background: rgba(0,0,0,0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+}
+.no-linked {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+}
+.badge-warning {
+    background: #ffc107;
+    color: #212529;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.75em;
+    margin-left: 8px;
+}
+
+/* Link modal */
+.modal-wide {
+    max-width: 500px;
+}
+.modal-hint {
+    color: var(--text-muted);
+    margin-bottom: 15px;
+    font-size: 0.9em;
+}
+.search-input-wrap {
+    position: relative;
+    margin-bottom: 15px;
+}
+.search-input-wrap input {
+    width: 100%;
+    padding: 12px 40px 12px 15px;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.2);
+    color: var(--text);
+    font-size: 1em;
+}
+.search-input-wrap input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+.spinner {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--border);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+    to { transform: translateY(-50%) rotate(360deg); }
+}
+.search-results {
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 15px;
+}
+.search-hint {
+    color: var(--text-muted);
+    font-size: 0.9em;
+    text-align: center;
+    padding: 15px;
+}
+.search-result-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.search-result-item:hover {
+    background: rgba(0,0,0,0.3);
+}
+.search-result-info {
+    flex: 1;
+}
+.search-result-name {
+    font-weight: 500;
+    margin-bottom: 2px;
+}
+.search-result-uuid {
+    font-size: 0.8em;
+    color: var(--text-muted);
+}
+.modal-divider {
+    text-align: center;
+    margin: 20px 0;
+    position: relative;
+}
+.modal-divider::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 1px;
+    background: var(--border);
+}
+.modal-divider span {
+    background: var(--card-bg);
+    padding: 0 15px;
+    position: relative;
+    color: var(--text-muted);
+    font-size: 0.85em;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--text-muted);
+    font-size: 0.9em;
+}
+.form-group input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 2px solid var(--border);
+    border-radius: 6px;
+    background: rgba(0,0,0,0.2);
+    color: var(--text);
+    font-family: monospace;
+}
+.form-group input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOT = '{{ request.app.root_path }}';
+const KEY_ID = {{ key.id }};
+
+function copyToClipboard(element) {
+    const text = element.querySelector('code').textContent;
+    navigator.clipboard.writeText(text).then(() => {
+        showToast('Скопировано!');
+    });
+}
+
+function showToast(message) {
+    const toast = document.getElementById('toast');
+    toast.textContent = message;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+function showExtendModal() {
+    document.getElementById('extendModal').classList.add('show');
+}
+
+function closeModal() {
+    document.getElementById('extendModal').classList.remove('show');
+}
+
+document.getElementById('extendForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const formData = new FormData(this);
+
+    try {
+        const resp = await fetch(ROOT + '/keys/' + KEY_ID + '/extend', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast(data.message);
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+
+    closeModal();
+});
+
+async function confirmDelete() {
+    if (!confirm('Вы уверены, что хотите удалить этот ключ со всех серверов?')) {
+        return;
+    }
+
+    try {
+        const resp = await fetch(ROOT + '/keys/' + KEY_ID, {
+            method: 'DELETE'
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            alert(data.message);
+            location.href = ROOT + '/keys';
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+// Закрытие модалки по клику вне её
+document.getElementById('extendModal').addEventListener('click', function(e) {
+    if (e.target === this) {
+        closeModal();
+    }
+});
+
+// ============ Linked keys functions ============
+
+let searchTimeout = null;
+
+function showLinkModal() {
+    document.getElementById('linkModal').classList.add('show');
+    document.getElementById('linkSearchInput').focus();
+}
+
+function closeLinkModal() {
+    document.getElementById('linkModal').classList.remove('show');
+    document.getElementById('linkSearchInput').value = '';
+    document.getElementById('linkedUuidInput').value = '';
+    document.getElementById('linkSearchResults').innerHTML = '<p class="search-hint">Введите минимум 3 символа для поиска</p>';
+}
+
+function searchKeysForLink(query) {
+    clearTimeout(searchTimeout);
+
+    const resultsDiv = document.getElementById('linkSearchResults');
+    const spinner = document.getElementById('linkSearchSpinner');
+
+    if (query.length < 3) {
+        resultsDiv.innerHTML = '<p class="search-hint">Введите минимум 3 символа для поиска</p>';
+        return;
+    }
+
+    spinner.style.display = 'block';
+
+    searchTimeout = setTimeout(async () => {
+        try {
+            const resp = await fetch(ROOT + '/keys/search/uuid?q=' + encodeURIComponent(query) + '&exclude_id=' + KEY_ID);
+            const data = await resp.json();
+
+            if (data.results && data.results.length > 0) {
+                let html = '';
+                for (const key of data.results) {
+                    const name = key.client_email || key.phone_number || 'Без имени';
+                    const uuid = key.client_id;
+                    html += `
+                        <div class="search-result-item" onclick="selectKeyForLink('${uuid}', ${key.id})">
+                            <div class="search-result-info">
+                                <div class="search-result-name">${escapeHtml(name)}</div>
+                                <div class="search-result-uuid">${uuid.substring(0, 12)}...</div>
+                            </div>
+                            <span class="btn btn-primary btn-xs">Выбрать</span>
+                        </div>
+                    `;
+                }
+                resultsDiv.innerHTML = html;
+            } else {
+                resultsDiv.innerHTML = '<p class="search-hint">Ничего не найдено</p>';
+            }
+        } catch (e) {
+            resultsDiv.innerHTML = '<p class="search-hint">Ошибка поиска</p>';
+        } finally {
+            spinner.style.display = 'none';
+        }
+    }, 300);
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function selectKeyForLink(uuid, keyId) {
+    linkKeyById(keyId);
+}
+
+async function linkKeyById(linkedKeyId) {
+    const formData = new FormData();
+    formData.append('linked_key_id', linkedKeyId);
+
+    try {
+        const resp = await fetch(ROOT + '/keys/' + KEY_ID + '/link', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast(data.message);
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+
+    closeLinkModal();
+}
+
+async function submitLinkForm(e) {
+    e.preventDefault();
+    const uuid = document.getElementById('linkedUuidInput').value.trim();
+
+    if (!uuid) {
+        alert('Введите UUID ключа');
+        return;
+    }
+
+    // Валидация UUID формата
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidPattern.test(uuid)) {
+        alert('Неверный формат UUID');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('linked_uuid', uuid);
+
+    try {
+        const resp = await fetch(ROOT + '/keys/' + KEY_ID + '/link', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast(data.message);
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+
+    closeLinkModal();
+}
+
+async function unlinkKey(linkId) {
+    if (!confirm('Вы уверены, что хотите отвязать этот ключ?')) {
+        return;
+    }
+
+    try {
+        const resp = await fetch(ROOT + '/keys/' + KEY_ID + '/unlink/' + linkId, {
+            method: 'DELETE'
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast(data.message);
+            // Удаляем элемент из DOM
+            const item = document.querySelector(`.linked-item[data-link-id="${linkId}"]`);
+            if (item) {
+                item.remove();
+            }
+            // Если больше нет связанных ключей, показываем сообщение
+            const linkedList = document.querySelector('.linked-list');
+            if (linkedList && linkedList.children.length === 0) {
+                linkedList.innerHTML = '<p class="no-linked">Нет связанных ключей. Привяжите ключи, чтобы объединить их в одну подписку.</p>';
+            }
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+// Закрытие модалки link по клику вне её
+document.getElementById('linkModal').addEventListener('click', function(e) {
+    if (e.target === this) {
+        closeLinkModal();
+    }
+});
+</script>
+{% endblock %}

@@ -7,6 +7,7 @@ import uuid
 import ssl
 import asyncio
 import logging
+import subprocess
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 
@@ -242,6 +243,29 @@ class XUIClient:
         local_server = next((s for s in servers_config.get('servers', []) if s.get('local')), None)
         local_active = local_server.get('active_for_new', True) if local_server else True
 
+        # Получаем flow из существующих клиентов в локальной базе
+        flow = ''
+        try:
+            result = subprocess.run([
+                'sqlite3', '/etc/x-ui/x-ui.db',
+                f'SELECT settings FROM inbounds WHERE id={inbound_id}'
+            ], capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0 and result.stdout.strip():
+                settings = json.loads(result.stdout.strip())
+                for client in settings.get('clients', []):
+                    if client.get('flow'):
+                        flow = client.get('flow')
+                        logger.debug(f"Flow '{flow}' получен из существующих клиентов")
+                        break
+        except Exception as e:
+            logger.warning(f"Не удалось получить flow из базы: {e}")
+            # Fallback на статический конфиг
+            if local_server:
+                inbounds = local_server.get('inbounds', {})
+                main_inbound = inbounds.get('main', {})
+                flow = main_inbound.get('flow', '')
+
         # Настройки клиента
         client_settings = {
             "clients": [{
@@ -254,7 +278,7 @@ class XUIClient:
                 "enable": True,
                 "tgId": phone,
                 "subId": "",
-                "flow": ""  # Пустой flow для совместимости
+                "flow": flow
             }]
         }
 
@@ -330,11 +354,21 @@ class XUIClient:
             )
             logger.info(f"Результаты создания на удалённых серверах: {remote_results}")
 
+            # Получаем результаты по серверам
+            server_results = remote_results.get('results', {})
+
             # Проверяем, создан ли клиент хотя бы на одном сервере
-            any_created = local_created or any(remote_results.values())
+            any_created = local_created or any(server_results.values())
             if not any_created:
                 logger.error("Клиент не создан ни на одном сервере!")
                 return None
+
+            # Если клиент уже существовал на сервере, используем его реальный UUID
+            if remote_results.get('any_existing', False):
+                real_uuid = remote_results.get('uuid', client_id)
+                if real_uuid != client_id:
+                    logger.info(f"Клиент {email} уже существовал на сервере с UUID {real_uuid}, используем его")
+                    client_id = real_uuid
 
         except Exception as e:
             logger.error(f"Ошибка создания на удалённых серверах: {e}")
@@ -355,11 +389,29 @@ class XUIClient:
         """Старая логика создания клиента (не используется)"""
         client_id = str(uuid.uuid4())
         expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
+
+        # Получаем flow из существующих клиентов в базе
+        flow = ''
+        try:
+            result = subprocess.run([
+                'sqlite3', '/etc/x-ui/x-ui.db',
+                f'SELECT settings FROM inbounds WHERE id={inbound_id}'
+            ], capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0 and result.stdout.strip():
+                settings = json.loads(result.stdout.strip())
+                for client in settings.get('clients', []):
+                    if client.get('flow'):
+                        flow = client.get('flow')
+                        break
+        except Exception:
+            pass
+
         client_settings = {
             "clients": [{
                 "id": client_id, "alterId": 0, "email": email, "limitIp": ip_limit,
                 "totalGB": 0, "expiryTime": expire_time, "enable": True,
-                "tgId": phone, "subId": "", "flow": ""
+                "tgId": phone, "subId": "", "flow": flow
             }]
         }
 
@@ -451,7 +503,6 @@ class XUIClient:
         """
         try:
             # Используем локальную базу x-ui
-            import subprocess
             result = subprocess.run([
                 'sqlite3', '/etc/x-ui/x-ui.db',
                 'SELECT settings FROM inbounds WHERE enable=1'
@@ -484,7 +535,6 @@ class XUIClient:
         :return: Данные клиента или None
         """
         try:
-            import subprocess
             result = subprocess.run([
                 'sqlite3', '/etc/x-ui/x-ui.db',
                 'SELECT settings FROM inbounds WHERE enable=1'
@@ -664,7 +714,7 @@ class XUIClient:
             settings = json.loads(inbound.get('settings', '{}'))
             return settings.get('clients', [])
         except Exception as e:
-            print(f"List clients error: {e}")
+            logger.error(f"List clients error: {e}")
             return []
 
     async def list_inbounds(self, max_retries: int = 3) -> list:
@@ -741,8 +791,6 @@ class XUIClient:
         Использует системный рестарт x-ui для гарантированного обновления конфига.
         """
         try:
-            import subprocess
-
             # Системный рестарт x-ui - гарантирует обновление config.json
             result = subprocess.run(
                 ['systemctl', 'restart', 'x-ui'],
@@ -1000,4 +1048,187 @@ class XUIClient:
 
         except Exception as e:
             logger.error(f"Ошибка при поиске и удалении клиента {client_email}: {e}")
+            return False
+
+    async def update_client(self, inbound_id: int, client_uuid: str, client_dict: dict, max_retries: int = 3) -> bool:
+        """
+        Обновить данные клиента
+
+        :param inbound_id: ID inbound
+        :param client_uuid: UUID клиента
+        :param client_dict: Новые данные клиента
+        :param max_retries: Максимальное количество попыток
+        :return: True если успешно, False если ошибка
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                if not await self._ensure_logged_in():
+                    return False
+
+                new_settings = json.dumps({'clients': [client_dict]})
+                url = f"{self.host}/panel/api/inbounds/updateClient/{client_uuid}"
+                payload = {'id': inbound_id, 'settings': new_settings}
+
+                async with self.session.post(url, json=payload) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'application/json' not in content_type:
+                            self.session_cookie = None
+                            if attempt < max_retries:
+                                await asyncio.sleep(1)
+                                continue
+                            return False
+
+                        data = await response.json()
+                        if data.get('success'):
+                            logger.info(f"Клиент {client_uuid} успешно обновлен")
+                            return True
+                        else:
+                            logger.error(f"Ошибка обновления клиента: {data.get('msg')}")
+                            return False
+
+                    elif response.status in [401, 403]:
+                        self.session_cookie = None
+                        if attempt < max_retries:
+                            await asyncio.sleep(1)
+                            continue
+
+                    return False
+
+            except Exception as e:
+                logger.error(f"Ошибка обновления клиента (попытка {attempt}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+
+        return False
+
+    async def get_client_traffic(self, email: str, max_retries: int = 3) -> Optional[Dict]:
+        """
+        Получить статистику трафика клиента
+
+        :param email: Email клиента
+        :param max_retries: Максимальное количество попыток
+        :return: Данные о трафике или None
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                if not await self._ensure_logged_in():
+                    return None
+
+                url = f"{self.host}/panel/api/inbounds/getClientTraffics/{email}"
+
+                async with self.session.get(url) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'application/json' not in content_type:
+                            self.session_cookie = None
+                            if attempt < max_retries:
+                                await asyncio.sleep(1)
+                                continue
+                            return None
+
+                        data = await response.json()
+                        if data.get('success'):
+                            return data.get('obj')
+                        return None
+
+                    elif response.status in [401, 403]:
+                        self.session_cookie = None
+                        if attempt < max_retries:
+                            await asyncio.sleep(1)
+                            continue
+
+                    return None
+
+            except Exception as e:
+                logger.error(f"Ошибка получения трафика (попытка {attempt}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+
+        return None
+
+    async def extend_client(self, inbound_id: int, client_email: str, days: int, max_retries: int = 3) -> bool:
+        """
+        Продлить подписку клиента на указанное количество дней
+
+        :param inbound_id: ID inbound
+        :param client_email: Email клиента
+        :param days: Количество дней для продления
+        :param max_retries: Максимальное количество попыток
+        :return: True если успешно, False если ошибка
+        """
+        try:
+            # Получаем текущие данные inbound
+            inbound = await self.get_inbound(inbound_id, max_retries=max_retries)
+            if not inbound:
+                return False
+
+            settings = json.loads(inbound.get('settings', '{}'))
+            clients = settings.get('clients', [])
+
+            # Ищем клиента
+            client = None
+            for c in clients:
+                if c.get('email') == client_email:
+                    client = c
+                    break
+
+            if not client:
+                logger.error(f"Клиент {client_email} не найден в inbound {inbound_id}")
+                return False
+
+            # Вычисляем новое время истечения
+            current_expiry = client.get('expiryTime', 0)
+            now_ms = int(datetime.now().timestamp() * 1000)
+
+            if current_expiry > now_ms:
+                # Добавляем к текущему времени
+                new_expiry = current_expiry + (days * 24 * 60 * 60 * 1000)
+            else:
+                # Подписка истекла, продлеваем от текущего момента
+                new_expiry = now_ms + (days * 24 * 60 * 60 * 1000)
+
+            # Обновляем данные клиента
+            client['expiryTime'] = new_expiry
+
+            return await self.update_client(inbound_id, client['id'], client, max_retries)
+
+        except Exception as e:
+            logger.error(f"Ошибка продления подписки: {e}")
+            return False
+
+    async def enable_client(self, inbound_id: int, client_email: str, enable: bool = True, max_retries: int = 3) -> bool:
+        """
+        Включить/выключить клиента
+
+        :param inbound_id: ID inbound
+        :param client_email: Email клиента
+        :param enable: True для включения, False для выключения
+        :param max_retries: Максимальное количество попыток
+        :return: True если успешно, False если ошибка
+        """
+        try:
+            inbound = await self.get_inbound(inbound_id, max_retries=max_retries)
+            if not inbound:
+                return False
+
+            settings = json.loads(inbound.get('settings', '{}'))
+            clients = settings.get('clients', [])
+
+            client = None
+            for c in clients:
+                if c.get('email') == client_email:
+                    client = c
+                    break
+
+            if not client:
+                logger.error(f"Клиент {client_email} не найден")
+                return False
+
+            client['enable'] = enable
+
+            return await self.update_client(inbound_id, client['id'], client, max_retries)
+
+        except Exception as e:
+            logger.error(f"Ошибка изменения статуса клиента: {e}")
             return False

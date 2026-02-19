@@ -184,7 +184,7 @@
       "traffic_limit_gb": 50,
       "domain": "vk.peakvip.ru",
       "ip": "138.124.14.245",
-      "port": 443,
+      "port": 8443,
       "enabled": true,
       "active_for_new": true,
       "local": false,
@@ -200,12 +200,12 @@
         "main": {
           "id": 1,
           "security": "reality",
-          "sni": "example.com",
-          "pbk": "",
-          "sid": "",
-          "flow": "",
-          "fp": "chrome",
-          "name_prefix": "📶 LTE: Билайн"
+          "sni": "ads.x5.ru",
+          "pbk": "0dzvl4BSKkHBRTg2PydzbUhlfl6zcuNFt3Ryr_TBFy8",
+          "sid": "0d159b27f8a8d5",
+          "flow": "xtls-rprx-vision",
+          "fp": "firefox",
+          "name_prefix": "🇷🇺 📶 LTE: Билайн"
         }
       }
     }

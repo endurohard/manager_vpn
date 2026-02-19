@@ -1,0 +1,267 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header">
+    <h2>Промокоды</h2>
+    <button class="btn btn-primary" onclick="openPromoModal()">+ Добавить</button>
+</div>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Код</th>
+            <th>Скидка</th>
+            <th>Использований</th>
+            <th>Статус</th>
+            <th>Действует до</th>
+            <th>Действия</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for promo in promos %}
+        <tr>
+            <td><code>{{ promo.code }}</code></td>
+            <td>
+                {% if promo.discount_type == 'percent' %}
+                {{ promo.discount_value }}%
+                {% elif promo.discount_type == 'fixed' %}
+                {{ promo.discount_value }}₽
+                {% elif promo.discount_type == 'days' %}
+                +{{ promo.discount_value }} дн.
+                {% endif %}
+            </td>
+            <td>
+                {{ promo.uses_count or 0 }}{% if promo.max_uses > 0 %}/{{ promo.max_uses }}{% endif %}
+            </td>
+            <td>
+                {% if promo.is_active %}
+                <span class="badge badge-success">Активен</span>
+                {% else %}
+                <span class="badge badge-secondary">Неактивен</span>
+                {% endif %}
+            </td>
+            <td>{{ promo.valid_until or 'Бессрочно' }}</td>
+            <td>
+                <button class="btn btn-sm btn-info"
+                    onclick="openPromoModal({{ promo.id }}, '{{ promo.code }}', '{{ promo.discount_type }}', {{ promo.discount_value }}, {{ promo.max_uses }}, {{ promo.is_active }})">
+                    ✏️
+                </button>
+                <button class="btn btn-sm btn-warning" onclick="togglePromo({{ promo.id }})">
+                    {% if promo.is_active %}⏸{% else %}▶{% endif %}
+                </button>
+                <button class="btn btn-sm btn-danger" onclick="deletePromo({{ promo.id }})">🗑</button>
+            </td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="6" class="text-center">Нет промокодов</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<!-- Модальное окно -->
+<div class="modal-bg" id="promoModalBg">
+    <div class="modal">
+        <button class="modal-close" onclick="closePromoModal()">×</button>
+        <h3 id="promoModalTitle">Добавить промокод</h3>
+        <form id="promoForm" method="post">
+            <input type="hidden" name="id" id="promoId">
+            <div class="form-group">
+                <label>Код:</label>
+                <input type="text" name="code" id="promoCode" required class="form-input" style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+                <label>Тип скидки:</label>
+                <select name="discount_type" id="promoDiscountType" class="form-select">
+                    <option value="percent">Процент (%)</option>
+                    <option value="fixed">Фиксированная (₽)</option>
+                    <option value="days">Бонусные дни</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Значение:</label>
+                <input type="number" name="discount_value" id="promoDiscountValue" required min="1" class="form-input">
+            </div>
+            <div class="form-group">
+                <label>Макс. использований (0 = без лимита):</label>
+                <input type="number" name="max_uses" id="promoMaxUses" value="0" min="0" class="form-input">
+            </div>
+            <div class="form-group" id="validDaysGroup">
+                <label>Действует дней (0 = бессрочно):</label>
+                <input type="number" name="valid_days" id="promoValidDays" value="0" min="0" class="form-input">
+            </div>
+            <div class="form-group" id="isActiveGroup" style="display: none;">
+                <label>
+                    <input type="checkbox" name="is_active" id="promoIsActive" checked> Активен
+                </label>
+            </div>
+            <button type="submit" class="btn btn-primary" style="width: 100%;">Сохранить</button>
+        </form>
+    </div>
+</div>
+
+<style>
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #1e1e1e;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.table th, .table td {
+    padding: 12px 15px;
+    text-align: left;
+    border-bottom: 1px solid #333;
+}
+.table th {
+    background: #2a2a2a;
+}
+code {
+    background: #2a2a2a;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 0.9em;
+}
+.badge {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.8em;
+}
+.badge-success { background: #28a745; color: #fff; }
+.badge-secondary { background: #6c757d; color: #fff; }
+.btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.btn-primary { background: #4a90d9; color: #fff; }
+.btn-sm { padding: 4px 8px; font-size: 0.85em; }
+.btn-info { background: #17a2b8; color: #fff; }
+.btn-warning { background: #ffc107; color: #000; }
+.btn-danger { background: #dc3545; color: #fff; }
+.text-center { text-align: center; }
+.modal-bg {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 1000;
+    justify-content: center;
+    align-items: center;
+}
+.modal {
+    background: #1e1e1e;
+    padding: 25px;
+    border-radius: 10px;
+    min-width: 350px;
+    max-width: 450px;
+    position: relative;
+}
+.modal-close {
+    position: absolute;
+    top: 10px;
+    right: 15px;
+    background: none;
+    border: none;
+    font-size: 1.5em;
+    color: #888;
+    cursor: pointer;
+}
+.modal h3 {
+    margin: 0 0 20px 0;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    color: #888;
+    font-size: 0.9em;
+}
+.form-input, .form-select {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #2a2a2a;
+    color: #fff;
+}
+</style>
+
+<script>
+let editingId = null;
+
+function openPromoModal(id, code, discountType, discountValue, maxUses, isActive) {
+    editingId = id || null;
+    document.getElementById('promoModalBg').style.display = 'flex';
+    document.getElementById('promoModalTitle').textContent = id ? 'Редактировать промокод' : 'Добавить промокод';
+    document.getElementById('promoForm').action = id ? `/admin/promo/${id}/edit` : '/admin/promo/new';
+    document.getElementById('promoId').value = id || '';
+    document.getElementById('promoCode').value = code || '';
+    document.getElementById('promoDiscountType').value = discountType || 'percent';
+    document.getElementById('promoDiscountValue').value = discountValue || '';
+    document.getElementById('promoMaxUses').value = maxUses || 0;
+    document.getElementById('promoIsActive').checked = isActive !== false;
+
+    // Показываем/скрываем поля
+    document.getElementById('validDaysGroup').style.display = id ? 'none' : 'block';
+    document.getElementById('isActiveGroup').style.display = id ? 'block' : 'none';
+}
+
+function closePromoModal() {
+    document.getElementById('promoModalBg').style.display = 'none';
+}
+
+document.getElementById('promoModalBg').onclick = function(e) {
+    if (e.target === this) closePromoModal();
+};
+
+document.getElementById('promoForm').onsubmit = function(e) {
+    e.preventDefault();
+    const form = this;
+    fetch(form.action, {
+        method: 'POST',
+        body: new FormData(form),
+        headers: {'x-requested-with': 'XMLHttpRequest'}
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) location.reload();
+    });
+};
+
+function togglePromo(id) {
+    fetch(`/admin/promo/${id}/toggle`, {
+        method: 'POST',
+        headers: {'x-requested-with': 'XMLHttpRequest'}
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) location.reload();
+    });
+}
+
+function deletePromo(id) {
+    if (!confirm('Удалить промокод?')) return;
+    fetch(`/admin/promo/${id}/delete`, {
+        method: 'POST',
+        headers: {'x-requested-with': 'XMLHttpRequest'}
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) location.reload();
+    });
+}
+</script>
+{% endblock %}

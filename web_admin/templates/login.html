@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Вход - VPN Manager Admin</title>
+    <link rel="stylesheet" href="{{ request.app.root_path }}/static/login.css">
+    <link rel="stylesheet" href="{{ request.app.root_path }}/static/common.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="dark-theme very-dark login-page">
+    <div class="login-container">
+        <div class="login-box">
+            <h1>VPN Manager</h1>
+            <p class="subtitle">Панель администратора</p>
+
+            {% if error %}
+            <div class="error-message">{{ error }}</div>
+            {% endif %}
+
+            <form method="post" action="{{ request.app.root_path }}/login">
+                <div class="form-group">
+                    <label for="password">Пароль</label>
+                    <input type="password" id="password" name="password" required autofocus>
+                </div>
+                <button type="submit" class="btn-login">Войти</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

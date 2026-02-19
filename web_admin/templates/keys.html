@@ -1,0 +1,210 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header">
+    <div>
+        <h2>История ключей</h2>
+        <span class="total-count">Всего: {{ total }}</span>
+    </div>
+    <a href="{{ request.app.root_path }}/keys/create" class="btn btn-primary">
+        + Создать ключ
+    </a>
+</div>
+
+<div class="search-row">
+    <form method="get" class="search-form">
+        <input type="text" name="search" value="{{ search }}" placeholder="Поиск по email, телефону, UUID..." class="search-input">
+        <button type="submit" class="btn btn-primary">Найти</button>
+        {% if search %}
+        <a href="{{ request.app.root_path }}/keys" class="btn btn-secondary">Сбросить</a>
+        {% endif %}
+    </form>
+</div>
+
+<div class="table-responsive">
+    <table class="table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Email / Телефон</th>
+                <th>UUID</th>
+                <th>Период</th>
+                <th>Статус</th>
+                <th>Менеджер</th>
+                <th>Дата</th>
+                <th>Ключи</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for key in keys %}
+            <tr>
+                <td>{{ key.id }}</td>
+                <td>
+                    <div class="key-info">
+                        <strong>{{ key.client_email or '-' }}</strong>
+                        {% if key.phone_number %}
+                        <br><small>{{ key.phone_number }}</small>
+                        {% endif %}
+                    </div>
+                </td>
+                <td><code class="uuid">{{ (key.client_id or '')[:12] }}...</code></td>
+                <td>{{ key.expire_days or '?' }} дн.</td>
+                <td>
+                    {% if key.status == 'active' %}
+                    <span class="badge badge-success">{{ key.days_left }}</span>
+                    {% elif key.status == 'expired' %}
+                    <span class="badge badge-danger">{{ key.days_left }}</span>
+                    {% else %}
+                    <span class="badge badge-secondary">{{ key.days_left }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ key.manager_display }}</td>
+                <td>{{ (key.created_at or '')[:10] }}</td>
+                <td>
+                    <a href="/manager/keys/{{ key.id }}" class="btn btn-sm btn-info">VLESS</a>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="8" class="text-center">
+                    {% if search %}
+                    Ключи не найдены. <a href="/manager/keys">Сбросить поиск</a>
+                    {% else %}
+                    Нет ключей
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if total_pages > 1 %}
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}{% if search %}&search={{ search }}{% endif %}" class="page-link">← Назад</a>
+    {% endif %}
+
+    {% for p in pages %}
+        {% if p == '...' %}
+        <span class="page-ellipsis">...</span>
+        {% elif p == page %}
+        <span class="page-link active">{{ p }}</span>
+        {% else %}
+        <a href="?page={{ p }}{% if search %}&search={{ search }}{% endif %}" class="page-link">{{ p }}</a>
+        {% endif %}
+    {% endfor %}
+
+    {% if page < total_pages %}
+    <a href="?page={{ page + 1 }}{% if search %}&search={{ search }}{% endif %}" class="page-link">Вперёд →</a>
+    {% endif %}
+</div>
+{% endif %}
+
+<style>
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+.total-count {
+    color: #888;
+}
+.search-row {
+    margin-bottom: 20px;
+}
+.search-form {
+    display: flex;
+    gap: 10px;
+}
+.search-input {
+    flex: 1;
+    max-width: 400px;
+    padding: 8px 12px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #2a2a2a;
+    color: #fff;
+}
+.btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+}
+.btn-sm {
+    padding: 4px 10px;
+    font-size: 0.85em;
+}
+.btn-primary { background: #4a90d9; color: #fff; }
+.btn-secondary { background: #555; color: #fff; }
+.btn-info { background: #17a2b8; color: #fff; }
+.table-responsive {
+    overflow-x: auto;
+}
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #1e1e1e;
+    border-radius: 8px;
+}
+.table th, .table td {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 1px solid #333;
+}
+.table th {
+    background: #2a2a2a;
+    font-weight: 600;
+}
+.table tbody tr:hover {
+    background: #252525;
+}
+.key-info {
+    line-height: 1.4;
+}
+.key-info small {
+    color: #888;
+}
+code.uuid {
+    background: #2a2a2a;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.8em;
+}
+.badge {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.8em;
+}
+.badge-success { background: #28a745; color: #fff; }
+.badge-danger { background: #dc3545; color: #fff; }
+.badge-secondary { background: #6c757d; color: #fff; }
+.text-center { text-align: center; }
+.pagination {
+    display: flex;
+    gap: 5px;
+    justify-content: center;
+    margin-top: 20px;
+}
+.page-link {
+    padding: 8px 12px;
+    background: #2a2a2a;
+    color: #fff;
+    text-decoration: none;
+    border-radius: 4px;
+}
+.page-link:hover {
+    background: #3a3a3a;
+}
+.page-link.active {
+    background: #4a90d9;
+}
+.page-ellipsis {
+    padding: 8px;
+    color: #888;
+}
+</style>
+{% endblock %}

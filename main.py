@@ -18,7 +18,8 @@ from aiogram.types import FSInputFile
 from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, INBOUND_ID
 from bot.database import DatabaseManager
 from bot.api import XUIClient
-from bot.handlers import common, manager, admin
+from bot.handlers import common, manager, admin, extended
+from bot.middlewares import BanCheckMiddleware, ThrottlingMiddleware, MaintenanceMiddleware
 from bot.webapp.server import start_webapp_server, set_bot_instance
 from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server
 
@@ -298,6 +299,12 @@ async def main():
     except Exception as e:
         logger.error(f"Ошибка подключения к X-UI: {e}")
 
+    # Регистрация middleware
+    dp.update.middleware(ThrottlingMiddleware(default_ttl=0.5))
+    dp.update.middleware(BanCheckMiddleware(DATABASE_PATH))
+    dp.update.middleware(MaintenanceMiddleware(admin_ids=[ADMIN_ID]))
+    logger.info("Middleware зарегистрированы")
+
     # Middleware для передачи зависимостей
     @dp.update.middleware()
     async def db_middleware(handler, event, data):
@@ -310,6 +317,7 @@ async def main():
     dp.include_router(common.router)
     dp.include_router(manager.router)
     dp.include_router(admin.router)
+    dp.include_router(extended.router)
 
     logger.info("Обработчики зарегистрированы")
 

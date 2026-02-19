@@ -2622,6 +2622,24 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
     """Обработка поискового запроса - ищет в базе и на X-UI серверах"""
     query = message.text.strip()
 
+    # Если пользователь нажал кнопку меню - выходим из режима поиска
+    admin_menu_buttons = {
+        "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
+        "Добавить менеджера", "Список менеджеров", "Общая статистика",
+        "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
+        "🔧 Исправить ключ", "💰 Прайс", "Моя статистика",
+    }
+    if query in admin_menu_buttons:
+        await state.clear()
+        await message.answer(
+            "🔍 Поиск отменен.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
+
     if len(query) < 2:
         await message.answer("❌ Введите минимум 2 символа для поиска.")
         return
@@ -4888,6 +4906,7 @@ async def show_pending_keys(message: Message, db: DatabaseManager, **kwargs):
 @admin_only
 async def start_add_server_to_sub(message: Message, state: FSMContext, **kwargs):
     """Начало добавления сервера в подписку клиента"""
+    await state.clear()
     await state.set_state(AddToSubscriptionStates.waiting_for_search)
     await message.answer(
         "📡 <b>ДОБАВИТЬ СЕРВЕР В ПОДПИСКУ</b>\n\n"
@@ -4915,6 +4934,24 @@ async def cancel_add_server_to_sub(message: Message, state: FSMContext):
 async def process_add_sub_search(message: Message, state: FSMContext):
     """Обработка поискового запроса для добавления сервера"""
     query = message.text.strip()
+
+    # Если пользователь нажал кнопку меню - выходим из режима поиска
+    admin_menu_buttons = {
+        "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
+        "Добавить менеджера", "Список менеджеров", "Общая статистика",
+        "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
+        "🔧 Исправить ключ", "💰 Прайс", "Моя статистика",
+    }
+    if query in admin_menu_buttons:
+        await state.clear()
+        await message.answer(
+            "Операция отменена.",
+            reply_markup=Keyboards.admin_menu()
+        )
+        return
 
     if len(query) < 2:
         await message.answer("❌ Введите минимум 2 символа для поиска.")
@@ -5040,7 +5077,8 @@ async def select_client_for_add(callback: CallbackQuery, state: FSMContext):
         expiry_time_ms=expiry_time_ms,
         ip_limit=ip_limit,
         available_servers=available_servers,
-        selected_server_indices=[]
+        selected_server_indices=[],
+        admin_total_gb=None
     )
     await state.set_state(AddToSubscriptionStates.waiting_for_server_select)
 
@@ -5473,6 +5511,7 @@ async def _execute_add_to_sub(callback: CallbackQuery, state: FSMContext, data: 
 @router.callback_query(F.data == "addsub_newsearch")
 async def addsub_new_search(callback: CallbackQuery, state: FSMContext):
     """Новый поиск для добавления сервера"""
+    await state.clear()
     await state.set_state(AddToSubscriptionStates.waiting_for_search)
     await callback.message.edit_text(
         "📡 <b>ДОБАВИТЬ СЕРВЕР В ПОДПИСКУ</b>\n\n"

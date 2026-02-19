@@ -1,0 +1,473 @@
+/* === ОБЩИЕ СТИЛИ ДЛЯ ВСЕЙ АДМИНКИ === */
+
+.modal {
+  background: #23272b;
+  border-radius: 16px;
+  box-shadow: 0 8px 32px #000a;
+  padding: 32px 28px 24px 28px;
+  min-width: 320px;
+  width: 540px;
+  max-width: 98vw;
+  color: #e0e0e0;
+  position: relative;
+  overflow-y: auto;
+}
+
+.form-btns {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.button, .cancel-btn {
+  padding: 3px 9px;
+  font-size: 1em;
+  font-weight: 500;
+  line-height: 1.25;
+  border-radius: 9px;
+  border: 1.5px solid;
+  box-shadow: 0 2px 6px #0002;
+  cursor: pointer;
+  margin: 0 3px;
+  transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s;
+  display: inline-block;
+  text-align: center;
+  vertical-align: middle;
+}
+.button {
+  background: #008771;
+  color: #fff !important;
+  border-color: #008771;
+}
+.button:hover {
+  background: #00a884;
+  color: #fff !important;
+  border-color: #00a884;
+}
+.cancel-btn {
+  background: #e74c3c;
+  color: #fff !important;
+  border-color: #e74c3c;
+}
+.cancel-btn:hover {
+  background: #c0392b;
+  border-color: #c0392b;
+}
+
+.client-form {
+  margin-top: 10px;
+}
+.client-form .form-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+body:not(.very-dark) .client-form input[type="text"],
+body:not(.very-dark) .client-form input[type="number"],
+body:not(.very-dark) .client-form input[type="date"],
+body:not(.very-dark) .client-form select,
+body:not(.very-dark) .client-form textarea {
+  background: #fff !important;
+  color: #23272b !important;
+  border: 1px solid #b0b0b0 !important;
+}
+.client-form .form-row-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+.client-form input[type="checkbox"] {
+  width: auto;
+}
+
+.table-narrow {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0 8px;
+  margin-top: 18px;
+}
+.table-narrow th, .table-narrow td {
+  padding: 0px 8px;
+  border: none;
+  text-align: center;
+  font-size: 0.97em;
+}
+.table-narrow th {
+  color: #6ee7b7;
+  font-weight: 600;
+  background: #181c20;
+}
+.table-narrow tr:hover td {
+  box-shadow: 0 2px 12px #0003;
+  background: #1a1e22;
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: #00a884;
+  border-radius: 50%;
+  padding: 5px;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.15em;
+}
+.icon-btn:hover {
+  background: #00a88422;
+  color: #008771;
+}
+
+.user-action-btn {
+  display: inline-block;
+  background: #008771;
+  color: #fff !important;
+  border: 1.5px solid #008771;
+  border-radius: 7px;
+  font-size: 1em;
+  font-weight: 500;
+  padding: 2px 0px;
+  min-width: 120px;
+  /* margin: 4px 6px 4px 0; */
+  text-align: center;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+  box-shadow: 0 2px 6px #0002;
+}
+.user-action-btn:hover {
+  background: #00a884;
+  border-color: #00a884;
+  color: #fff !important;
+}
+.user-action-btn[style*="background:#e74c3c"] {
+  background: #e74c3c !important;
+  border-color: #e74c3c !important;
+}
+
+.button.active {
+  background: #4f946c !important;
+  color: #fff !important;
+  border: 2px solid #1e874b !important;
+  font-weight: bold;
+  box-shadow: 0 2px 8px rgba(39,174,96,0.15);
+}
+
+@media (max-width: 768px) {
+  .modal {
+    margin-top: 32px !important;
+    margin-bottom: 32px !important;
+    max-height: 80vh !important;
+    overflow-y: auto !important;
+    padding: 16px 12px;
+    width: 100vw !important;
+    max-width: 98vw !important;
+    min-width: 0 !important;
+    box-sizing: border-box;
+  }
+  .user-header-flex,
+  .form-btns {
+    flex-direction: row !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    gap: 8px !important;
+  }
+  .user-header-flex .button,
+  .form-btns .button,
+  .form-btns .cancel-btn {
+    width: auto !important;
+    min-width: 120px !important;
+    margin: 3px !important;
+    flex: none !important;
+  }
+  .button, .cancel-btn {
+    padding: 6px 12px !important;
+    font-size: 0.9em !important;
+    /* min-height: 36px !important; */
+    border-radius: 5px !important;
+    margin: 3px !important;
+    width: auto !important;
+  }
+  .table-narrow .button,
+  .table-narrow .cancel-btn {
+    padding: 3px 6px !important;
+    font-size: 0.8em !important;
+    min-height: 28px !important;
+    border-radius: 3px !important;
+    margin: 1px !important;
+    width: auto !important;
+    display: inline-block !important;
+  }
+  .table-narrow td {
+    display: block !important;
+    width: 100% !important;
+    padding: 0px 0 !important;
+    border: none !important;
+    background: transparent !important;
+    text-align: left !important;
+    position: relative !important;
+    min-height: auto !important;
+    line-height: 1.4 !important;
+    word-wrap: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+  .table-narrow td:before {
+    content: attr(data-label) ": " !important;
+    display: inline !important;
+    font-weight: 600 !important;
+    font-size: 0.8em !important;
+    color: #6ee7b7 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.3px !important;
+    margin-right: 6px !important;
+    line-height: 1.3 !important;
+    opacity: 0.9 !important;
+    vertical-align: baseline !important;
+  }
+  .user-action-btn {
+    font-size: 0.95em;
+    padding: 2px 0px;
+    min-width: 100px;
+    margin: 4px 4px 4px 0;
+  }
+}
+@keyframes spin {
+  100% { transform: rotate(360deg); }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+#log-refresh-btn {
+  background: none;
+  border: none; 
+  cursor: pointer;
+  padding: 0;
+  align-items: center;
+  margin-top: 0;
+  margin-bottom: 0;
+  color: #008771;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+#log-level-filter {
+  min-width: 80px;
+  height: 32px;
+  line-height: 32px;
+  padding: 0 12px;
+  border: 1px solid #008771;
+  border-radius: 6px;
+  color: inherit;
+  font-size: 16px;
+  outline: none;
+  box-sizing: border-box;
+  margin: 0;
+  vertical-align: middle;
+}
+
+.download-log-btn {
+  background: #008771;
+  border: none;
+  display: flex;
+  border-radius: 6px;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.18s;
+  box-shadow: none;
+  padding: 0;
+}
+.download-log-btn:hover {
+  background: #008771
+}
+.download-log-btn svg {
+  color: #fff;
+  width: 24px;
+  height: 24px;
+  display: block;
+}
+
+.format-buttons {
+  margin-bottom: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.format-buttons button {
+  background-color: var(--button-bg-color);
+  color: var(--button-text-color);
+  border: 1px solid var(--button-border-color);
+  padding: 5px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-weight: bold;
+  min-width: 40px;
+}
+.format-buttons button:hover {
+  background-color: var(--button-hover-bg-color);
+}
+.form-textarea {
+  width: 100%;
+  border-radius: 8px;
+  color: var(--text-color);
+  resize: vertical;
+}
+.form-control-file {
+  width: 100%;
+  padding: 10px 2px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background-color: var(--input-bg-color);
+  color: var(--text-color);
+}
+.preview-area {
+  margin-top: 20px;
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  background-color: var(--secondary-bg-color);
+  color: var(--text-color);
+  min-height: 100px;
+  overflow-y: auto;
+  display: inline-block;
+}
+.preview-area img, .preview-area video {
+  max-width: 100%;
+  max-height: 350px;
+  height: auto;
+  display: block;
+  margin: 10px;
+  border-radius: 5px;
+  object-fit: contain; 
+}
+.preview-area .file-name {
+  font-weight: bold;
+  color: var(--primary-color);
+}
+#previewContent {
+  background-color: var(--secondary-bg-color);
+  color: var(--text-color);
+  padding: 15px;
+  white-space: pre-wrap;
+}
+.preview-area pre {
+  background-color: var(--input-bg-color);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  padding: 15px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: monospace;
+  margin: 15px 0;
+  position: relative;
+}
+.preview-area blockquote {
+  border-left: 8px solid #e84e72;
+  padding-left: 20px;
+  margin: 15px 0;
+  font-style: italic;
+  color: var(--text-color);
+  background-color: var(--blockquote-bg-clolor);
+  border-radius: 8px;
+  position: relative;
+}
+
+.preview-area blockquote::after {
+  content: '”';
+  position: absolute;
+  top: 5px;
+  right: 10px;
+  font-size: 2.5em;
+  color: #e84e72;
+  opacity: 0.7;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.copy-code-container {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background-color: #4a4f54;
+  border-top-right-radius: 8px;
+  border-bottom-left-radius: 8px;
+  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 0.9em;
+  color: #e0e0e0;
+}
+
+.copy-code-container:hover {
+  background-color: #5a6066;
+}
+
+.copy-code-button {
+  background: none;
+  border: none;
+  color: #e0e0e0;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.9em;
+}
+
+.copy-code-button svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+}
+
+.tg-spoiler {
+  background-color: var(--secondary-bg-color);
+  color: var(--spoiler-bg-color);
+  transition: color 0.3s ease, background-color 0.3s ease;
+  border-radius: 3px;
+  padding: 0 4px;
+  display: inline-block;
+}
+
+.tg-spoiler:hover,
+.tg-spoiler:active {
+  color: var(--text-color);
+  background-color: var(--secondary-bg-color);
+  cursor: pointer;
+}
+
+#emojiPickerBtn {
+    background-color: var(--button-bg-color);
+    color: var(--button-text-color);
+    border: 1px solid var(--button-border-color);
+    padding: 0 10px;
+    height: 32px;
+    border-radius: 9px;
+    cursor: pointer;
+    font-weight: bold;
+    min-width: 40px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+    white-space: nowrap;
+}
+#emojiPickerBtn:hover {
+    background-color: var(--button-hover-bg-color);
+}
+
+emoji-picker {
+    width: 100%;
+    --num-columns: 6;
+}

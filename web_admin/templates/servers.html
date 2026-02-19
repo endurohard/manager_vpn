@@ -1,0 +1,391 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Серверы</h1>
+    <button class="btn btn-secondary" onclick="refreshAll()">
+        <span id="refreshIcon">🔄</span> Обновить
+    </button>
+</div>
+
+<!-- Общая статистика -->
+<div class="stats-cards">
+    <div class="stat-card">
+        <div class="stat-value">{{ online_count }}/{{ total_count }}</div>
+        <div class="stat-label">Онлайн</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ active_count }}</div>
+        <div class="stat-label">Активных</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ total_clients }}</div>
+        <div class="stat-label">Всего клиентов</div>
+    </div>
+</div>
+
+<!-- Список серверов -->
+<div class="servers-grid">
+    {% for server in servers %}
+    <div class="server-card {% if not server.enabled %}disabled{% endif %}" data-name="{{ server.name }}">
+        <div class="server-header">
+            <div class="server-status">
+                {% if not server.enabled %}
+                    <span class="status-dot status-disabled" title="Отключен"></span>
+                {% elif server.port_open or server.panel_available %}
+                    <span class="status-dot status-online" title="Онлайн"></span>
+                {% else %}
+                    <span class="status-dot status-offline" title="Офлайн"></span>
+                {% endif %}
+                <span class="server-name">{{ server.name }}</span>
+            </div>
+            <div class="server-badge">
+                {% if server.active_for_new %}
+                    <span class="badge badge-success">Активен</span>
+                {% else %}
+                    <span class="badge badge-secondary">Не активен</span>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="server-info">
+            <div class="info-row">
+                <span class="info-label">IP:</span>
+                <span class="info-value">{{ server.ip }}</span>
+            </div>
+            {% if server.domain and server.domain != server.ip %}
+            <div class="info-row">
+                <span class="info-label">Домен:</span>
+                <span class="info-value">{{ server.domain }}</span>
+            </div>
+            {% endif %}
+            <div class="info-row">
+                <span class="info-label">Порт:</span>
+                <span class="info-value">
+                    {{ server.port }}
+                    {% if server.port_open %}
+                        <span class="check-mark">✓</span>
+                    {% else %}
+                        <span class="cross-mark">✗</span>
+                    {% endif %}
+                </span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Клиентов:</span>
+                <span class="info-value clients-count">{{ server.clients }}</span>
+            </div>
+            {% if server.inbounds %}
+            <div class="info-row">
+                <span class="info-label">Inbounds:</span>
+                <span class="info-value">{{ server.inbounds | join(', ') }}</span>
+            </div>
+            {% endif %}
+            {% if server.is_local %}
+            <div class="info-row">
+                <span class="badge badge-info">Локальный</span>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if server.error %}
+        <div class="server-error">
+            ⚠️ {{ server.error }}
+        </div>
+        {% endif %}
+
+        <div class="server-actions">
+            {% if server.enabled %}
+                <button class="btn btn-sm {% if server.active_for_new %}btn-warning{% else %}btn-success{% endif %}"
+                        onclick="toggleActive('{{ server.name }}')">
+                    {{ '⏸️ Выключить' if server.active_for_new else '▶️ Включить' }}
+                </button>
+                <button class="btn btn-sm btn-secondary" onclick="checkServer('{{ server.name }}')">
+                    🔍 Проверить
+                </button>
+                <button class="btn btn-sm btn-danger" onclick="disableServer('{{ server.name }}')">
+                    ⛔ Отключить
+                </button>
+            {% else %}
+                <button class="btn btn-sm btn-success" onclick="enableServer('{{ server.name }}')">
+                    ✅ Включить сервер
+                </button>
+            {% endif %}
+        </div>
+    </div>
+    {% else %}
+    <div class="no-data">
+        <p>Нет настроенных серверов</p>
+    </div>
+    {% endfor %}
+</div>
+
+<style>
+.stats-cards {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.stat-card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 1rem 1.5rem;
+    text-align: center;
+    flex: 1;
+}
+
+.stat-value {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: var(--primary);
+}
+
+.stat-label {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.servers-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1rem;
+}
+
+.server-card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 1.25rem;
+    border: 1px solid var(--border);
+    transition: all 0.2s;
+}
+
+.server-card:hover {
+    border-color: var(--primary);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.server-card.disabled {
+    opacity: 0.6;
+}
+
+.server-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.server-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-online {
+    background: #22c55e;
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
+}
+
+.status-offline {
+    background: #ef4444;
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+}
+
+.status-disabled {
+    background: #6b7280;
+}
+
+.server-name {
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.server-info {
+    margin-bottom: 1rem;
+}
+
+.info-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.25rem 0;
+    font-size: 0.9rem;
+}
+
+.info-label {
+    color: var(--text-muted);
+}
+
+.info-value {
+    font-family: monospace;
+}
+
+.check-mark {
+    color: #22c55e;
+    margin-left: 0.25rem;
+}
+
+.cross-mark {
+    color: #ef4444;
+    margin-left: 0.25rem;
+}
+
+.server-error {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+    padding: 0.5rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+}
+
+.server-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.server-actions .btn {
+    flex: 1;
+    min-width: 80px;
+}
+
+.badge-info {
+    background: #3b82f6;
+    color: white;
+}
+
+.clients-count {
+    font-weight: 600;
+    color: var(--primary);
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.spinning {
+    animation: spin 1s linear infinite;
+    display: inline-block;
+}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOT = '{{ request.app.root_path }}';
+
+async function refreshAll() {
+    const icon = document.getElementById('refreshIcon');
+    icon.classList.add('spinning');
+
+    try {
+        const resp = await fetch(ROOT + '/servers/status');
+        const data = await resp.json();
+
+        // Обновляем карточки серверов
+        data.servers.forEach(server => {
+            const card = document.querySelector(`.server-card[data-name="${server.name}"]`);
+            if (card) {
+                // Обновляем статус
+                const statusDot = card.querySelector('.status-dot');
+                statusDot.className = 'status-dot';
+                if (!server.enabled) {
+                    statusDot.classList.add('status-disabled');
+                } else if (server.port_open || server.panel_available) {
+                    statusDot.classList.add('status-online');
+                } else {
+                    statusDot.classList.add('status-offline');
+                }
+
+                // Обновляем количество клиентов
+                const clientsEl = card.querySelector('.clients-count');
+                if (clientsEl) clientsEl.textContent = server.clients;
+            }
+        });
+    } catch (e) {
+        console.error('Error refreshing:', e);
+    }
+
+    icon.classList.remove('spinning');
+}
+
+async function toggleActive(name) {
+    const resp = await fetch(ROOT + '/servers/' + encodeURIComponent(name) + '/toggle', {
+        method: 'POST'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка');
+    }
+}
+
+async function enableServer(name) {
+    const resp = await fetch(ROOT + '/servers/' + encodeURIComponent(name) + '/enable', {
+        method: 'POST'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    }
+}
+
+async function disableServer(name) {
+    if (!confirm('Отключить сервер ' + name + '?')) return;
+
+    const resp = await fetch(ROOT + '/servers/' + encodeURIComponent(name) + '/disable', {
+        method: 'POST'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    }
+}
+
+async function checkServer(name) {
+    const card = document.querySelector(`.server-card[data-name="${name}"]`);
+    const btn = card.querySelector('button[onclick*="checkServer"]');
+    btn.disabled = true;
+    btn.textContent = '⏳...';
+
+    try {
+        const resp = await fetch(ROOT + '/servers/' + encodeURIComponent(name) + '/check');
+        const server = await resp.json();
+
+        // Обновляем статус
+        const statusDot = card.querySelector('.status-dot');
+        statusDot.className = 'status-dot';
+        if (!server.enabled) {
+            statusDot.classList.add('status-disabled');
+        } else if (server.port_open || server.panel_available) {
+            statusDot.classList.add('status-online');
+        } else {
+            statusDot.classList.add('status-offline');
+        }
+
+        // Обновляем клиентов
+        const clientsEl = card.querySelector('.clients-count');
+        if (clientsEl) clientsEl.textContent = server.clients;
+
+        btn.textContent = '✓ OK';
+        setTimeout(() => { btn.textContent = '🔍 Проверить'; btn.disabled = false; }, 1500);
+
+    } catch (e) {
+        btn.textContent = '❌ Ошибка';
+        setTimeout(() => { btn.textContent = '🔍 Проверить'; btn.disabled = false; }, 1500);
+    }
+}
+
+// Автообновление каждые 30 секунд
+setInterval(refreshAll, 30000);
+</script>
+{% endblock %}

@@ -1,0 +1,365 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <div class="breadcrumb">
+        <a href="{{ request.app.root_path }}/keys">Ключи</a>
+        <span>/</span>
+        <span>Создать ключ</span>
+    </div>
+</div>
+
+<div class="create-form-container">
+    <div class="card">
+        <h2>Создание нового ключа</h2>
+
+        <form id="createKeyForm" class="create-form">
+            <div class="form-group">
+                <label for="client_name">Имя клиента / Email</label>
+                <input type="text" id="client_name" name="client_name" required
+                       placeholder="Например: user@example.com или Имя клиента">
+            </div>
+
+            <div class="form-group">
+                <label for="server_name">Сервер</label>
+                <select id="server_name" name="server_name" required>
+                    <option value="">Выберите сервер</option>
+                    {% for server in servers %}
+                    <option value="{{ server.name }}"
+                            data-inbounds='{{ server.inbounds | tojson }}'
+                            {% if server.active_for_new %}class="active-server"{% endif %}>
+                        {{ server.name }}
+                        {% if server.active_for_new %}(активен){% endif %}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="form-group" id="inboundGroup" style="display: none;">
+                <label for="inbound_name">Inbound</label>
+                <select id="inbound_name" name="inbound_name">
+                    <option value="main">Main</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Период подписки</label>
+                <div class="period-cards">
+                    {% for key, period in prices.items() %}
+                    <label class="period-card">
+                        <input type="radio" name="period" value="{{ key }}"
+                               {% if key == '1_month' %}checked{% endif %}>
+                        <div class="period-content">
+                            <div class="period-name">{{ period.name }}</div>
+                            <div class="period-price">{{ period.price }} ₽</div>
+                            <div class="period-days">{{ period.days }} дней</div>
+                        </div>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <div class="form-actions">
+                <a href="{{ request.app.root_path }}/keys" class="btn btn-secondary">Отмена</a>
+                <button type="submit" class="btn btn-primary" id="submitBtn">
+                    Создать ключ
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Результат создания -->
+    <div id="resultCard" class="card result-card" style="display: none;">
+        <h3>Ключ создан успешно!</h3>
+
+        <div class="result-info">
+            <div class="result-row">
+                <span class="result-label">Сервер:</span>
+                <span id="resultServer" class="result-value"></span>
+            </div>
+            <div class="result-row">
+                <span class="result-label">Период:</span>
+                <span id="resultPeriod" class="result-value"></span>
+            </div>
+            <div class="result-row">
+                <span class="result-label">UUID:</span>
+                <span id="resultUuid" class="result-value mono"></span>
+            </div>
+        </div>
+
+        <div class="vless-block">
+            <label>VLESS ключ:</label>
+            <div class="vless-url">
+                <code id="resultVless"></code>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="copyVless()">
+                    Копировать
+                </button>
+            </div>
+        </div>
+
+        <div class="result-actions">
+            <a id="viewKeyLink" href="#" class="btn btn-primary">Открыть ключ</a>
+            <button type="button" class="btn btn-secondary" onclick="resetForm()">
+                Создать ещё
+            </button>
+        </div>
+    </div>
+</div>
+
+<style>
+.create-form-container {
+    max-width: 700px;
+}
+
+.create-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.form-group label {
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.form-group input,
+.form-group select {
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card-bg);
+    color: var(--text);
+    font-size: 1rem;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.period-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1rem;
+}
+
+.period-card {
+    cursor: pointer;
+}
+
+.period-card input {
+    display: none;
+}
+
+.period-content {
+    padding: 1rem;
+    border: 2px solid var(--border);
+    border-radius: 12px;
+    text-align: center;
+    transition: all 0.2s;
+}
+
+.period-card input:checked + .period-content {
+    border-color: var(--primary);
+    background: rgba(99, 102, 241, 0.1);
+}
+
+.period-card:hover .period-content {
+    border-color: var(--primary);
+}
+
+.period-name {
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+}
+
+.period-price {
+    font-size: 1.25rem;
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.period-days {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.form-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: flex-end;
+    margin-top: 1rem;
+}
+
+.result-card {
+    margin-top: 1.5rem;
+    border: 2px solid #22c55e;
+}
+
+.result-card h3 {
+    color: #22c55e;
+    margin-bottom: 1rem;
+}
+
+.result-info {
+    margin-bottom: 1.5rem;
+}
+
+.result-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.result-label {
+    color: var(--text-muted);
+}
+
+.result-value {
+    font-weight: 500;
+}
+
+.result-value.mono {
+    font-family: monospace;
+    font-size: 0.9rem;
+}
+
+.vless-block {
+    margin-bottom: 1.5rem;
+}
+
+.vless-block label {
+    display: block;
+    margin-bottom: 0.5rem;
+    color: var(--text-muted);
+}
+
+.vless-url {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+}
+
+.vless-url code {
+    flex: 1;
+    padding: 0.75rem;
+    background: rgba(0,0,0,0.2);
+    border-radius: 8px;
+    word-break: break-all;
+    font-size: 0.85rem;
+    max-height: 100px;
+    overflow-y: auto;
+}
+
+.result-actions {
+    display: flex;
+    gap: 1rem;
+}
+
+.breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-muted);
+}
+
+.breadcrumb a {
+    color: var(--primary);
+    text-decoration: none;
+}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOT = '{{ request.app.root_path }}';
+
+document.getElementById('server_name').addEventListener('change', function() {
+    const option = this.options[this.selectedIndex];
+    const inboundsData = option.getAttribute('data-inbounds');
+    const inboundGroup = document.getElementById('inboundGroup');
+    const inboundSelect = document.getElementById('inbound_name');
+
+    if (inboundsData) {
+        try {
+            const inbounds = JSON.parse(inboundsData);
+            inboundSelect.innerHTML = '';
+
+            for (const [key, inbound] of Object.entries(inbounds)) {
+                const opt = document.createElement('option');
+                opt.value = key;
+                opt.textContent = inbound.name_prefix || key;
+                inboundSelect.appendChild(opt);
+            }
+
+            if (Object.keys(inbounds).length > 1) {
+                inboundGroup.style.display = 'flex';
+            } else {
+                inboundGroup.style.display = 'none';
+            }
+        } catch (e) {
+            console.error('Error parsing inbounds:', e);
+        }
+    }
+});
+
+document.getElementById('createKeyForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+
+    const submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Создание...';
+
+    const formData = new FormData(this);
+
+    try {
+        const resp = await fetch(ROOT + '/keys/create', {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await resp.json();
+
+        if (data.success) {
+            // Показываем результат
+            document.getElementById('resultServer').textContent = data.server;
+            document.getElementById('resultPeriod').textContent = data.period;
+            document.getElementById('resultUuid').textContent = data.client_id;
+            document.getElementById('resultVless').textContent = data.vless_url || 'N/A';
+            document.getElementById('viewKeyLink').href = ROOT + '/keys/' + data.key_id;
+
+            document.getElementById('resultCard').style.display = 'block';
+            this.style.display = 'none';
+        } else {
+            alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+        }
+    } catch (e) {
+        alert('Ошибка сети: ' + e.message);
+    }
+
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Создать ключ';
+});
+
+function copyVless() {
+    const vless = document.getElementById('resultVless').textContent;
+    navigator.clipboard.writeText(vless).then(() => {
+        alert('Скопировано!');
+    });
+}
+
+function resetForm() {
+    document.getElementById('createKeyForm').reset();
+    document.getElementById('createKeyForm').style.display = 'flex';
+    document.getElementById('resultCard').style.display = 'none';
+}
+</script>
+{% endblock %}

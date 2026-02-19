@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Менеджеры</h1>
+    <button class="btn btn-primary" onclick="showAddModal()">+ Добавить</button>
+</div>
+
+<div class="card">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Имя</th>
+                <th>Ключей</th>
+                <th>Сегодня</th>
+                <th>Выручка</th>
+                <th>Статус</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in managers %}
+            <tr data-id="{{ m.user_id }}">
+                <td>
+                    <a href="{{ request.app.root_path }}/managers/{{ m.user_id }}" class="link">
+                        {{ m.user_id }}
+                    </a>
+                </td>
+                <td>
+                    <span class="manager-name">{{ m.custom_name or m.full_name or m.username or 'Без имени' }}</span>
+                    {% if m.username %}
+                    <small class="text-muted">@{{ m.username }}</small>
+                    {% endif %}
+                </td>
+                <td>{{ m.keys_count }}</td>
+                <td>{{ m.keys_today }}</td>
+                <td>{{ '{:,.0f}'.format(m.total_revenue) }} ₽</td>
+                <td>
+                    <span class="badge {% if m.is_active %}badge-success{% else %}badge-danger{% endif %}">
+                        {{ 'Активен' if m.is_active else 'Заблокирован' }}
+                    </span>
+                </td>
+                <td class="actions">
+                    <button class="btn btn-sm btn-icon" onclick="toggleManager({{ m.user_id }})" title="{{ 'Заблокировать' if m.is_active else 'Разблокировать' }}">
+                        {% if m.is_active %}🔒{% else %}🔓{% endif %}
+                    </button>
+                    <button class="btn btn-sm btn-icon" onclick="showRenameModal({{ m.user_id }}, '{{ m.custom_name or '' }}')" title="Переименовать">
+                        ✏️
+                    </button>
+                    <button class="btn btn-sm btn-icon btn-danger" onclick="deleteManager({{ m.user_id }})" title="Удалить">
+                        🗑️
+                    </button>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="7" class="text-center text-muted">Нет менеджеров</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Modal: Добавить менеджера -->
+<div id="addModal" class="modal" style="display:none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Добавить менеджера</h3>
+            <button class="modal-close" onclick="closeModal('addModal')">&times;</button>
+        </div>
+        <form id="addForm" onsubmit="addManager(event)">
+            <div class="form-group">
+                <label>Telegram ID</label>
+                <input type="number" name="user_id" required placeholder="123456789">
+            </div>
+            <div class="form-group">
+                <label>Имя (необязательно)</label>
+                <input type="text" name="custom_name" placeholder="Иван">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('addModal')">Отмена</button>
+                <button type="submit" class="btn btn-primary">Добавить</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: Переименовать -->
+<div id="renameModal" class="modal" style="display:none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Переименовать менеджера</h3>
+            <button class="modal-close" onclick="closeModal('renameModal')">&times;</button>
+        </div>
+        <form id="renameForm" onsubmit="renameManager(event)">
+            <input type="hidden" name="user_id" id="rename_user_id">
+            <div class="form-group">
+                <label>Новое имя</label>
+                <input type="text" name="custom_name" id="rename_name" placeholder="Новое имя">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('renameModal')">Отмена</button>
+                <button type="submit" class="btn btn-primary">Сохранить</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOT = '{{ request.app.root_path }}';
+
+function showAddModal() {
+    document.getElementById('addModal').style.display = 'flex';
+}
+
+function showRenameModal(userId, currentName) {
+    document.getElementById('rename_user_id').value = userId;
+    document.getElementById('rename_name').value = currentName;
+    document.getElementById('renameModal').style.display = 'flex';
+}
+
+function closeModal(id) {
+    document.getElementById(id).style.display = 'none';
+}
+
+async function addManager(e) {
+    e.preventDefault();
+    const form = e.target;
+    const formData = new FormData(form);
+
+    const resp = await fetch(ROOT + '/managers/add', {
+        method: 'POST',
+        body: formData
+    });
+    const data = await resp.json();
+
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка');
+    }
+}
+
+async function toggleManager(userId) {
+    const resp = await fetch(ROOT + '/managers/' + userId + '/toggle', {
+        method: 'POST'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    }
+}
+
+async function renameManager(e) {
+    e.preventDefault();
+    const form = e.target;
+    const userId = document.getElementById('rename_user_id').value;
+    const formData = new FormData(form);
+
+    const resp = await fetch(ROOT + '/managers/' + userId + '/rename', {
+        method: 'POST',
+        body: formData
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    }
+}
+
+async function deleteManager(userId) {
+    if (!confirm('Удалить менеджера? Это не удалит его ключи.')) return;
+
+    const resp = await fetch(ROOT + '/managers/' + userId, {
+        method: 'DELETE'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    }
+}
+
+// Закрытие модалки при клике вне её
+document.querySelectorAll('.modal').forEach(modal => {
+    modal.onclick = function(e) {
+        if (e.target === modal) closeModal(modal.id);
+    };
+});
+</script>
+{% endblock %}

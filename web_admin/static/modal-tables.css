@@ -1,0 +1,23 @@
+#inboundsModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#clientModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#trafficModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#addSubModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#serverModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#modal-bg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#editModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#subsInfoModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn,
+#promoModalBg.modal-bg[style*="block"] ~ .main-content .mobile-menu-btn {
+    display: none !important;
+}
+
+.main-content:has(#inboundsModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#clientModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#trafficModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#addSubModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#serverModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#modal-bg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#editModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#subsInfoModalBg[style*="block"]) .mobile-menu-btn,
+.main-content:has(#promoModalBg[style*="block"]) .mobile-menu-btn {
+    display: none !important;
+}
