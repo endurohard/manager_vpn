@@ -598,9 +598,9 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
         # Ссылка подписки
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
 
-        # QR код
+        # QR код для ссылки подписки
         try:
-            qr_code = generate_qr_code(vless_link_for_user)
+            qr_code = generate_qr_code(subscription_url)
             await callback.message.answer_photo(
                 BufferedInputFile(qr_code.read(), filename="qrcode.png"),
                 caption=(

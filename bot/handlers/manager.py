@@ -790,9 +790,9 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         # Формируем ссылку подписки
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
 
-        # Генерируем QR код для ссылки с ДОМЕНОМ (для пользователя)
+        # Генерируем QR код для ссылки подписки (автообновление)
         try:
-            qr_code = generate_qr_code(vless_link_for_user)
+            qr_code = generate_qr_code(subscription_url)
 
             # Отправляем QR код
             await callback.message.answer_photo(
@@ -804,7 +804,7 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     f"💰 Стоимость: {period_price} ₽\n"
                     f"🌐 Лимит IP: 2\n"
                     f"📊 Трафик: безлимит\n\n"
-                    f"📱 Отсканируйте QR код в приложении VPN"
+                    f"📱 Отсканируйте QR код подписки в приложении VPN"
                 )
             )
 
@@ -1291,9 +1291,9 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
         # Формируем ссылку подписки
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
 
-        # Генерируем QR код
+        # Генерируем QR код для ссылки подписки
         try:
-            qr_code = generate_qr_code(vless_link_for_user)
+            qr_code = generate_qr_code(subscription_url)
 
             await callback.message.answer_photo(
                 BufferedInputFile(qr_code.read(), filename="qrcode.png"),
@@ -1303,7 +1303,7 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
                     f"⏰ Срок действия: {period_name}\n"
                     f"🌐 Лимит IP: 2\n"
                     f"📊 Трафик: безлимит\n\n"
-                    f"📱 Отсканируйте QR код в приложении VPN"
+                    f"📱 Отсканируйте QR код подписки в приложении VPN"
                 )
             )
 
