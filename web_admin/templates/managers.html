@@ -15,6 +15,8 @@
                 <th>Ключей</th>
                 <th>Сегодня</th>
                 <th>Выручка</th>
+                <th>Долг</th>
+                <th>Прибыль</th>
                 <th>Статус</th>
                 <th>Действия</th>
             </tr>
@@ -36,6 +38,8 @@
                 <td>{{ m.keys_count }}</td>
                 <td>{{ m.keys_today }}</td>
                 <td>{{ '{:,.0f}'.format(m.total_revenue) }} ₽</td>
+                <td style="color: #e74c3c;">{{ '{:,.0f}'.format(m.total_debt) }} ₽</td>
+                <td style="color: {% if m.manager_profit >= 0 %}#27ae60{% else %}#e74c3c{% endif %};">{{ '{:,.0f}'.format(m.manager_profit) }} ₽</td>
                 <td>
                     <span class="badge {% if m.is_active %}badge-success{% else %}badge-danger{% endif %}">
                         {{ 'Активен' if m.is_active else 'Заблокирован' }}
@@ -55,7 +59,7 @@
             </tr>
             {% else %}
             <tr>
-                <td colspan="7" class="text-center text-muted">Нет менеджеров</td>
+                <td colspan="9" class="text-center text-muted">Нет менеджеров</td>
             </tr>
             {% endfor %}
         </tbody>

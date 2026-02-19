@@ -7,6 +7,8 @@ from fastapi import APIRouter, Request, Form, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from web_admin.routes.settings import load_prices
+
 managers_router = APIRouter()
 templates: Jinja2Templates = None
 
@@ -16,11 +18,22 @@ def setup_managers_router(tpl: Jinja2Templates):
     templates = tpl
 
 
+def _build_global_cost_map() -> dict:
+    """Построить маппинг expire_days → global price из prices.json"""
+    prices = load_prices()
+    cost_map = {}
+    for period_key, info in prices.items():
+        cost_map[info['days']] = info['price']
+    return cost_map
+
+
 @managers_router.get('/managers', response_class=HTMLResponse)
 async def managers_list(request: Request):
     """Список всех менеджеров"""
     db_path = request.app.state.db_path
     root_path = request.app.root_path
+
+    global_cost_map = _build_global_cost_map()
 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -39,13 +52,39 @@ async def managers_list(request: Request):
         ''')
         managers = [dict(row) for row in await cursor.fetchall()]
 
-        # Статистика за сегодня для каждого
         for manager in managers:
+            uid = manager['user_id']
+
+            # Статистика за сегодня
             cursor = await db.execute('''
                 SELECT COUNT(*) FROM keys_history
                 WHERE manager_id = ? AND DATE(created_at) = DATE('now')
-            ''', (manager['user_id'],))
+            ''', (uid,))
             manager['keys_today'] = (await cursor.fetchone())[0]
+
+            # Себестоимости менеджера
+            cursor = await db.execute(
+                'SELECT expire_days, cost_price FROM manager_prices WHERE manager_id = ?',
+                (uid,)
+            )
+            mp_map = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # Долг: SUM(cost_price * count) по каждому expire_days
+            cursor = await db.execute('''
+                SELECT expire_days, COUNT(*) as cnt
+                FROM keys_history
+                WHERE manager_id = ?
+                GROUP BY expire_days
+            ''', (uid,))
+            debt = 0
+            for row in await cursor.fetchall():
+                ed = row[0] or 0
+                cnt = row[1]
+                cp = mp_map.get(ed, global_cost_map.get(ed, 0))
+                debt += cp * cnt
+
+            manager['total_debt'] = debt
+            manager['manager_profit'] = manager['total_revenue'] - debt
 
     return templates.TemplateResponse('managers.html', {
         'request': request,
@@ -142,6 +181,28 @@ async def delete_manager(request: Request, user_id: int):
     return JSONResponse({'success': True})
 
 
+@managers_router.post('/managers/{user_id}/prices')
+async def update_manager_prices(request: Request, user_id: int):
+    """Upsert себестоимостей менеджера"""
+    db_path = request.app.state.db_path
+    data = await request.json()
+    prices_list = data.get('prices', [])
+
+    async with aiosqlite.connect(db_path) as db:
+        for item in prices_list:
+            expire_days = int(item['expire_days'])
+            cost_price = int(item['cost_price'])
+            await db.execute('''
+                INSERT INTO manager_prices (manager_id, expire_days, cost_price, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(manager_id, expire_days)
+                DO UPDATE SET cost_price = excluded.cost_price, updated_at = CURRENT_TIMESTAMP
+            ''', (user_id, expire_days, cost_price))
+        await db.commit()
+
+    return JSONResponse({'success': True})
+
+
 @managers_router.get('/managers/{user_id}', response_class=HTMLResponse)
 async def manager_detail(request: Request, user_id: int):
     """Детальная страница менеджера"""
@@ -197,15 +258,50 @@ async def manager_detail(request: Request, user_id: int):
         ''', (user_id,))
         recent_keys = [dict(row) for row in await cursor.fetchall()]
 
-        # Статистика по периодам подписки
+        # Статистика по периодам подписки (с expire_days для JOIN)
         cursor = await db.execute('''
-            SELECT period, COUNT(*) as count, COALESCE(SUM(price), 0) as revenue
+            SELECT period, expire_days, COUNT(*) as count, COALESCE(SUM(price), 0) as revenue
             FROM keys_history
             WHERE manager_id = ?
-            GROUP BY period
+            GROUP BY period, expire_days
             ORDER BY count DESC
         ''', (user_id,))
         periods_stats = [dict(row) for row in await cursor.fetchall()]
+
+        # Загружаем себестоимости менеджера
+        cursor = await db.execute(
+            'SELECT expire_days, cost_price FROM manager_prices WHERE manager_id = ?',
+            (user_id,)
+        )
+        manager_prices_rows = await cursor.fetchall()
+        manager_prices_map = {row[0]: row[1] for row in manager_prices_rows}
+
+    # Глобальные цены как fallback
+    global_cost_map = _build_global_cost_map()
+
+    # Обогащаем periods_stats колонками cost_price / debt
+    debt_total = 0
+    for p in periods_stats:
+        ed = p.get('expire_days') or 0
+        cp = manager_prices_map.get(ed, global_cost_map.get(ed, 0))
+        p['cost_price'] = cp
+        p['debt'] = cp * p['count']
+        debt_total += p['debt']
+
+    manager_profit = stats['total_revenue'] - debt_total
+
+    # Формируем данные для отображения цен в форме
+    global_prices = load_prices()
+    manager_prices_display = []
+    for period_key, info in global_prices.items():
+        days = info['days']
+        manager_prices_display.append({
+            'period_key': period_key,
+            'name': info['name'],
+            'days': days,
+            'global_price': info['price'],
+            'cost_price': manager_prices_map.get(days, ''),
+        })
 
     return templates.TemplateResponse('manager_detail.html', {
         'request': request,
@@ -213,5 +309,8 @@ async def manager_detail(request: Request, user_id: int):
         'stats': stats,
         'recent_keys': recent_keys,
         'periods_stats': periods_stats,
+        'manager_prices_display': manager_prices_display,
+        'debt_total': debt_total,
+        'manager_profit': manager_profit,
         'active': 'managers'
     })

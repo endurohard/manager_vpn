@@ -125,6 +125,20 @@ class DatabaseManager:
             ''')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_linked_clients_master ON linked_clients(master_uuid)')
 
+            # Таблица себестоимостей менеджеров
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS manager_prices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manager_id INTEGER NOT NULL,
+                    expire_days INTEGER NOT NULL,
+                    cost_price INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (manager_id) REFERENCES managers(user_id),
+                    UNIQUE(manager_id, expire_days)
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_prices_manager ON manager_prices(manager_id)')
+
             logger.info("Индексы базы данных созданы/проверены")
 
             await db.commit()

@@ -54,9 +54,33 @@
         <div class="stat-value">{{ '{:,.0f}'.format(stats.total_revenue) }} ₽</div>
         <div class="stat-label">Выручка</div>
     </div>
+    <div class="stat-card stat-debt">
+        <div class="stat-value">{{ '{:,.0f}'.format(debt_total) }} ₽</div>
+        <div class="stat-label">Должен мне</div>
+    </div>
+    <div class="stat-card {% if manager_profit >= 0 %}stat-profit{% else %}stat-debt{% endif %}">
+        <div class="stat-value">{{ '{:,.0f}'.format(manager_profit) }} ₽</div>
+        <div class="stat-label">Прибыль</div>
+    </div>
 </div>
 
 <div class="content-grid">
+    <!-- Себестоимости -->
+    <div class="card">
+        <h3>Себестоимости</h3>
+        <form id="costPricesForm" class="cost-prices-form">
+            {% for mp in manager_prices_display %}
+            <div class="form-group cost-row">
+                <label>{{ mp.name }} ({{ mp.days }} дн.)</label>
+                <input type="number" name="cost_{{ mp.days }}" data-days="{{ mp.days }}"
+                       value="{{ mp.cost_price }}" placeholder="{{ mp.global_price }}" min="0" class="cost-input">
+                <small class="text-muted">Глобальная: {{ mp.global_price }} ₽</small>
+            </div>
+            {% endfor %}
+            <button type="submit" class="btn btn-primary btn-sm" style="margin-top: 0.5rem; width: 100%;">Сохранить</button>
+        </form>
+    </div>
+
     <!-- Статистика по периодам -->
     <div class="card">
         <h3>По тарифам</h3>
@@ -66,6 +90,8 @@
                     <th>Период</th>
                     <th>Ключей</th>
                     <th>Выручка</th>
+                    <th>Себест.</th>
+                    <th>Долг</th>
                 </tr>
             </thead>
             <tbody>
@@ -74,10 +100,12 @@
                     <td>{{ p.period }}</td>
                     <td>{{ p.count }}</td>
                     <td>{{ '{:,.0f}'.format(p.revenue) }} ₽</td>
+                    <td>{{ '{:,.0f}'.format(p.cost_price) }} ₽</td>
+                    <td>{{ '{:,.0f}'.format(p.debt) }} ₽</td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="3" class="text-center text-muted">Нет данных</td>
+                    <td colspan="5" class="text-center text-muted">Нет данных</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -194,9 +222,43 @@
     font-size: 0.85rem;
 }
 
+.stat-debt .stat-value {
+    color: #e74c3c;
+}
+
+.stat-profit .stat-value {
+    color: #27ae60;
+}
+
+.cost-prices-form .cost-row {
+    margin-bottom: 0.75rem;
+}
+
+.cost-prices-form label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-weight: 500;
+    font-size: 0.9rem;
+}
+
+.cost-input {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.95rem;
+}
+
+.cost-input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
 .content-grid {
     display: grid;
-    grid-template-columns: 1fr 2fr;
+    grid-template-columns: 1fr 1fr 2fr;
     gap: 1rem;
 }
 
@@ -204,7 +266,13 @@
     grid-column: span 1;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
+    .content-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+@media (max-width: 700px) {
     .content-grid {
         grid-template-columns: 1fr;
     }
@@ -226,4 +294,38 @@
     text-decoration: underline;
 }
 </style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ROOT = '{{ request.app.root_path }}';
+const MANAGER_ID = {{ manager.user_id }};
+
+document.getElementById('costPricesForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const inputs = this.querySelectorAll('.cost-input');
+    const prices = [];
+    inputs.forEach(input => {
+        const val = input.value.trim();
+        if (val !== '') {
+            prices.push({
+                expire_days: parseInt(input.dataset.days),
+                cost_price: parseInt(val)
+            });
+        }
+    });
+
+    const resp = await fetch(ROOT + '/managers/' + MANAGER_ID + '/prices', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prices: prices})
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка сохранения');
+    }
+});
+</script>
 {% endblock %}

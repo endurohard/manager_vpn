@@ -9,7 +9,7 @@ from aiogram.types import (
     WebAppInfo
 )
 from bot.price_config import get_subscription_periods
-from bot.config import WEBAPP_URL
+from bot.config import WEBAPP_URL, ADMIN_PANEL_URL
 
 
 class Keyboards:
@@ -47,6 +47,7 @@ class Keyboards:
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
             [KeyboardButton(text="📡 Добавить сервер")],
             [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
+            [KeyboardButton(text="🌐 Админ-панель сайта")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(
