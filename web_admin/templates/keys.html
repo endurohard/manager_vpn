@@ -13,10 +13,15 @@
 <div class="search-row">
     <form method="get" class="search-form">
         <input type="text" name="search" value="{{ search }}" placeholder="Поиск по email, телефону, UUID..." class="search-input">
+        <input type="hidden" name="sort" value="{{ sort }}">
         <button type="submit" class="btn btn-primary">Найти</button>
         {% if search %}
-        <a href="{{ request.app.root_path }}/keys" class="btn btn-secondary">Сбросить</a>
+        <a href="{{ request.app.root_path }}/keys{% if sort != 'newest' %}?sort={{ sort }}{% endif %}" class="btn btn-secondary">Сбросить</a>
         {% endif %}
+        <select id="sort-select" class="sort-select">
+            <option value="newest" {% if sort == 'newest' %}selected{% endif %}>Новые первыми</option>
+            <option value="expiring" {% if sort == 'expiring' %}selected{% endif %}>Заканчиваются первыми</option>
+        </select>
     </form>
 </div>
 
@@ -81,7 +86,7 @@
 {% if total_pages > 1 %}
 <div class="pagination">
     {% if page > 1 %}
-    <a href="?page={{ page - 1 }}{% if search %}&search={{ search }}{% endif %}" class="page-link">← Назад</a>
+    <a href="?page={{ page - 1 }}{% if search %}&search={{ search }}{% endif %}{% if sort != 'newest' %}&sort={{ sort }}{% endif %}" class="page-link">← Назад</a>
     {% endif %}
 
     {% for p in pages %}
@@ -90,12 +95,12 @@
         {% elif p == page %}
         <span class="page-link active">{{ p }}</span>
         {% else %}
-        <a href="?page={{ p }}{% if search %}&search={{ search }}{% endif %}" class="page-link">{{ p }}</a>
+        <a href="?page={{ p }}{% if search %}&search={{ search }}{% endif %}{% if sort != 'newest' %}&sort={{ sort }}{% endif %}" class="page-link">{{ p }}</a>
         {% endif %}
     {% endfor %}
 
     {% if page < total_pages %}
-    <a href="?page={{ page + 1 }}{% if search %}&search={{ search }}{% endif %}" class="page-link">Вперёд →</a>
+    <a href="?page={{ page + 1 }}{% if search %}&search={{ search }}{% endif %}{% if sort != 'newest' %}&sort={{ sort }}{% endif %}" class="page-link">Вперёд →</a>
     {% endif %}
 </div>
 {% endif %}
@@ -206,5 +211,23 @@ code.uuid {
     padding: 8px;
     color: #888;
 }
+.sort-select {
+    padding: 8px 12px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #2a2a2a;
+    color: #fff;
+    cursor: pointer;
+    margin-left: auto;
+}
 </style>
+
+<script>
+document.getElementById('sort-select').addEventListener('change', function() {
+    var params = new URLSearchParams(window.location.search);
+    params.set('sort', this.value);
+    params.delete('page');
+    window.location.search = params.toString();
+});
+</script>
 {% endblock %}

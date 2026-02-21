@@ -50,6 +50,12 @@ class DatabaseManager:
             except Exception:
                 pass  # Колонка уже существует
 
+            # Добавляем колонку expiry_notified для отслеживания уведомлений об истечении
+            try:
+                await db.execute('ALTER TABLE keys_history ADD COLUMN expiry_notified INTEGER DEFAULT 0')
+            except Exception:
+                pass  # Колонка уже существует
+
             # Добавляем колонку custom_name для пользовательских имен менеджеров
             try:
                 await db.execute('ALTER TABLE managers ADD COLUMN custom_name TEXT')
@@ -138,6 +144,19 @@ class DatabaseManager:
                 )
             ''')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_prices_manager ON manager_prices(manager_id)')
+
+            # Таблица оплат менеджеров
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS manager_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manager_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    note TEXT,
+                    FOREIGN KEY (manager_id) REFERENCES managers(user_id)
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_payments_manager ON manager_payments(manager_id)')
 
             logger.info("Индексы базы данных созданы/проверены")
 

@@ -76,15 +76,23 @@ async def managers_list(request: Request):
                 WHERE manager_id = ?
                 GROUP BY expire_days
             ''', (uid,))
-            debt = 0
+            gross_debt = 0
             for row in await cursor.fetchall():
                 ed = row[0] or 0
                 cnt = row[1]
                 cp = mp_map.get(ed, global_cost_map.get(ed, 0))
-                debt += cp * cnt
+                gross_debt += cp * cnt
 
-            manager['total_debt'] = debt
-            manager['manager_profit'] = manager['total_revenue'] - debt
+            # Сумма оплат
+            cursor = await db.execute(
+                'SELECT COALESCE(SUM(amount), 0) FROM manager_payments WHERE manager_id = ?',
+                (uid,)
+            )
+            total_paid = (await cursor.fetchone())[0]
+
+            manager['total_debt'] = gross_debt - total_paid
+            manager['total_paid'] = total_paid
+            manager['manager_profit'] = manager['total_revenue'] - gross_debt
 
     return templates.TemplateResponse('managers.html', {
         'request': request,
@@ -276,19 +284,31 @@ async def manager_detail(request: Request, user_id: int):
         manager_prices_rows = await cursor.fetchall()
         manager_prices_map = {row[0]: row[1] for row in manager_prices_rows}
 
+        # Оплаты менеджера
+        cursor = await db.execute('''
+            SELECT id, amount, paid_at, note
+            FROM manager_payments
+            WHERE manager_id = ?
+            ORDER BY paid_at DESC
+        ''', (user_id,))
+        payments = [dict(row) for row in await cursor.fetchall()]
+
+        total_paid = sum(p['amount'] for p in payments)
+
     # Глобальные цены как fallback
     global_cost_map = _build_global_cost_map()
 
     # Обогащаем periods_stats колонками cost_price / debt
-    debt_total = 0
+    gross_debt = 0
     for p in periods_stats:
         ed = p.get('expire_days') or 0
         cp = manager_prices_map.get(ed, global_cost_map.get(ed, 0))
         p['cost_price'] = cp
         p['debt'] = cp * p['count']
-        debt_total += p['debt']
+        gross_debt += p['debt']
 
-    manager_profit = stats['total_revenue'] - debt_total
+    current_debt = gross_debt - total_paid
+    manager_profit = stats['total_revenue'] - gross_debt
 
     # Формируем данные для отображения цен в форме
     global_prices = load_prices()
@@ -310,7 +330,153 @@ async def manager_detail(request: Request, user_id: int):
         'recent_keys': recent_keys,
         'periods_stats': periods_stats,
         'manager_prices_display': manager_prices_display,
-        'debt_total': debt_total,
+        'debt_total': current_debt,
+        'gross_debt': gross_debt,
+        'total_paid': total_paid,
+        'payments': payments,
         'manager_profit': manager_profit,
         'active': 'managers'
+    })
+
+
+@managers_router.post('/managers/{user_id}/payments')
+async def add_payment(request: Request, user_id: int):
+    """Записать оплату менеджера"""
+    db_path = request.app.state.db_path
+    data = await request.json()
+    amount = int(data.get('amount', 0))
+    note = data.get('note', '').strip()
+
+    if amount <= 0:
+        return JSONResponse({'success': False, 'error': 'Сумма должна быть больше 0'})
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            'INSERT INTO manager_payments (manager_id, amount, note) VALUES (?, ?, ?)',
+            (user_id, amount, note or None)
+        )
+        await db.commit()
+
+    return JSONResponse({'success': True})
+
+
+@managers_router.post('/managers/{user_id}/payments/reset')
+async def reset_debt(request: Request, user_id: int):
+    """Погасить весь оставшийся долг одной записью"""
+    db_path = request.app.state.db_path
+    global_cost_map = _build_global_cost_map()
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Себестоимости менеджера
+        cursor = await db.execute(
+            'SELECT expire_days, cost_price FROM manager_prices WHERE manager_id = ?',
+            (user_id,)
+        )
+        mp_map = {row[0]: row[1] for row in await cursor.fetchall()}
+
+        # Валовый долг
+        cursor = await db.execute('''
+            SELECT expire_days, COUNT(*) as cnt
+            FROM keys_history WHERE manager_id = ?
+            GROUP BY expire_days
+        ''', (user_id,))
+        gross_debt = 0
+        for row in await cursor.fetchall():
+            ed = row[0] or 0
+            cnt = row[1]
+            cp = mp_map.get(ed, global_cost_map.get(ed, 0))
+            gross_debt += cp * cnt
+
+        # Уже оплачено
+        cursor = await db.execute(
+            'SELECT COALESCE(SUM(amount), 0) FROM manager_payments WHERE manager_id = ?',
+            (user_id,)
+        )
+        total_paid = (await cursor.fetchone())[0]
+
+        remaining = gross_debt - total_paid
+        if remaining <= 0:
+            return JSONResponse({'success': False, 'error': 'Долг уже погашен'})
+
+        await db.execute(
+            'INSERT INTO manager_payments (manager_id, amount, note) VALUES (?, ?, ?)',
+            (user_id, remaining, 'Полное погашение долга')
+        )
+        await db.commit()
+
+    return JSONResponse({'success': True, 'amount': remaining})
+
+
+@managers_router.delete('/managers/{user_id}/payments/{payment_id}')
+async def delete_payment(request: Request, user_id: int, payment_id: int):
+    """Удалить запись об оплате"""
+    db_path = request.app.state.db_path
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            'SELECT id FROM manager_payments WHERE id = ? AND manager_id = ?',
+            (payment_id, user_id)
+        )
+        if not await cursor.fetchone():
+            return JSONResponse({'success': False, 'error': 'Оплата не найдена'})
+
+        await db.execute('DELETE FROM manager_payments WHERE id = ?', (payment_id,))
+        await db.commit()
+
+    return JSONResponse({'success': True})
+
+
+@managers_router.get('/managers/{user_id}/analytics')
+async def manager_analytics(
+    request: Request,
+    user_id: int,
+    group_by: str = Query('day', pattern='^(day|week|month)$'),
+    date_from: str = Query('', alias='from'),
+    date_to: str = Query('', alias='to')
+):
+    """Аналитика: ключи по дням/неделям/месяцам с фильтром дат"""
+    db_path = request.app.state.db_path
+
+    if group_by == 'day':
+        date_expr = "DATE(created_at)"
+    elif group_by == 'week':
+        date_expr = "DATE(created_at, 'weekday 0', '-6 days')"
+    else:
+        date_expr = "strftime('%Y-%m', created_at)"
+
+    conditions = ['manager_id = ?']
+    params = [user_id]
+
+    if date_from:
+        conditions.append("DATE(created_at) >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("DATE(created_at) <= ?")
+        params.append(date_to)
+
+    where = ' AND '.join(conditions)
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        query = f'''
+            SELECT {date_expr} as period,
+                   COUNT(*) as keys_count,
+                   COALESCE(SUM(price), 0) as revenue
+            FROM keys_history
+            WHERE {where}
+            GROUP BY {date_expr}
+            ORDER BY period DESC
+        '''
+        cursor = await db.execute(query, params)
+        rows = [dict(row) for row in await cursor.fetchall()]
+
+    total_keys = sum(r['keys_count'] for r in rows)
+    total_revenue = sum(r['revenue'] for r in rows)
+
+    return JSONResponse({
+        'rows': rows,
+        'total_keys': total_keys,
+        'total_revenue': total_revenue
     })

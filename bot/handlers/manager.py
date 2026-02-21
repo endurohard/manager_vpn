@@ -1734,8 +1734,9 @@ async def _execute_fix_key(message: Message, state: FSMContext, target_server: d
     new_query = '&'.join(params)
     fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
 
-    # Генерируем QR код
-    qr_code = generate_qr_code(fixed_link)
+    # Генерируем QR код для ссылки подписки (не для VLESS ключа)
+    subscription_url = f"https://zov-gor.ru/sub/{uuid_part}"
+    qr_code = generate_qr_code(subscription_url)
 
     # Формируем информацию об изменениях
     changes = []
@@ -1857,8 +1858,9 @@ async def _generate_fixed_link(message: Message, state: FSMContext, target_serve
     new_query = '&'.join(params)
     fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
 
-    # Генерируем QR код
-    qr_code = generate_qr_code(fixed_link)
+    # Генерируем QR код для ссылки подписки (не для VLESS ключа)
+    subscription_url = f"https://zov-gor.ru/sub/{uuid_part}"
+    qr_code = generate_qr_code(subscription_url)
 
     # Статус
     if found_on_server:

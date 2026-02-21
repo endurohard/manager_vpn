@@ -248,6 +248,118 @@ async def get_inbound_settings_from_panel(
         return None
 
 
+async def get_all_clients_from_panel(server_config: dict) -> list:
+    """
+    Получить список всех клиентов с панели сервера.
+
+    :param server_config: Конфигурация сервера из servers_config.json
+    :return: Список клиентов [{'email': ..., 'inbound_id': ...}, ...]
+    """
+    server_name = server_config.get('name', 'Unknown')
+    panel = server_config.get('panel', {})
+
+    if not panel:
+        logger.warning(f"Нет конфигурации панели для {server_name}")
+        return []
+
+    session = await _get_panel_opener(server_name)
+    if not session.get('logged_in'):
+        if not await _panel_login(server_config):
+            logger.warning(f"Не удалось авторизоваться в панели {server_name}")
+            return []
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        list_req = urllib.request.Request(list_url)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, opener.open, list_req)
+        data = json.loads(response.read().decode())
+
+        if not data.get('success'):
+            logger.warning(f"Ошибка получения inbounds с {server_name}")
+            return []
+
+        clients = []
+        for inbound in data.get('obj', []):
+            inbound_id = inbound.get('id')
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    email = client.get('email', '')
+                    if email:
+                        clients.append({
+                            'email': email,
+                            'inbound_id': inbound_id
+                        })
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        return clients
+
+    except Exception as e:
+        logger.error(f"Ошибка получения клиентов с {server_name}: {e}")
+        session['logged_in'] = False
+        return []
+
+
+async def reset_client_traffic_via_panel(server_config: dict, email: str, inbound_id: int = None) -> bool:
+    """
+    Сбросить трафик клиента через API панели X-UI.
+
+    POST /panel/api/inbounds/{inbound_id}/resetClientTraffic/{email}
+
+    :param server_config: Конфигурация сервера из servers_config.json
+    :param email: Email клиента
+    :param inbound_id: ID inbound (если не указан, используется из конфига)
+    :return: True если успешно
+    """
+    server_name = server_config.get('name', 'Unknown')
+    panel = server_config.get('panel', {})
+
+    if not panel:
+        logger.warning(f"Нет конфигурации панели для {server_name}")
+        return False
+
+    if inbound_id is None:
+        inbounds = server_config.get('inbounds', {})
+        main_inbound = inbounds.get('main', {})
+        inbound_id = main_inbound.get('id', 1)
+
+    session = await _get_panel_opener(server_name)
+    if not session.get('logged_in'):
+        if not await _panel_login(server_config):
+            logger.warning(f"Не удалось авторизоваться в панели {server_name}")
+            return False
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        reset_url = f"{base_url}/panel/api/inbounds/{inbound_id}/resetClientTraffic/{email}"
+        reset_req = urllib.request.Request(reset_url, method='POST')
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(None, opener.open, reset_req)
+        result = json.loads(resp.read())
+
+        if result.get('success'):
+            logger.debug(f"Трафик клиента {email} сброшен на {server_name}")
+            return True
+        else:
+            logger.error(f"Ошибка сброса трафика {email} на {server_name}: {result.get('msg')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Ошибка сброса трафика {email} на {server_name}: {e}")
+        session['logged_in'] = False
+        return False
+
+
 async def create_client_via_panel(
     server_config: dict,
     client_uuid: str,

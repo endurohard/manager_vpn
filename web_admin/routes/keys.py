@@ -352,12 +352,17 @@ def generate_vless_url(uuid: str, server: dict, inbound_name: str = 'main') -> s
 async def keys_list(
     request: Request,
     page: int = Query(1, ge=1),
-    search: str = Query('')
+    search: str = Query(''),
+    sort: str = Query('newest')
 ):
     """Список ключей из keys_history"""
     db_path = request.app.state.db_path
     limit = 25
     offset = (page - 1) * limit
+
+    # Валидация sort
+    if sort not in ('newest', 'expiring'):
+        sort = 'newest'
 
     base_query = '''
         SELECT kh.*, m.full_name as manager_name, m.custom_name
@@ -376,7 +381,10 @@ async def keys_list(
         count_query += where_clause
         params = [search_pattern, search_pattern, search_pattern]
 
-    base_query += ' ORDER BY kh.id DESC LIMIT ? OFFSET ?'
+    if sort == 'expiring':
+        base_query += " ORDER BY DATE(kh.created_at, '+' || kh.expire_days || ' days') ASC LIMIT ? OFFSET ?"
+    else:
+        base_query += ' ORDER BY kh.id DESC LIMIT ? OFFSET ?'
 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -435,6 +443,7 @@ async def keys_list(
         'total_pages': total_pages,
         'total': total,
         'search': search,
+        'sort': sort,
         'pages': pages,
         'active': 'keys'
     })

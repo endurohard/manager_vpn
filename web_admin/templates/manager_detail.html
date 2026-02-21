@@ -51,98 +51,202 @@
         <div class="stat-label">За месяц</div>
     </div>
     <div class="stat-card">
-        <div class="stat-value">{{ '{:,.0f}'.format(stats.total_revenue) }} ₽</div>
+        <div class="stat-value">{{ '{:,.0f}'.format(stats.total_revenue) }} &#8381;</div>
         <div class="stat-label">Выручка</div>
     </div>
     <div class="stat-card stat-debt">
-        <div class="stat-value">{{ '{:,.0f}'.format(debt_total) }} ₽</div>
-        <div class="stat-label">Должен мне</div>
+        <div class="stat-value">{{ '{:,.0f}'.format(debt_total) }} &#8381;</div>
+        <div class="stat-label">Текущий долг</div>
+    </div>
+    <div class="stat-card stat-paid">
+        <div class="stat-value">{{ '{:,.0f}'.format(total_paid) }} &#8381;</div>
+        <div class="stat-label">Оплачено</div>
     </div>
     <div class="stat-card {% if manager_profit >= 0 %}stat-profit{% else %}stat-debt{% endif %}">
-        <div class="stat-value">{{ '{:,.0f}'.format(manager_profit) }} ₽</div>
+        <div class="stat-value">{{ '{:,.0f}'.format(manager_profit) }} &#8381;</div>
         <div class="stat-label">Прибыль</div>
     </div>
 </div>
 
-<div class="content-grid">
-    <!-- Себестоимости -->
-    <div class="card">
-        <h3>Себестоимости</h3>
-        <form id="costPricesForm" class="cost-prices-form">
-            {% for mp in manager_prices_display %}
-            <div class="form-group cost-row">
-                <label>{{ mp.name }} ({{ mp.days }} дн.)</label>
-                <input type="number" name="cost_{{ mp.days }}" data-days="{{ mp.days }}"
-                       value="{{ mp.cost_price }}" placeholder="{{ mp.global_price }}" min="0" class="cost-input">
-                <small class="text-muted">Глобальная: {{ mp.global_price }} ₽</small>
+<div class="content-grid-2col">
+    <!-- Левая колонка -->
+    <div class="col-left">
+        <!-- Себестоимости -->
+        <div class="card">
+            <h3>Себестоимости</h3>
+            <form id="costPricesForm" class="cost-prices-form">
+                {% for mp in manager_prices_display %}
+                <div class="form-group cost-row">
+                    <label>{{ mp.name }} ({{ mp.days }} дн.)</label>
+                    <input type="number" name="cost_{{ mp.days }}" data-days="{{ mp.days }}"
+                           value="{{ mp.cost_price }}" placeholder="{{ mp.global_price }}" min="0" class="cost-input">
+                    <small class="text-muted">Глобальная: {{ mp.global_price }} &#8381;</small>
+                </div>
+                {% endfor %}
+                <button type="submit" class="btn btn-primary btn-sm" style="margin-top: 0.5rem; width: 100%;">Сохранить</button>
+            </form>
+        </div>
+
+        <!-- Статистика по периодам -->
+        <div class="card">
+            <h3>По тарифам</h3>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Период</th>
+                        <th>Ключей</th>
+                        <th>Выручка</th>
+                        <th>Себест.</th>
+                        <th>Долг</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for p in periods_stats %}
+                    <tr>
+                        <td>{{ p.period }}</td>
+                        <td>{{ p.count }}</td>
+                        <td>{{ '{:,.0f}'.format(p.revenue) }} &#8381;</td>
+                        <td>{{ '{:,.0f}'.format(p.cost_price) }} &#8381;</td>
+                        <td>{{ '{:,.0f}'.format(p.debt) }} &#8381;</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="text-center text-muted">Нет данных</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Оплаты -->
+        <div class="card">
+            <div class="card-header-row">
+                <h3>Оплаты</h3>
+                <div class="card-actions">
+                    <button class="btn btn-primary btn-sm" onclick="openPaymentModal()">Записать оплату</button>
+                    <button class="btn btn-success btn-sm" onclick="resetDebt()">Погасить весь долг</button>
+                </div>
             </div>
-            {% endfor %}
-            <button type="submit" class="btn btn-primary btn-sm" style="margin-top: 0.5rem; width: 100%;">Сохранить</button>
+            <table class="data-table" id="paymentsTable">
+                <thead>
+                    <tr>
+                        <th>Сумма</th>
+                        <th>Дата</th>
+                        <th>Заметка</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for p in payments %}
+                    <tr data-id="{{ p.id }}">
+                        <td>{{ '{:,.0f}'.format(p.amount) }} &#8381;</td>
+                        <td>{{ p.paid_at[:16] if p.paid_at else 'N/A' }}</td>
+                        <td>{{ p.note or '—' }}</td>
+                        <td>
+                            <button class="btn btn-danger btn-xs" onclick="deletePayment({{ p.id }})">&#10005;</button>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr class="no-data-row">
+                        <td colspan="4" class="text-center text-muted">Нет оплат</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Правая колонка -->
+    <div class="col-right">
+        <!-- Аналитика -->
+        <div class="card">
+            <h3>Аналитика</h3>
+            <div class="analytics-controls">
+                <div class="analytics-group-btns">
+                    <button class="btn btn-sm btn-outline active" data-group="day">По дням</button>
+                    <button class="btn btn-sm btn-outline" data-group="week">По неделям</button>
+                    <button class="btn btn-sm btn-outline" data-group="month">По месяцам</button>
+                </div>
+                <div class="analytics-dates">
+                    <input type="date" id="analyticsFrom" class="date-input">
+                    <span>—</span>
+                    <input type="date" id="analyticsTo" class="date-input">
+                    <button class="btn btn-sm btn-primary" onclick="loadAnalytics()">Показать</button>
+                </div>
+            </div>
+            <div id="analyticsSummary" class="analytics-summary" style="display:none;">
+                <span>Ключей: <strong id="anTotalKeys">0</strong></span>
+                <span>Выручка: <strong id="anTotalRevenue">0</strong> &#8381;</span>
+            </div>
+            <table class="data-table" id="analyticsTable">
+                <thead>
+                    <tr>
+                        <th>Период</th>
+                        <th>Ключей</th>
+                        <th>Выручка</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="3" class="text-center text-muted">Нажмите «Показать»</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Последние ключи -->
+        <div class="card">
+            <h3>Последние ключи</h3>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Клиент</th>
+                        <th>Период</th>
+                        <th>Цена</th>
+                        <th>Дата</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for key in recent_keys %}
+                    <tr>
+                        <td>
+                            <a href="{{ request.app.root_path }}/keys/{{ key.id }}" class="link">
+                                {{ key.client_email or key.phone_number or key.client_id[:8] ~ '...' }}
+                            </a>
+                        </td>
+                        <td>{{ key.period }}</td>
+                        <td>{{ key.price or 0 }} &#8381;</td>
+                        <td>{{ key.created_at[:16] if key.created_at else 'N/A' }}</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="4" class="text-center text-muted">Нет ключей</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Модалка оплаты -->
+<div id="paymentModal" class="modal-overlay" style="display:none;" onclick="if(event.target===this)closePaymentModal()">
+    <div class="modal-box">
+        <h3>Записать оплату</h3>
+        <form id="paymentForm" onsubmit="submitPayment(event)">
+            <div class="form-group">
+                <label>Сумма (&#8381;)</label>
+                <input type="number" id="paymentAmount" min="1" required class="form-input">
+            </div>
+            <div class="form-group">
+                <label>Заметка</label>
+                <input type="text" id="paymentNote" class="form-input" placeholder="Необязательно">
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="closePaymentModal()">Отмена</button>
+                <button type="submit" class="btn btn-primary btn-sm">Записать</button>
+            </div>
         </form>
-    </div>
-
-    <!-- Статистика по периодам -->
-    <div class="card">
-        <h3>По тарифам</h3>
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Период</th>
-                    <th>Ключей</th>
-                    <th>Выручка</th>
-                    <th>Себест.</th>
-                    <th>Долг</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for p in periods_stats %}
-                <tr>
-                    <td>{{ p.period }}</td>
-                    <td>{{ p.count }}</td>
-                    <td>{{ '{:,.0f}'.format(p.revenue) }} ₽</td>
-                    <td>{{ '{:,.0f}'.format(p.cost_price) }} ₽</td>
-                    <td>{{ '{:,.0f}'.format(p.debt) }} ₽</td>
-                </tr>
-                {% else %}
-                <tr>
-                    <td colspan="5" class="text-center text-muted">Нет данных</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-
-    <!-- Последние ключи -->
-    <div class="card wide">
-        <h3>Последние ключи</h3>
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Клиент</th>
-                    <th>Период</th>
-                    <th>Цена</th>
-                    <th>Дата</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for key in recent_keys %}
-                <tr>
-                    <td>
-                        <a href="{{ request.app.root_path }}/keys/{{ key.id }}" class="link">
-                            {{ key.client_email or key.phone_number or key.client_id[:8] ~ '...' }}
-                        </a>
-                    </td>
-                    <td>{{ key.period }}</td>
-                    <td>{{ key.price or 0 }} ₽</td>
-                    <td>{{ key.created_at[:16] if key.created_at else 'N/A' }}</td>
-                </tr>
-                {% else %}
-                <tr>
-                    <td colspan="4" class="text-center text-muted">Нет ключей</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
     </div>
 </div>
 
@@ -230,6 +334,10 @@
     color: #27ae60;
 }
 
+.stat-paid .stat-value {
+    color: #3498db;
+}
+
 .cost-prices-form .cost-row {
     margin-bottom: 0.75rem;
 }
@@ -256,26 +364,22 @@
     border-color: var(--primary);
 }
 
-.content-grid {
+.content-grid-2col {
     display: grid;
-    grid-template-columns: 1fr 1fr 2fr;
+    grid-template-columns: 1fr 1fr;
     gap: 1rem;
 }
 
-.content-grid .wide {
-    grid-column: span 1;
-}
-
-@media (max-width: 1100px) {
-    .content-grid {
-        grid-template-columns: 1fr 1fr;
-    }
-}
-
-@media (max-width: 700px) {
-    .content-grid {
+@media (max-width: 900px) {
+    .content-grid-2col {
         grid-template-columns: 1fr;
     }
+}
+
+.col-left, .col-right {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
 }
 
 .breadcrumb {
@@ -293,6 +397,170 @@
 .breadcrumb a:hover {
     text-decoration: underline;
 }
+
+/* Card header with actions */
+.card-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.card-header-row h3 {
+    margin: 0;
+}
+
+.card-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* Payment modal */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-box {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 1.5rem;
+    width: 90%;
+    max-width: 400px;
+}
+
+.modal-box h3 {
+    margin: 0 0 1rem 0;
+}
+
+.form-input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.95rem;
+    box-sizing: border-box;
+}
+
+.form-input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.form-group {
+    margin-bottom: 0.75rem;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-weight: 500;
+    font-size: 0.9rem;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 1rem;
+}
+
+/* Buttons */
+.btn-success {
+    background: #27ae60;
+    color: white;
+    border: none;
+    cursor: pointer;
+}
+
+.btn-success:hover {
+    background: #219a52;
+}
+
+.btn-danger {
+    background: #e74c3c;
+    color: white;
+    border: none;
+    cursor: pointer;
+}
+
+.btn-danger:hover {
+    background: #c0392b;
+}
+
+.btn-secondary {
+    background: var(--border);
+    color: var(--text);
+    border: none;
+    cursor: pointer;
+}
+
+.btn-xs {
+    padding: 0.15rem 0.4rem;
+    font-size: 0.75rem;
+    border-radius: 4px;
+}
+
+.btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 0.3rem 0.75rem;
+}
+
+.btn-outline.active {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+}
+
+/* Analytics */
+.analytics-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.analytics-group-btns {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.analytics-dates {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.date-input {
+    padding: 0.3rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9rem;
+}
+
+.analytics-summary {
+    display: flex;
+    gap: 1.5rem;
+    padding: 0.5rem 0;
+    margin-bottom: 0.5rem;
+    font-size: 0.95rem;
+}
 </style>
 {% endblock %}
 
@@ -300,7 +568,9 @@
 <script>
 const ROOT = '{{ request.app.root_path }}';
 const MANAGER_ID = {{ manager.user_id }};
+let currentGroup = 'day';
 
+// --- Себестоимости ---
 document.getElementById('costPricesForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     const inputs = this.querySelectorAll('.cost-input');
@@ -327,5 +597,113 @@ document.getElementById('costPricesForm').addEventListener('submit', async funct
         alert(data.error || 'Ошибка сохранения');
     }
 });
+
+// --- Оплаты ---
+function openPaymentModal() {
+    document.getElementById('paymentAmount').value = '';
+    document.getElementById('paymentNote').value = '';
+    document.getElementById('paymentModal').style.display = 'flex';
+    document.getElementById('paymentAmount').focus();
+}
+
+function closePaymentModal() {
+    document.getElementById('paymentModal').style.display = 'none';
+}
+
+async function submitPayment(e) {
+    e.preventDefault();
+    const amount = parseInt(document.getElementById('paymentAmount').value);
+    const note = document.getElementById('paymentNote').value.trim();
+    if (!amount || amount <= 0) return;
+
+    const resp = await fetch(ROOT + '/managers/' + MANAGER_ID + '/payments', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({amount, note})
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка');
+    }
+}
+
+async function resetDebt() {
+    if (!confirm('Погасить весь оставшийся долг?')) return;
+
+    const resp = await fetch(ROOT + '/managers/' + MANAGER_ID + '/payments/reset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'}
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка');
+    }
+}
+
+async function deletePayment(id) {
+    if (!confirm('Удалить эту запись об оплате?')) return;
+
+    const resp = await fetch(ROOT + '/managers/' + MANAGER_ID + '/payments/' + id, {
+        method: 'DELETE'
+    });
+    const data = await resp.json();
+    if (data.success) {
+        location.reload();
+    } else {
+        alert(data.error || 'Ошибка');
+    }
+}
+
+// --- Аналитика ---
+document.querySelectorAll('.analytics-group-btns .btn-outline').forEach(btn => {
+    btn.addEventListener('click', function() {
+        document.querySelectorAll('.analytics-group-btns .btn-outline').forEach(b => b.classList.remove('active'));
+        this.classList.add('active');
+        currentGroup = this.dataset.group;
+    });
+});
+
+async function loadAnalytics() {
+    const dateFrom = document.getElementById('analyticsFrom').value;
+    const dateTo = document.getElementById('analyticsTo').value;
+
+    let url = ROOT + '/managers/' + MANAGER_ID + '/analytics?group_by=' + currentGroup;
+    if (dateFrom) url += '&from=' + dateFrom;
+    if (dateTo) url += '&to=' + dateTo;
+
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    const tbody = document.querySelector('#analyticsTable tbody');
+    if (!data.rows || data.rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">Нет данных</td></tr>';
+        document.getElementById('analyticsSummary').style.display = 'none';
+        return;
+    }
+
+    let html = '';
+    data.rows.forEach(r => {
+        html += '<tr><td>' + r.period + '</td><td>' + r.keys_count + '</td><td>' + Number(r.revenue).toLocaleString('ru-RU') + ' \u20BD</td></tr>';
+    });
+    tbody.innerHTML = html;
+
+    document.getElementById('anTotalKeys').textContent = data.total_keys;
+    document.getElementById('anTotalRevenue').textContent = Number(data.total_revenue).toLocaleString('ru-RU');
+    document.getElementById('analyticsSummary').style.display = 'flex';
+}
+
+// Загружаем аналитику при открытии страницы (последние 30 дней)
+(function() {
+    const today = new Date();
+    const monthAgo = new Date();
+    monthAgo.setDate(today.getDate() - 30);
+    document.getElementById('analyticsFrom').value = monthAgo.toISOString().split('T')[0];
+    document.getElementById('analyticsTo').value = today.toISOString().split('T')[0];
+    loadAnalytics();
+})();
 </script>
 {% endblock %}
