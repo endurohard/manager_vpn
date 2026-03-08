@@ -1,6 +1,7 @@
 """
 Веб-сервер для Telegram Mini App с функцией заказа ключей
 """
+import asyncio
 import os
 import json
 import logging
@@ -471,6 +472,12 @@ def check_client_exists_on_server(uuid_str, server):
     return client is not None
 
 
+async def check_client_exists_on_server_async(uuid_str, server):
+    """Асинхронная проверка существования клиента на сервере"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, check_client_exists_on_server, uuid_str, server)
+
+
 def find_client_on_all_servers(uuid_str):
     """Найти клиента по UUID на всех серверах"""
     servers_config = load_servers_config()
@@ -786,8 +793,8 @@ def generate_vless_link_for_server(uuid, email, server_config, inbound_name='mai
         # Мержим: override перезаписывает статические настройки
         inbound = {**inbound, **inbound_settings_override}
 
-    domain = server_config.get('domain', server_config.get('ip', ''))
-    port = server_config.get('port', 443)
+    domain = inbound.get('domain', server_config.get('domain', server_config.get('ip', '')))
+    port = inbound.get('port', server_config.get('port', 443))
     server_name = server_config.get('name', 'Server')
     network = inbound.get('network', 'tcp')
 
@@ -1416,15 +1423,21 @@ async def subscription_handler(request):
     if client_keys:
         client_email = client_keys[0]['client'].get('email', 'client')
 
-    # Если клиента нет локально — получаем email с удалённых серверов
+    # Если клиента нет локально — получаем email с удалённых серверов (параллельно)
     if client_email == 'client':
-        for server in servers_config.get('servers', []):
-            if server.get('local') or not server.get('enabled', True):
-                continue
-            panel_info = await get_client_info_from_panel(client_id, server)
-            if panel_info and panel_info.get('email'):
-                client_email = panel_info['email']
-                break
+        remote_servers = [
+            s for s in servers_config.get('servers', [])
+            if not s.get('local') and s.get('enabled', True)
+        ]
+        if remote_servers:
+            panel_results = await asyncio.gather(
+                *[get_client_info_from_panel(client_id, s) for s in remote_servers],
+                return_exceptions=True
+            )
+            for panel_info in panel_results:
+                if isinstance(panel_info, dict) and panel_info.get('email'):
+                    client_email = panel_info['email']
+                    break
 
     # Получаем данные клиента из базы данных (срок, трафик)
     upload_bytes = 0
@@ -1468,38 +1481,56 @@ async def subscription_handler(request):
             links.append(link)
 
     # Обрабатываем серверы из конфига - только активные
+    local_servers = []
+    remote_servers_active = []
     for server in servers_config.get('servers', []):
         if not server.get('enabled', True):
             continue
-        # Пропускаем неактивные для новых подписок серверы
         if not server.get('active_for_new', True):
             continue
-
         if server.get('local', False):
-            # Для локального сервера - генерируем ключи только если клиент найден
-            if client_keys:
-                for inbound_name, inbound_config in server.get('inbounds', {}).items():
-                    if inbound_name == 'main':
-                        continue  # main уже добавлен выше
-                    # Генерируем ссылки для всех связанных клиентов
-                    for uuid in all_client_ids:
-                        link = generate_vless_link_for_server(uuid, client_email, server, inbound_name)
-                        if link:
-                            links.append(link)
+            local_servers.append(server)
         else:
-            # Для внешних серверов - проверяем наличие клиента перед генерацией
-            server_name = server.get('name', server.get('ip', 'Unknown'))
-            # Проверяем все UUID (master + linked)
-            for uuid in all_client_ids:
-                if check_client_exists_on_server(uuid, server):
-                    logger.debug(f"Client {uuid[:8]}... found on {server_name}")
-                    for inbound_name in server.get('inbounds', {}).keys():
-                        # Используем асинхронную функцию для получения актуальных настроек с панели
-                        link = await generate_vless_link_for_server_async(uuid, client_email, server, inbound_name)
-                        if link:
-                            links.append(link)
-                else:
-                    logger.debug(f"Client {uuid[:8]}... NOT found on {server_name}, skipping")
+            remote_servers_active.append(server)
+
+    # Локальный сервер — синхронно (быстро, без сети)
+    for server in local_servers:
+        if client_keys:
+            for inbound_name, inbound_config in server.get('inbounds', {}).items():
+                if inbound_name == 'main':
+                    continue
+                for uuid in all_client_ids:
+                    link = generate_vless_link_for_server(uuid, client_email, server, inbound_name)
+                    if link:
+                        links.append(link)
+
+    # Внешние серверы — параллельная проверка наличия клиента
+    async def _check_and_generate_links(server, uuid_val):
+        """Проверить клиента на сервере и сгенерировать ссылки"""
+        server_name = server.get('name', server.get('ip', 'Unknown'))
+        result_links = []
+        try:
+            if await check_client_exists_on_server_async(uuid_val, server):
+                logger.debug(f"Client {uuid_val[:8]}... found on {server_name}")
+                for inbound_name in server.get('inbounds', {}).keys():
+                    link = await generate_vless_link_for_server_async(uuid_val, client_email, server, inbound_name)
+                    if link:
+                        result_links.append(link)
+            else:
+                logger.debug(f"Client {uuid_val[:8]}... NOT found on {server_name}, skipping")
+        except Exception as e:
+            logger.error(f"Error checking client on {server_name}: {e}")
+        return result_links
+
+    if remote_servers_active and all_client_ids:
+        tasks = []
+        for server in remote_servers_active:
+            for uuid_val in all_client_ids:
+                tasks.append(_check_and_generate_links(server, uuid_val))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, list):
+                links.extend(result)
 
     # Если нет ключей - возвращаем 404
     if not links:
@@ -1529,24 +1560,28 @@ async def subscription_handler(request):
             'server': local_server.get('name', 'Local') if local_server else 'Local'
         }
 
-    # Если локальных данных нет - получаем с удалённых серверов
+    # Если локальных данных нет - получаем с удалённых серверов (параллельно)
     if not client_info:
-        for server in servers_config.get('servers', []):
-            if server.get('local') or not server.get('enabled'):
-                continue
-            panel_info = await get_client_info_from_panel(client_id, server)
-            if panel_info:
-                client_info = panel_info
-                # Обновляем client_email для VPN ответа
-                client_email = panel_info.get('email', client_email)
-                # Обновляем данные для Subscription-Userinfo заголовка
-                upload_bytes = panel_info.get('upload', 0)
-                download_bytes = panel_info.get('download', 0)
-                total_bytes = panel_info.get('total', 0)
-                expire_time = panel_info.get('expiry_time', 0)
-                if expire_time:
-                    expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
-                break
+        info_servers = [
+            s for s in servers_config.get('servers', [])
+            if not s.get('local') and s.get('enabled')
+        ]
+        if info_servers:
+            info_results = await asyncio.gather(
+                *[get_client_info_from_panel(client_id, s) for s in info_servers],
+                return_exceptions=True
+            )
+            for panel_info in info_results:
+                if isinstance(panel_info, dict) and panel_info:
+                    client_info = panel_info
+                    client_email = panel_info.get('email', client_email)
+                    upload_bytes = panel_info.get('upload', 0)
+                    download_bytes = panel_info.get('download', 0)
+                    total_bytes = panel_info.get('total', 0)
+                    expire_time = panel_info.get('expiry_time', 0)
+                    if expire_time:
+                        expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
+                    break
 
     # Fallback если ничего не нашли
     if not client_info:
@@ -1815,33 +1850,43 @@ async def subscription_json_handler(request):
             'server': 'ZoVGoR'
         })
 
-    # Внешние серверы - только где клиент существует
+    # Внешние серверы - параллельная проверка и генерация ссылок
     servers_config = load_servers_config()
-    for server in servers_config.get('servers', []):
-        if not server.get('enabled', True):
-            continue
-        if server.get('local', False):
-            continue
+    ext_servers = [
+        s for s in servers_config.get('servers', [])
+        if s.get('enabled', True) and not s.get('local', False)
+    ]
 
+    async def _check_and_gen(server):
+        """Проверить клиента на сервере и сгенерировать ссылки"""
+        result = []
         server_name = server.get('name', 'Server')
+        try:
+            if not await check_client_exists_on_server_async(client_id, server):
+                return result
+            for inbound_name, inbound_config in server.get('inbounds', {}).items():
+                link = await generate_vless_link_for_server_async(client_id, client_email, server, inbound_name)
+                if link:
+                    name_prefix = inbound_config.get('name_prefix', server_name)
+                    result.append({
+                        'name': f"{name_prefix} {client_email}",
+                        'link': link,
+                        'port': server.get('port', 443),
+                        'tag': inbound_name,
+                        'server': server_name
+                    })
+        except Exception as e:
+            logger.error(f"Error processing server {server_name}: {e}")
+        return result
 
-        # Проверяем наличие клиента на сервере
-        if not check_client_exists_on_server(client_id, server):
-            continue
-
-        for inbound_name, inbound_config in server.get('inbounds', {}).items():
-            # Используем асинхронную функцию для получения актуальных настроек с панели
-            link = await generate_vless_link_for_server_async(client_id, client_email, server, inbound_name)
-            if link:
-                name_prefix = inbound_config.get('name_prefix', server_name)
-                # Формируем имя: PREFIX пробел EMAIL (как в get_client_link_from_active_server)
-                links.append({
-                    'name': f"{name_prefix} {client_email}",
-                    'link': link,
-                    'port': server.get('port', 443),
-                    'tag': inbound_name,
-                    'server': server_name
-                })
+    if ext_servers:
+        ext_results = await asyncio.gather(
+            *[_check_and_gen(s) for s in ext_servers],
+            return_exceptions=True
+        )
+        for result in ext_results:
+            if isinstance(result, list):
+                links.extend(result)
 
     return web.json_response({
         'count': len(links),

@@ -553,6 +553,19 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     'local_created': False
                 }
 
+                # Вычисляем expire_timestamp (мс)
+                from datetime import timedelta
+                _expire_ts = int((datetime.now() + timedelta(days=period_days)).timestamp() * 1000)
+
+                # Фиксируем основной сервер
+                await db.add_client_server(
+                    client_uuid=client_uuid, client_email=phone,
+                    server_name=selected_server.get('name', ''),
+                    inbound_id=inbound_id, expire_days=period_days,
+                    expire_timestamp=_expire_ts,
+                    total_gb=server_total_gb, ip_limit=2
+                )
+
                 # Авто-добавление на серверы с лимитом трафика (LTE Билайн)
                 selected_name = selected_server.get('name', '')
                 all_servers = load_servers_config().get('servers', [])
@@ -570,6 +583,15 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                                 ip_limit=2,
                                 total_gb=srv.get('traffic_limit_gb', 0)
                             )
+                            # Фиксируем доп. сервер
+                            await db.add_client_server(
+                                client_uuid=client_uuid, client_email=phone,
+                                server_name=srv.get('name', ''),
+                                inbound_id=srv.get('inbounds', {}).get('main', {}).get('id', 1),
+                                expire_days=period_days,
+                                expire_timestamp=_expire_ts,
+                                total_gb=srv.get('traffic_limit_gb', 0), ip_limit=2
+                            )
                             logger.info(f"Авто-добавлен на {srv.get('name')} с лимитом {srv.get('traffic_limit_gb')} ГБ")
                         except Exception as e:
                             logger.error(f"Ошибка авто-добавления на {srv.get('name')}: {e}")
@@ -584,6 +606,26 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                 expire_days=period_days,
                 ip_limit=2
             )
+
+            # Фиксируем серверы для старой логики
+            if client_data and not client_data.get('error'):
+                _expire_ts_old = client_data.get('expire_time', 0)
+                from bot.api.remote_xui import load_servers_config as _lsc
+                _cfg = _lsc()
+                for srv in _cfg.get('servers', []):
+                    if not srv.get('enabled', True) or not srv.get('active_for_new', True):
+                        continue
+                    try:
+                        await db.add_client_server(
+                            client_uuid=client_data['client_id'], client_email=phone,
+                            server_name=srv.get('name', ''),
+                            inbound_id=srv.get('inbounds', {}).get('main', {}).get('id', 1),
+                            expire_days=period_days,
+                            expire_timestamp=_expire_ts_old,
+                            total_gb=srv.get('traffic_limit_gb', 0), ip_limit=2
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка фиксации сервера {srv.get('name')}: {e}")
 
         if not client_data:
             # Сохраняем в очередь на повторное создание
@@ -784,7 +826,8 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
             period=period_name,
             expire_days=period_days,
             client_id=client_uuid,
-            price=period_price
+            price=period_price,
+            server_name=selected_server.get('name') if selected_server else None
         )
 
         # Формируем ссылку подписки

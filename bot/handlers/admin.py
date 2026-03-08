@@ -5554,3 +5554,162 @@ async def cancel_add_sub_callback(callback: CallbackQuery, state: FSMContext):
         reply_markup=Keyboards.admin_menu()
     )
     await callback.answer()
+
+
+# ===== Восстановление клиентов из бэкапа =====
+
+class RestoreStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_server = State()
+
+
+@router.message(F.text == "/restore_backup")
+async def cmd_restore_backup(message: Message, state: FSMContext, db: DatabaseManager):
+    """Команда восстановления клиентов из JSON-бэкапа"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    from bot.api.remote_xui import load_servers_config
+    config = load_servers_config()
+    active_servers = [
+        s for s in config.get('servers', [])
+        if s.get('enabled', True) and s.get('panel')
+    ]
+
+    if not active_servers:
+        await message.answer("❌ Нет доступных серверов с панелями")
+        return
+
+    await state.set_state(RestoreStates.waiting_for_file)
+    await message.answer(
+        "📥 <b>Восстановление из бэкапа</b>\n\n"
+        "Отправьте JSON-файл бэкапа клиентов (clients_backup_*.json).\n\n"
+        "Или /cancel для отмены.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(RestoreStates.waiting_for_file, F.document)
+async def restore_receive_file(message: Message, state: FSMContext, db: DatabaseManager, bot):
+    """Получение файла бэкапа"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    doc = message.document
+    if not doc.file_name.endswith('.json'):
+        await message.answer("⚠️ Нужен JSON-файл (clients_backup_*.json)")
+        return
+
+    # Скачиваем файл
+    import os
+    backup_dir = '/root/manager_vpn/backups'
+    os.makedirs(backup_dir, exist_ok=True)
+    file_path = f"{backup_dir}/restore_temp.json"
+
+    file = await bot.get_file(doc.file_id)
+    await bot.download_file(file.file_path, file_path)
+
+    # Проверяем содержимое
+    import json
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка чтения JSON: {e}")
+        await state.clear()
+        return
+
+    client_servers = data.get('client_servers', [])
+    clients = data.get('clients', [])
+    backup_date = data.get('backup_date', '?')
+
+    if not client_servers:
+        await message.answer(
+            "⚠️ В бэкапе нет данных client_servers.\n"
+            "Восстановление невозможно — бэкап создан до добавления этой функции."
+        )
+        await state.clear()
+        return
+
+    # Показываем серверы для выбора
+    from bot.api.remote_xui import load_servers_config
+    config = load_servers_config()
+    active_servers = [
+        s for s in config.get('servers', [])
+        if s.get('enabled', True) and s.get('panel')
+    ]
+
+    # Уникальные серверы из бэкапа
+    backup_servers = set(r.get('server_name') for r in client_servers)
+
+    buttons = []
+    for server in active_servers:
+        name = server.get('name', '')
+        count = sum(1 for r in client_servers if r.get('server_name') == name)
+        label = f"{name} ({count} клиентов)" if count else f"{name} (новый)"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"restore_srv_{name}")])
+
+    buttons.append([InlineKeyboardButton(text="🔄 Все серверы (как в бэкапе)", callback_data="restore_srv_all")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="restore_cancel")])
+
+    await state.update_data(restore_file=file_path)
+    await state.set_state(RestoreStates.waiting_for_server)
+    await message.answer(
+        f"📋 <b>Бэкап от {backup_date}</b>\n\n"
+        f"🔑 Клиентов: {len(clients)}\n"
+        f"📡 Записей серверов: {len(client_servers)}\n"
+        f"🌐 Серверов в бэкапе: {', '.join(backup_servers)}\n\n"
+        f"Выберите сервер для восстановления:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(RestoreStates.waiting_for_server, F.data.startswith("restore_srv_"))
+async def restore_select_server(callback: CallbackQuery, state: FSMContext, db: DatabaseManager, bot):
+    """Выбор сервера и запуск восстановления"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    data = await state.get_data()
+    file_path = data.get('restore_file')
+    server_choice = callback.data.replace("restore_srv_", "")
+
+    target_server = None if server_choice == "all" else server_choice
+
+    await callback.message.edit_text("⏳ Восстановление клиентов... Это может занять несколько минут.")
+
+    from main import restore_clients_from_backup
+    result = await restore_clients_from_backup(file_path, target_server, bot)
+
+    report = (
+        f"✅ <b>Восстановление завершено</b>\n\n"
+        f"📡 Сервер: {target_server or 'все (как в бэкапе)'}\n"
+        f"✅ Восстановлено: {result['restored']}\n"
+        f"⏭ Пропущено: {result['skipped']}\n"
+        f"❌ Ошибок: {result['errors']}\n"
+    )
+
+    if result['details']:
+        details_text = '\n'.join(result['details'][:20])
+        report += f"\n<b>Детали:</b>\n{details_text}"
+        if len(result['details']) > 20:
+            report += f"\n... и ещё {len(result['details']) - 20}"
+
+    await callback.message.edit_text(report, parse_mode="HTML")
+    await state.clear()
+
+
+@router.callback_query(RestoreStates.waiting_for_server, F.data == "restore_cancel")
+async def restore_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена восстановления"""
+    await state.clear()
+    await callback.message.edit_text("❌ Восстановление отменено")
+    await callback.answer()
+
+
+@router.message(RestoreStates.waiting_for_file, F.text == "/cancel")
+async def restore_cancel_text(message: Message, state: FSMContext):
+    """Отмена восстановления текстом"""
+    await state.clear()
+    await message.answer("❌ Восстановление отменено")

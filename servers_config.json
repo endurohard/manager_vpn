@@ -185,8 +185,8 @@
       "domain": "vk.peakvip.ru",
       "ip": "138.124.14.245",
       "port": 8443,
-      "enabled": true,
-      "active_for_new": true,
+      "enabled": false,
+      "active_for_new": false,
       "local": false,
       "description": "Сервер 📶 LTE: Билайн [ 50 Гб ]",
       "panel": {
@@ -206,6 +206,18 @@
           "flow": "xtls-rprx-vision",
           "fp": "firefox",
           "name_prefix": "🇷🇺 📶 LTE: Билайн"
+        },
+        "universal": {
+          "id": 2,
+          "domain": "138.124.14.245",
+          "port": 443,
+          "security": "reality",
+          "sni": "api.vk.com",
+          "pbk": "dVD2v9gsGVOordY5x1OxYO0x0W5dnSbJ88N0oFq-WnA",
+          "sid": "cfea12",
+          "flow": "",
+          "fp": "chrome",
+          "name_prefix": "🇷🇺 📶 LTE: Универсальный"
         }
       }
     }

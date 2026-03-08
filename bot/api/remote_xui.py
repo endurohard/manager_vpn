@@ -2,6 +2,7 @@
 Клиент для создания клиентов на удалённых X-UI серверах через SSH или API панели
 """
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -11,6 +12,9 @@ import urllib.parse
 import http.cookiejar
 from pathlib import Path
 from datetime import datetime, timedelta
+
+# Таймаут для HTTP запросов к панелям (секунды)
+PANEL_REQUEST_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +118,9 @@ async def _panel_login(server_config: dict) -> bool:
         login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 
         loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, session['opener'].open, login_req)
+        resp = await loop.run_in_executor(
+            None, functools.partial(session['opener'].open, login_req, timeout=PANEL_REQUEST_TIMEOUT)
+        )
         result = json.loads(resp.read())
 
         if result.get('success'):
@@ -172,7 +178,7 @@ async def get_inbound_settings_from_panel(
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
@@ -194,15 +200,22 @@ async def get_inbound_settings_from_panel(
                     network = stream.get('network', 'tcp')
 
                     result = {
+                        'port': inbound.get('port', 443),
                         'security': security,
                         'network': network,
                         'fp': 'chrome'  # default
                     }
 
-                    # Получаем flow из первого клиента (все клиенты в inbound обычно используют одинаковый flow)
+                    # Получаем flow по большинству клиентов (majority vote)
                     clients = settings.get('clients', [])
-                    if clients and clients[0].get('flow'):
-                        result['flow'] = clients[0].get('flow')
+                    if clients:
+                        flow_counts = {}
+                        for c in clients:
+                            f = c.get('flow', '')
+                            flow_counts[f] = flow_counts.get(f, 0) + 1
+                        majority_flow = max(flow_counts, key=flow_counts.get)
+                        if majority_flow:
+                            result['flow'] = majority_flow
 
                     # Reality настройки
                     if security == 'reality':
@@ -276,7 +289,7 @@ async def get_all_clients_from_panel(server_config: dict) -> list:
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
@@ -294,7 +307,12 @@ async def get_all_clients_from_panel(server_config: dict) -> list:
                     if email:
                         clients.append({
                             'email': email,
-                            'inbound_id': inbound_id
+                            'uuid': client.get('id', ''),
+                            'inbound_id': inbound_id,
+                            'expiryTime': client.get('expiryTime', 0),
+                            'totalGB': client.get('totalGB', 0),
+                            'limitIp': client.get('limitIp', 0),
+                            'enable': client.get('enable', True),
                         })
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
@@ -344,7 +362,7 @@ async def reset_client_traffic_via_panel(server_config: dict, email: str, inboun
         reset_req = urllib.request.Request(reset_url, method='POST')
 
         loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, opener.open, reset_req)
+        resp = await loop.run_in_executor(None, functools.partial(opener.open, reset_req, timeout=PANEL_REQUEST_TIMEOUT))
         result = json.loads(resp.read())
 
         if result.get('success'):
@@ -453,7 +471,7 @@ async def create_client_via_panel(
             add_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 
             loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, session['opener'].open, add_req)
+            resp = await loop.run_in_executor(None, functools.partial(session['opener'].open, add_req, timeout=PANEL_REQUEST_TIMEOUT))
             result = json.loads(resp.read())
 
             if result.get('success'):
@@ -508,7 +526,7 @@ async def _find_client_uuid_by_email(server_config: dict, email: str) -> str:
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
@@ -551,31 +569,34 @@ async def delete_client_via_panel(
 
     base_url = session.get('base_url', '')
 
-    # Получаем inbound ID
+    # Удаляем клиента из всех inbound'ов сервера
     inbounds = server_config.get('inbounds', {})
-    main_inbound = inbounds.get('main', {})
-    inbound_id = main_inbound.get('id', 1)
+    any_deleted = False
 
-    try:
-        # X-UI API для удаления клиента
-        del_url = f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
-        del_req = urllib.request.Request(del_url, method='POST')
+    for inbound_name, inbound_config in inbounds.items():
+        inbound_id = inbound_config.get('id', 1)
+        try:
+            del_url = f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
+            del_req = urllib.request.Request(del_url, method='POST')
 
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, session['opener'].open, del_req)
-        result = json.loads(resp.read())
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, functools.partial(session['opener'].open, del_req, timeout=PANEL_REQUEST_TIMEOUT))
+            result = json.loads(resp.read())
 
-        if result.get('success'):
-            logger.info(f"Клиент {client_uuid} удалён с {server_name}")
-            return True
-        else:
-            logger.error(f"Ошибка удаления клиента с {server_name}: {result.get('msg')}")
-            return False
+            if result.get('success'):
+                logger.info(f"Клиент {client_uuid} удалён с {server_name} inbound={inbound_name} (id={inbound_id})")
+                any_deleted = True
+            else:
+                logger.debug(f"Клиент не найден на {server_name} inbound={inbound_name}: {result.get('msg')}")
 
-    except Exception as e:
-        logger.error(f"Ошибка удаления клиента через панель {server_name}: {e}")
-        session['logged_in'] = False
-        return False
+        except Exception as e:
+            logger.error(f"Ошибка удаления клиента через панель {server_name} inbound={inbound_name}: {e}")
+            session['logged_in'] = False
+
+    if not any_deleted:
+        logger.warning(f"Клиент {client_uuid} не найден ни в одном inbound на {server_name}")
+
+    return any_deleted
 
 
 async def create_client_on_remote_server(
@@ -585,7 +606,8 @@ async def create_client_on_remote_server(
     expire_days: int,
     ip_limit: int = 2,
     inbound_id: int = None,
-    total_gb: int = 0
+    total_gb: int = 0,
+    expire_time_ms: int = None
 ) -> dict:
     """
     Создать клиента на удалённом сервере через SSH или API панели
@@ -595,6 +617,7 @@ async def create_client_on_remote_server(
     :param email: Email/ID клиента
     :param expire_days: Срок действия в днях
     :param ip_limit: Лимит IP
+    :param expire_time_ms: Точное время истечения в мс (для восстановления из бэкапа)
     :return: {'success': bool, 'uuid': str} - uuid может отличаться если клиент уже существовал
     """
     if server_config.get('local', False):
@@ -613,6 +636,7 @@ async def create_client_on_remote_server(
             expire_days=expire_days,
             ip_limit=ip_limit,
             inbound_id=inbound_id,
+            expire_time_ms=expire_time_ms,
             total_gb=total_gb
         )
         # Возвращаем UUID - либо переданный, либо существующий на сервере
@@ -637,7 +661,10 @@ async def create_client_on_remote_server(
         return {'success': False, 'uuid': client_uuid}
 
     # Вычисляем время истечения в миллисекундах
-    expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
+    if expire_time_ms:
+        expire_time = expire_time_ms
+    else:
+        expire_time = int((datetime.now() + timedelta(days=expire_days)).timestamp() * 1000)
 
     # Получаем inbound_id из конфигурации если не указан
     inbounds = server_config.get('inbounds', {})
@@ -850,27 +877,41 @@ async def create_client_on_active_servers(
     for server in active_servers:
         server_name = server.get('name', 'Unknown')
         server_total_gb = server.get('traffic_limit_gb', 0)
-        result = await create_client_on_remote_server(
-            server_config=server,
-            client_uuid=client_uuid,
-            email=email,
-            expire_days=expire_days,
-            ip_limit=ip_limit,
-            total_gb=server_total_gb
-        )
-        success = result.get('success', False)
-        results[server_name] = success
+        inbounds = server.get('inbounds', {})
 
-        if success:
+        # Создаём клиента на всех inbound'ах сервера
+        server_success = True
+        for inbound_name, inbound_config in inbounds.items():
+            inbound_id = inbound_config.get('id', 1)
+            # X-UI требует уникальные email — для доп. inbound'ов добавляем суффикс
+            inbound_email = email if inbound_name == 'main' else f"{email}_{inbound_name}"
+            result = await create_client_on_remote_server(
+                server_config=server,
+                client_uuid=client_uuid,
+                email=inbound_email,
+                expire_days=expire_days,
+                ip_limit=ip_limit,
+                inbound_id=inbound_id,
+                total_gb=server_total_gb
+            )
+            inbound_success = result.get('success', False)
+
+            if inbound_success:
+                if result.get('existing', False) and result.get('uuid'):
+                    final_uuid = result.get('uuid')
+                    any_existing = True
+                    logger.info(f"Клиент {email} существует на {server_name} inbound={inbound_name} с UUID {final_uuid}")
+                else:
+                    logger.info(f"Клиент {email} создан на {server_name} inbound={inbound_name} (id={inbound_id})")
+            else:
+                server_success = False
+                logger.error(f"Не удалось создать клиента {email} на {server_name} inbound={inbound_name} (id={inbound_id})")
+
+        results[server_name] = server_success
+        if server_success:
             successful_servers.append(server)
-            # Если клиент уже существовал на сервере, используем его UUID
-            if result.get('existing', False) and result.get('uuid'):
-                final_uuid = result.get('uuid')
-                any_existing = True
-                logger.info(f"Клиент {email} существует на {server_name} с UUID {final_uuid}")
         else:
             has_failure = True
-            logger.error(f"Не удалось создать клиента {email} на сервере {server_name}")
 
     # Выполняем rollback при неудаче, если требуется
     rollback_performed = False
@@ -1010,7 +1051,7 @@ async def delete_client_by_email_via_panel(server_config: dict, email: str) -> b
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
@@ -1030,7 +1071,7 @@ async def delete_client_by_email_via_panel(server_config: dict, email: str) -> b
                             # Удаляем клиента
                             del_url = f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
                             del_req = urllib.request.Request(del_url, method='POST')
-                            resp = await loop.run_in_executor(None, opener.open, del_req)
+                            resp = await loop.run_in_executor(None, functools.partial(opener.open, del_req, timeout=PANEL_REQUEST_TIMEOUT))
                             result = json.loads(resp.read())
 
                             if result.get('success'):
@@ -1174,7 +1215,7 @@ async def find_client_on_server(server_config: dict, client_uuid: str) -> dict:
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
@@ -1550,13 +1591,17 @@ async def extend_client_expiry_via_panel(
         list_req = urllib.request.Request(list_url)
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, opener.open, list_req)
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
         data = json.loads(response.read().decode())
 
         if not data.get('success'):
             return {'success': False, 'error': 'Не удалось получить список inbounds'}
 
-        # Ищем клиента
+        # Ищем и обновляем клиента во всех inbound'ах
+        any_updated = False
+        new_expiry = None
+        client_email = ''
+
         for inbound in data.get('obj', []):
             current_inbound_id = inbound.get('id')
             if inbound_id is not None and current_inbound_id != inbound_id:
@@ -1573,19 +1618,17 @@ async def extend_client_expiry_via_panel(
                         current_expiry = client.get('expiryTime', 0)
                         now_ms = int(datetime.now().timestamp() * 1000)
 
-                        # Если срок истёк - продлеваем от текущего момента
-                        # Если срок не истёк - добавляем к текущему сроку
-                        if current_expiry > 0 and current_expiry > now_ms:
-                            new_expiry = current_expiry + (extend_days * 24 * 60 * 60 * 1000)
-                        else:
-                            new_expiry = int((datetime.now() + timedelta(days=extend_days)).timestamp() * 1000)
+                        if new_expiry is None:
+                            # Вычисляем один раз для всех inbound'ов
+                            if current_expiry > 0 and current_expiry > now_ms:
+                                new_expiry = current_expiry + (extend_days * 24 * 60 * 60 * 1000)
+                            else:
+                                new_expiry = int((datetime.now() + timedelta(days=extend_days)).timestamp() * 1000)
+                            client_email = client.get('email', '')
 
-                        # Обновляем клиента
                         client['expiryTime'] = new_expiry
 
-                        # Формируем payload для API
                         client_settings = {"clients": [client]}
-
                         update_url = f"{base_url}/panel/api/inbounds/updateClient/{client_uuid}"
                         payload = urllib.parse.urlencode({
                             'id': current_inbound_id,
@@ -1595,23 +1638,20 @@ async def extend_client_expiry_via_panel(
                         update_req = urllib.request.Request(update_url, data=payload, method='POST')
                         update_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 
-                        resp = await loop.run_in_executor(None, opener.open, update_req)
+                        resp = await loop.run_in_executor(None, functools.partial(opener.open, update_req, timeout=PANEL_REQUEST_TIMEOUT))
                         result = json.loads(resp.read())
 
                         if result.get('success'):
-                            logger.info(f"Клиент {client_uuid} продлён на {extend_days} дней на {server_name}")
-                            return {
-                                'success': True,
-                                'new_expiry': new_expiry,
-                                'email': client.get('email', '')
-                            }
+                            logger.info(f"Клиент {client_uuid} продлён на {extend_days} дней на {server_name} inbound={current_inbound_id}")
+                            any_updated = True
                         else:
-                            error_msg = result.get('msg', 'Unknown error')
-                            logger.error(f"Ошибка продления клиента на {server_name}: {error_msg}")
-                            return {'success': False, 'error': error_msg}
+                            logger.error(f"Ошибка продления клиента на {server_name} inbound={current_inbound_id}: {result.get('msg')}")
+                        break
             except Exception as e:
                 continue
 
+        if any_updated:
+            return {'success': True, 'new_expiry': new_expiry, 'email': client_email}
         return {'success': False, 'error': 'Клиент не найден'}
 
     except Exception as e:
@@ -1760,7 +1800,8 @@ async def _extend_client_local(client_uuid: str, extend_days: int) -> dict:
 
 async def get_client_link_from_active_server(client_uuid: str, client_email: str) -> str:
     """
-    Получить VLESS ссылку для клиента с активного сервера
+    Получить VLESS ссылку для клиента с активного сервера.
+    Параметры берутся с панели X-UI (актуальные), со статическим конфигом как fallback.
 
     :param client_uuid: UUID клиента
     :param client_email: Email клиента
@@ -1768,118 +1809,69 @@ async def get_client_link_from_active_server(client_uuid: str, client_email: str
     """
     config = load_servers_config()
 
-    # Ищем активный для новых подписок сервер
-    for server in config.get('servers', []):
-        if not server.get('enabled', True):
-            continue
-        if not server.get('active_for_new', False):
-            continue
-
-        server_name = server.get('name', 'Unknown')
-        domain = server.get('domain', server.get('ip', ''))
-        port = server.get('port', 443)
-
-        # Получаем настройки inbound из конфига
-        inbounds = server.get('inbounds', {})
-        main_inbound = inbounds.get('main', {})
-
-        sni = main_inbound.get('sni', '')
-        pbk = main_inbound.get('pbk', '')
-        sid = main_inbound.get('sid', '')
-        fp = main_inbound.get('fp', 'chrome')
-        security = main_inbound.get('security', 'reality')
-        flow = main_inbound.get('flow', '')
-        name_prefix = main_inbound.get('name_prefix', '')
-        network = main_inbound.get('network', 'tcp')
-
-        # Формируем VLESS ссылку
-        vless_link = f"vless://{client_uuid}@{domain}:{port}"
-
-        params = [
-            f"type={network}",
-            "encryption=none"
-        ]
-
-        # Добавляем gRPC параметры если нужно
-        if network == 'grpc':
-            params.append(f"serviceName={main_inbound.get('serviceName', '')}")
-            params.append(f"authority={main_inbound.get('authority', '')}")
-
-        params.append(f"security={security}")
-
-        if security == 'reality':
-            if pbk:
-                params.append(f"pbk={pbk}")
-            params.append(f"fp={fp or 'chrome'}")
-            if sni:
-                params.append(f"sni={sni}")
-            if sid:
-                params.append(f"sid={sid}")
-            if flow:
-                params.append(f"flow={flow}")
-            params.append("spx=%2F")
-
-        # Название ссылки
-        link_name = f"{name_prefix} {client_email}" if name_prefix else client_email
-
-        vless_link += "?" + "&".join(params) + f"#{link_name}"
-
-        logger.info(f"Сгенерирована VLESS ссылка с сервера {server_name} для {client_email}")
-        return vless_link
-
-    # Если не нашли активный сервер, ищем любой включенный
+    # Собираем кандидатов: сначала active_for_new, потом остальные enabled
+    candidates = []
     for server in config.get('servers', []):
         if not server.get('enabled', True):
             continue
         if server.get('local', False):
             continue
+        if server.get('active_for_new', False):
+            candidates.insert(0, server)
+        else:
+            candidates.append(server)
 
+    for server in candidates:
         server_name = server.get('name', 'Unknown')
-        domain = server.get('domain', server.get('ip', ''))
-        port = server.get('port', 443)
-
         inbounds = server.get('inbounds', {})
         main_inbound = inbounds.get('main', {})
+        inbound_id = main_inbound.get('id', 1)
 
-        sni = main_inbound.get('sni', '')
-        pbk = main_inbound.get('pbk', '')
-        sid = main_inbound.get('sid', '')
-        fp = main_inbound.get('fp', 'chrome')
-        security = main_inbound.get('security', 'reality')
-        flow = main_inbound.get('flow', '')
-        name_prefix = main_inbound.get('name_prefix', '')
-        network = main_inbound.get('network', 'tcp')
+        # Получаем актуальные настройки с панели
+        panel_settings = await get_inbound_settings_from_panel(server, inbound_id)
 
-        vless_link = f"vless://{client_uuid}@{domain}:{port}"
+        # Мержим: панель перезаписывает статический конфиг
+        if panel_settings:
+            settings = {**main_inbound, **panel_settings}
+        else:
+            settings = dict(main_inbound)
 
+        domain = main_inbound.get('domain', server.get('domain', server.get('ip', '')))
+        port = settings.get('port', server.get('port', 443))
+        network = settings.get('network', 'tcp')
+        security = settings.get('security', 'reality')
+        name_prefix = main_inbound.get('name_prefix', server_name)
+
+        # Формируем VLESS ссылку
         params = [
             f"type={network}",
             "encryption=none"
         ]
 
-        # Добавляем gRPC параметры если нужно
         if network == 'grpc':
-            params.append(f"serviceName={main_inbound.get('serviceName', '')}")
-            params.append(f"authority={main_inbound.get('authority', '')}")
+            params.append(f"serviceName={settings.get('serviceName', '')}")
+            params.append(f"authority={settings.get('authority', '')}")
 
         params.append(f"security={security}")
 
         if security == 'reality':
-            if pbk:
-                params.append(f"pbk={pbk}")
-            params.append(f"fp={fp or 'chrome'}")
-            if sni:
-                params.append(f"sni={sni}")
-            if sid:
-                params.append(f"sid={sid}")
-            if flow:
-                params.append(f"flow={flow}")
+            if settings.get('pbk'):
+                params.append(f"pbk={settings['pbk']}")
+            params.append(f"fp={settings.get('fp', 'chrome')}")
+            if settings.get('sni'):
+                params.append(f"sni={settings['sni']}")
+            if settings.get('sid'):
+                params.append(f"sid={settings['sid']}")
+            if settings.get('flow'):
+                params.append(f"flow={settings['flow']}")
             params.append("spx=%2F")
 
         link_name = f"{name_prefix} {client_email}" if name_prefix else client_email
-        vless_link += "?" + "&".join(params) + f"#{link_name}"
+        query = '&'.join(params)
+        vless_link = f"vless://{client_uuid}@{domain}:{port}?{query}#{link_name}"
 
-        logger.info(f"Сгенерирована VLESS ссылка с сервера {server_name} для {client_email}")
+        source = "панели" if panel_settings else "статического конфига"
+        logger.info(f"Сгенерирована VLESS ссылка с {source} сервера {server_name} для {client_email}")
         return vless_link
 
     logger.error(f"Не найден активный сервер для генерации ссылки")

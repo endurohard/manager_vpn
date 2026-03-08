@@ -2,6 +2,7 @@
 Главный файл бота для управления VPN ключами
 """
 import asyncio
+import functools
 import logging
 import sys
 import os
@@ -16,27 +17,222 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import FSInputFile
 
-from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, INBOUND_ID
+import json
+
+from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, INBOUND_ID, YANDEX_LOGIN, YANDEX_PASSWORD, BACKUP_KEEP_DAYS
 from bot.database import DatabaseManager
 from bot.api import XUIClient
 from bot.handlers import common, manager, admin, extended
 from bot.middlewares import BanCheckMiddleware, ThrottlingMiddleware, MaintenanceMiddleware
 from bot.webapp.server import start_webapp_server, set_bot_instance
-from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server, get_all_clients_from_panel, reset_client_traffic_via_panel
+from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server, get_all_clients_from_panel, reset_client_traffic_via_panel, PANEL_REQUEST_TIMEOUT
 
 # Путь к базе данных X-UI
 XUI_DB_PATH = Path("/etc/x-ui/x-ui.db")
 
 # Настройка логирования
+# Используем только StreamHandler — systemd сам записывает stdout в bot.log
+# (FileHandler + systemd redirect давали дублирование строк)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log')
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+import aiohttp as _aiohttp
+
+WEBDAV_BASE = "https://webdav.yandex.ru"
+WEBDAV_BACKUP_DIR = "/vpn_backups"
+
+
+async def _webdav_request(method: str, path: str, **kwargs):
+    """Выполнить WebDAV-запрос к Яндекс.Диску"""
+    auth = _aiohttp.BasicAuth(YANDEX_LOGIN, YANDEX_PASSWORD)
+    async with _aiohttp.ClientSession(auth=auth) as session:
+        async with session.request(method, f"{WEBDAV_BASE}{path}", **kwargs) as resp:
+            return resp.status, await resp.text()
+
+
+async def _ensure_webdav_dir(path: str):
+    """Создать директорию на Яндекс.Диске если не существует"""
+    status, _ = await _webdav_request("MKCOL", path)
+    # 201 = created, 405 = already exists
+    return status in (201, 405)
+
+
+async def _webdav_list_files(path: str) -> list:
+    """Получить список файлов в директории через PROPFIND"""
+    headers = {"Depth": "1", "Content-Type": "application/xml"}
+    body = '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/></d:prop></d:propfind>'
+    status, text = await _webdav_request("PROPFIND", path, headers=headers, data=body)
+    if status != 207:
+        return []
+    # Парсим href из multistatus ответа
+    import re
+    hrefs = re.findall(r'<d:href>([^<]+)</d:href>', text)
+    # Первый href — сама директория, остальные — файлы
+    return [h for h in hrefs[1:] if h != path and h != path + '/']
+
+
+async def upload_to_yandex_disk(file_path: Path) -> bool:
+    """Загрузить файл на Яндекс.Диск через WebDAV"""
+    if not YANDEX_LOGIN or not YANDEX_PASSWORD:
+        logger.info("Яндекс.Диск не настроен, пропускаем загрузку")
+        return False
+
+    try:
+        # Создаём папку
+        await _ensure_webdav_dir(WEBDAV_BACKUP_DIR)
+
+        # Загружаем файл
+        remote_path = f"{WEBDAV_BACKUP_DIR}/{file_path.name}"
+        with open(file_path, 'rb') as f:
+            data = f.read()
+
+        status, _ = await _webdav_request("PUT", remote_path, data=data)
+        if status in (200, 201, 204):
+            logger.info(f"Загружен на Яндекс.Диск: {remote_path}")
+        else:
+            logger.error(f"Ошибка загрузки на Яндекс.Диск: HTTP {status}")
+            return False
+
+        # Ротация старых бэкапов
+        files = await _webdav_list_files(WEBDAV_BACKUP_DIR)
+        # Фильтруем по префиксу имени файла (clients_backup_ / bot_db_backup_ / x-ui_backup_)
+        prefix = file_path.name.rsplit('_', 1)[0].rsplit('_', 1)[0]  # e.g. "clients_backup"
+        # Берём stem до даты
+        import re
+        m = re.match(r'^(.+?)_\d{4}-\d{2}-\d{2}', file_path.name)
+        prefix = m.group(1) if m else file_path.stem
+        matching = sorted([f for f in files if prefix in f], reverse=True)
+
+        for old_file in matching[BACKUP_KEEP_DAYS:]:
+            await _webdav_request("DELETE", old_file)
+            logger.info(f"Удалён старый бэкап с Яндекс.Диска: {old_file}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки на Яндекс.Диск: {e}")
+        return False
+
+
+async def backup_remote_panels(bot: Bot):
+    """Бэкап баз X-UI со всех доступных удалённых серверов"""
+    config = load_servers_config()
+    active_servers = [
+        s for s in config.get('servers', [])
+        if s.get('enabled', True) and s.get('panel')
+    ]
+
+    if not active_servers:
+        logger.info("Нет доступных серверов с панелями для бэкапа")
+        return
+
+    backup_dir = Path("/root/manager_vpn/backups")
+    backup_dir.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    results = []
+    for server in active_servers:
+        server_name = server.get('name', 'Unknown')
+        panel = server.get('panel', {})
+        ip = server.get('ip', '')
+        port = panel.get('port', 1020)
+        path = panel.get('path', '')
+        username = panel.get('username', '')
+        password = panel.get('password', '')
+
+        if not all([ip, username, password]):
+            results.append(f"⚠️ {server_name}: неполные данные панели")
+            continue
+
+        try:
+            import ssl
+            import http.cookiejar
+            import urllib.request
+            import urllib.parse
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            cookie_jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cookie_jar),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+
+            base_url = f"https://{ip}:{port}{path}"
+
+            # Авторизация
+            login_data = urllib.parse.urlencode({
+                'username': username,
+                'password': password
+            }).encode()
+            login_req = urllib.request.Request(
+                f"{base_url}/login", data=login_data, method='POST'
+            )
+            login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+
+            loop = asyncio.get_event_loop()
+            login_resp = await loop.run_in_executor(
+                None, functools.partial(opener.open, login_req, timeout=PANEL_REQUEST_TIMEOUT)
+            )
+            login_result = json.loads(login_resp.read())
+            if not login_result.get('success'):
+                results.append(f"❌ {server_name}: ошибка авторизации")
+                continue
+
+            # Скачиваем базу
+            db_req = urllib.request.Request(f"{base_url}/panel/api/server/getDb", method='GET')
+            db_resp = await loop.run_in_executor(
+                None, functools.partial(opener.open, db_req, timeout=30)
+            )
+            db_data = db_resp.read()
+
+            if len(db_data) < 100:
+                results.append(f"❌ {server_name}: пустой ответ ({len(db_data)} байт)")
+                continue
+
+            # Безопасное имя файла
+            safe_name = server_name.replace(' ', '_').replace('/', '_').replace(':', '')
+            backup_file = backup_dir / f"xui_{safe_name}_{date_str}.db"
+            backup_file.write_bytes(db_data)
+
+            size_kb = len(db_data) / 1024
+            results.append(f"✅ {server_name}: {size_kb:.1f} KB")
+            logger.info(f"Бэкап панели {server_name} сохранён: {backup_file}")
+
+            # Загрузка на Яндекс.Диск
+            await upload_to_yandex_disk(backup_file)
+
+            # Ротация локальных бэкапов этого сервера
+            pattern = f"xui_{safe_name}_*.db"
+            old_backups = sorted(backup_dir.glob(pattern), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old in old_backups[7:]:
+                old.unlink()
+                logger.info(f"Удалён старый бэкап панели: {old}")
+
+        except Exception as e:
+            results.append(f"❌ {server_name}: {e}")
+            logger.error(f"Ошибка бэкапа панели {server_name}: {e}")
+
+    # Отчёт админу
+    if results:
+        report = (
+            f"💾 <b>Бэкап панелей X-UI</b>\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            + "\n".join(results)
+        )
+        try:
+            await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить отчёт о бэкапе панелей: {e}")
 
 
 async def daily_backup_task(bot: Bot):
@@ -61,6 +257,8 @@ async def daily_backup_task(bot: Bot):
 
             # Выполняем бэкап
             await send_xui_backup(bot)
+            await backup_remote_panels(bot)
+            await create_clients_backup(bot)
 
         except asyncio.CancelledError:
             logger.info("Задача бэкапа отменена")
@@ -100,6 +298,9 @@ async def send_xui_backup(bot: Bot):
 
         logger.info(f"Бэкап X-UI отправлен: {backup_file}")
 
+        # Загрузка на Яндекс.Диск
+        await upload_to_yandex_disk(backup_file)
+
         # Удаляем старые бэкапы (оставляем только 7 последних)
         backups = sorted(backup_dir.glob("x-ui_backup_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
         for old_backup in backups[7:]:
@@ -107,9 +308,179 @@ async def send_xui_backup(bot: Bot):
             logger.info(f"Удалён старый бэкап: {old_backup}")
 
     except Exception as e:
-        logger.error(f"Ошибка отправки бэкапа: {e}")
+        logger.error(f"Ошибка отправки бэкапа X-UI: {e}")
         try:
             await bot.send_message(ADMIN_ID, f"❌ Ошибка бэкапа X-UI: {e}")
+        except:
+            pass
+
+    # Бэкап bot_database.db
+    try:
+        bot_db_path = Path(DATABASE_PATH)
+        if bot_db_path.exists():
+            backup_dir = Path("/root/manager_vpn/backups")
+            backup_dir.mkdir(exist_ok=True)
+
+            date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            bot_db_backup = backup_dir / f"bot_db_backup_{date_str}.db"
+
+            shutil.copy2(bot_db_path, bot_db_backup)
+
+            document = FSInputFile(bot_db_backup)
+            await bot.send_document(
+                ADMIN_ID,
+                document,
+                caption=f"💾 <b>Бэкап bot_database.db</b>\n\n"
+                        f"📅 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                        f"📦 Размер: {bot_db_backup.stat().st_size / 1024:.1f} KB",
+                parse_mode="HTML"
+            )
+            logger.info(f"Бэкап bot_database отправлен: {bot_db_backup}")
+
+            # Загрузка на Яндекс.Диск
+            await upload_to_yandex_disk(bot_db_backup)
+
+            # Ротация: оставляем 7 последних
+            bot_backups = sorted(backup_dir.glob("bot_db_backup_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old in bot_backups[7:]:
+                old.unlink()
+                logger.info(f"Удалён старый бэкап bot_db: {old}")
+        else:
+            logger.warning(f"bot_database.db не найдена: {bot_db_path}")
+    except Exception as e:
+        logger.error(f"Ошибка бэкапа bot_database: {e}")
+        try:
+            await bot.send_message(ADMIN_ID, f"❌ Ошибка бэкапа bot_database: {e}")
+        except:
+            pass
+
+
+async def create_clients_backup(bot: Bot):
+    """Полный JSON-бэкап клиентов со списком серверов"""
+    try:
+        backup_dir = Path("/root/manager_vpn/backups")
+        backup_dir.mkdir(exist_ok=True)
+
+        # 1. Читаем все записи из keys_history
+        keys_data = []
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT id, manager_id, client_email, phone_number, period, expire_days, '
+                'client_id, price, server_name, created_at FROM keys_history ORDER BY created_at DESC'
+            )
+            keys_data = [dict(row) for row in await cursor.fetchall()]
+
+        # 2. Для каждого активного сервера получаем список клиентов
+        config = load_servers_config()
+        active_servers = [s for s in config.get('servers', []) if s.get('enabled', True)]
+
+        servers_info = {}
+        all_panel_clients = {}  # email -> list of server_names
+        for server in active_servers:
+            server_name = server.get('name', 'Unknown')
+            try:
+                clients = await get_all_clients_from_panel(server)
+                client_emails = [c.get('email', '') for c in clients if c.get('email')]
+                servers_info[server_name] = {
+                    'total_clients': len(client_emails),
+                    'clients': client_emails
+                }
+                for email in client_emails:
+                    if email not in all_panel_clients:
+                        all_panel_clients[email] = []
+                    all_panel_clients[email].append(server_name)
+            except Exception as e:
+                logger.error(f"Ошибка получения клиентов с {server_name}: {e}")
+                servers_info[server_name] = {'total_clients': 0, 'clients': [], 'error': str(e)}
+
+        # 3. Формируем JSON
+        clients_list = []
+        for key in keys_data:
+            email = key.get('client_email', '')
+            clients_list.append({
+                'uuid': key.get('client_id'),
+                'email': email,
+                'phone': key.get('phone_number'),
+                'period': key.get('period'),
+                'expire_days': key.get('expire_days'),
+                'created_at': key.get('created_at'),
+                'price': key.get('price'),
+                'manager_id': key.get('manager_id'),
+                'server_name': key.get('server_name'),
+                'servers_found_on': all_panel_clients.get(email, [])
+            })
+
+        # Получаем linked_clients
+        linked_clients = []
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('SELECT master_uuid, linked_uuid, linked_at FROM linked_clients')
+            linked_clients = [dict(row) for row in await cursor.fetchall()]
+
+        # Получаем client_servers (привязка клиентов к серверам)
+        client_servers = []
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT client_uuid, client_email, server_name, inbound_id, '
+                'expire_days, expire_timestamp, total_gb, ip_limit, created_at '
+                'FROM client_servers ORDER BY created_at DESC'
+            )
+            client_servers = [dict(row) for row in await cursor.fetchall()]
+
+        backup_data = {
+            'backup_date': datetime.now().isoformat(),
+            'clients': clients_list,
+            'servers': servers_info,
+            'linked_clients': linked_clients,
+            'client_servers': client_servers,
+            'stats': {
+                'total_keys': len(keys_data),
+                'active_servers': len(active_servers),
+                'client_server_records': len(client_servers),
+            }
+        }
+
+        # 4. Сохраняем JSON
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        json_file = backup_dir / f"clients_backup_{date_str}.json"
+        json_content = json.dumps(backup_data, ensure_ascii=False, indent=2, default=str)
+        json_file.write_text(json_content, encoding='utf-8')
+
+        backup_data['stats']['backup_size_kb'] = round(json_file.stat().st_size / 1024, 1)
+        json_content = json.dumps(backup_data, ensure_ascii=False, indent=2, default=str)
+        json_file.write_text(json_content, encoding='utf-8')
+
+        # 5. Отправляем файл админу
+        document = FSInputFile(json_file)
+        await bot.send_document(
+            ADMIN_ID,
+            document,
+            caption=f"📋 <b>Бэкап клиентов со списком серверов</b>\n\n"
+                    f"📅 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                    f"🔑 Ключей: {len(keys_data)}\n"
+                    f"🌐 Серверов: {len(active_servers)}\n"
+                    f"📦 Размер: {json_file.stat().st_size / 1024:.1f} KB",
+            parse_mode="HTML"
+        )
+        logger.info(f"JSON бэкап клиентов отправлен: {json_file}")
+
+        # 5.1 Загрузка на Яндекс.Диск
+        yd_ok = await upload_to_yandex_disk(json_file)
+        if yd_ok:
+            await bot.send_message(ADMIN_ID, f"☁️ Бэкап клиентов загружен на Яндекс.Диск")
+
+        # 6. Ротация: 7 последних JSON файлов
+        json_backups = sorted(backup_dir.glob("clients_backup_*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+        for old in json_backups[7:]:
+            old.unlink()
+            logger.info(f"Удалён старый JSON бэкап: {old}")
+
+    except Exception as e:
+        logger.error(f"Ошибка JSON бэкапа клиентов: {e}")
+        try:
+            await bot.send_message(ADMIN_ID, f"❌ Ошибка JSON бэкапа клиентов: {e}")
         except:
             pass
 
@@ -413,6 +784,241 @@ async def retry_pending_keys_task(bot: Bot, db: DatabaseManager, xui_client: XUI
             await asyncio.sleep(60)
 
 
+async def restore_clients_from_backup(backup_path: str, target_server_name: str = None, bot: Bot = None) -> dict:
+    """
+    Восстановить клиентов на серверах из JSON-бэкапа.
+
+    :param backup_path: путь к JSON-файлу бэкапа
+    :param target_server_name: если указано — восстановить только на этот сервер
+    :param bot: бот для отправки отчёта
+    :return: {'restored': int, 'skipped': int, 'errors': int, 'details': [...]}
+    """
+    from bot.api.remote_xui import create_client_on_remote_server, load_servers_config
+
+    with open(backup_path, 'r', encoding='utf-8') as f:
+        backup_data = json.load(f)
+
+    client_servers_data = backup_data.get('client_servers', [])
+    if not client_servers_data:
+        return {'restored': 0, 'skipped': 0, 'errors': 0, 'details': ['Нет данных client_servers в бэкапе']}
+
+    # Загружаем конфиг серверов
+    config = load_servers_config()
+    servers_map = {s.get('name'): s for s in config.get('servers', []) if s.get('enabled', True) and s.get('panel')}
+
+    restored = 0
+    skipped = 0
+    errors = 0
+    details = []
+
+    for record in client_servers_data:
+        client_uuid = record.get('client_uuid')
+        client_email = record.get('client_email', '')
+        server_name = record.get('server_name', '')
+        expire_days = record.get('expire_days', 30)
+        expire_timestamp = record.get('expire_timestamp', 0)
+        total_gb = record.get('total_gb', 0)
+        ip_limit = record.get('ip_limit', 2)
+        inbound_id = record.get('inbound_id', 1)
+
+        if not client_uuid or not server_name:
+            skipped += 1
+            continue
+
+        # Пропускаем истёкшие подписки
+        if expire_timestamp > 0:
+            now_ms = int(datetime.now().timestamp() * 1000)
+            if expire_timestamp < now_ms:
+                skipped += 1
+                details.append(f"⏭ {client_email}: подписка истекла")
+                continue
+
+        # Если указан целевой сервер — восстанавливаем только на него
+        actual_server_name = target_server_name or server_name
+
+        server_config = servers_map.get(actual_server_name)
+        if not server_config:
+            skipped += 1
+            details.append(f"⏭ {client_email}: сервер {actual_server_name} не найден/отключен")
+            continue
+
+        try:
+            result = await create_client_on_remote_server(
+                server_config=server_config,
+                client_uuid=client_uuid,
+                email=client_email,
+                expire_days=expire_days,
+                ip_limit=ip_limit,
+                inbound_id=inbound_id,
+                total_gb=total_gb,
+                expire_time_ms=expire_timestamp if expire_timestamp > 0 else None
+            )
+            if result.get('success') or result.get('existing'):
+                restored += 1
+                logger.info(f"Восстановлен {client_email} на {actual_server_name}")
+            else:
+                errors += 1
+                details.append(f"❌ {client_email} → {actual_server_name}: {result.get('error', 'unknown')}")
+        except Exception as e:
+            errors += 1
+            details.append(f"❌ {client_email} → {actual_server_name}: {e}")
+
+        await asyncio.sleep(0.2)  # Пауза между запросами
+
+    summary = f"Восстановлено: {restored}, пропущено: {skipped}, ошибок: {errors}"
+    logger.info(f"Восстановление из бэкапа завершено: {summary}")
+
+    return {'restored': restored, 'skipped': skipped, 'errors': errors, 'details': details}
+
+
+async def backfill_server_names(db: DatabaseManager):
+    """Одноразовое ретроспективное заполнение server_name для существующих ключей"""
+    flag = await db.get_setting('server_name_backfill_done')
+    if flag == '1':
+        return
+
+    logger.info("Запуск ретроспективного заполнения server_name...")
+
+    try:
+        # Получаем ключи без server_name
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                'SELECT id, client_id FROM keys_history WHERE server_name IS NULL AND client_id IS NOT NULL'
+            )
+            keys_without_server = [dict(row) for row in await cursor.fetchall()]
+
+        if not keys_without_server:
+            logger.info("Нет ключей без server_name, пропускаем")
+            await db.set_setting('server_name_backfill_done', '1')
+            return
+
+        logger.info(f"Найдено {len(keys_without_server)} ключей без server_name")
+
+        config = load_servers_config()
+        active_servers = [s for s in config.get('servers', []) if s.get('enabled', True) and s.get('panel')]
+
+        # Получаем все клиенты со всех серверов разом
+        server_clients_map = {}  # email -> server_name
+        for server in active_servers:
+            server_name = server.get('name', 'Unknown')
+            try:
+                clients = await get_all_clients_from_panel(server)
+                for c in clients:
+                    email = c.get('email', '')
+                    if email and email not in server_clients_map:
+                        server_clients_map[email] = server_name
+            except Exception as e:
+                logger.error(f"Ошибка получения клиентов с {server_name} при backfill: {e}")
+
+        # Получаем email для каждого ключа
+        updated = 0
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                'SELECT id, client_id, client_email FROM keys_history WHERE server_name IS NULL AND client_id IS NOT NULL'
+            )
+            keys = [dict(row) for row in await cursor.fetchall()]
+
+            for key in keys:
+                email = key.get('client_email', '')
+                found_server = server_clients_map.get(email)
+                if found_server:
+                    await conn.execute(
+                        'UPDATE keys_history SET server_name = ? WHERE id = ?',
+                        (found_server, key['id'])
+                    )
+                    updated += 1
+
+            await conn.commit()
+
+        logger.info(f"Ретроспективное заполнение завершено: обновлено {updated}/{len(keys_without_server)} ключей")
+        await db.set_setting('server_name_backfill_done', '1')
+
+    except Exception as e:
+        logger.error(f"Ошибка ретроспективного заполнения server_name: {e}")
+
+
+async def backfill_client_servers(db: DatabaseManager):
+    """Одноразовое заполнение таблицы client_servers для существующих клиентов"""
+    flag = await db.get_setting('client_servers_backfill_done')
+    if flag == '1':
+        return
+
+    logger.info("Запуск заполнения client_servers для существующих клиентов...")
+
+    try:
+        # Получаем все ключи с client_id
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                'SELECT client_id, client_email, expire_days FROM keys_history '
+                'WHERE client_id IS NOT NULL AND client_id != ""'
+            )
+            keys = [dict(row) for row in await cursor.fetchall()]
+
+        if not keys:
+            logger.info("Нет ключей для заполнения client_servers")
+            await db.set_setting('client_servers_backfill_done', '1')
+            return
+
+        logger.info(f"Найдено {len(keys)} ключей для проверки")
+
+        config = load_servers_config()
+        active_servers = [s for s in config.get('servers', []) if s.get('enabled', True) and s.get('panel')]
+
+        # Строим карту: email -> список серверов, где клиент найден (с expiry)
+        email_servers = {}
+        for server in active_servers:
+            server_name = server.get('name', 'Unknown')
+            try:
+                clients = await get_all_clients_from_panel(server)
+                for c in clients:
+                    email = c.get('email', '')
+                    if email:
+                        if email not in email_servers:
+                            email_servers[email] = []
+                        email_servers[email].append({
+                            'server_name': server_name,
+                            'inbound_id': c.get('inbound_id', 1),
+                            'expiryTime': c.get('expiryTime', 0),
+                            'totalGB': c.get('totalGB', 0),
+                            'limitIp': c.get('limitIp', 2),
+                        })
+            except Exception as e:
+                logger.error(f"Ошибка получения клиентов с {server_name}: {e}")
+
+        # Заполняем client_servers
+        added = 0
+        for key in keys:
+            email = key.get('client_email', '')
+            client_uuid = key.get('client_id', '')
+            expire_days = key.get('expire_days', 0)
+            servers = email_servers.get(email, [])
+
+            for srv_info in servers:
+                try:
+                    await db.add_client_server(
+                        client_uuid=client_uuid,
+                        client_email=email,
+                        server_name=srv_info['server_name'],
+                        inbound_id=srv_info.get('inbound_id', 1),
+                        expire_days=expire_days,
+                        expire_timestamp=srv_info.get('expiryTime', 0),
+                        total_gb=srv_info.get('totalGB', 0),
+                        ip_limit=srv_info.get('limitIp', 2)
+                    )
+                    added += 1
+                except Exception:
+                    pass
+
+        logger.info(f"Заполнение client_servers завершено: добавлено {added} записей")
+        await db.set_setting('client_servers_backfill_done', '1')
+
+    except Exception as e:
+        logger.error(f"Ошибка заполнения client_servers: {e}")
+
+
 async def main():
     """Основная функция запуска бота"""
 
@@ -436,6 +1042,10 @@ async def main():
     db = DatabaseManager(DATABASE_PATH)
     await db.init_db()
     logger.info("База данных инициализирована")
+
+    # Ретроспективное заполнение server_name (одноразово)
+    await backfill_server_names(db)
+    await backfill_client_servers(db)
 
     # Автоматически добавляем админа как менеджера, если его нет
     if not await db.is_manager(ADMIN_ID):

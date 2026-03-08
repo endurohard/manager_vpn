@@ -56,6 +56,12 @@ class DatabaseManager:
             except Exception:
                 pass  # Колонка уже существует
 
+            # Добавляем колонку server_name для хранения имени сервера
+            try:
+                await db.execute('ALTER TABLE keys_history ADD COLUMN server_name TEXT DEFAULT NULL')
+            except Exception:
+                pass  # Колонка уже существует
+
             # Добавляем колонку custom_name для пользовательских имен менеджеров
             try:
                 await db.execute('ALTER TABLE managers ADD COLUMN custom_name TEXT')
@@ -158,6 +164,33 @@ class DatabaseManager:
             ''')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_payments_manager ON manager_payments(manager_id)')
 
+            # Таблица серверов клиента (для бэкапа/восстановления подписок)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS client_servers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_uuid TEXT NOT NULL,
+                    client_email TEXT,
+                    server_name TEXT NOT NULL,
+                    inbound_id INTEGER DEFAULT 1,
+                    expire_days INTEGER DEFAULT 0,
+                    expire_timestamp INTEGER DEFAULT 0,
+                    total_gb INTEGER DEFAULT 0,
+                    ip_limit INTEGER DEFAULT 2,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_client_servers_uuid ON client_servers(client_uuid)')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_client_servers_unique ON client_servers(client_uuid, server_name)')
+
+            # Таблица настроек (для одноразовых флагов миграций и т.п.)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS admin_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             logger.info("Индексы базы данных созданы/проверены")
 
             await db.commit()
@@ -238,16 +271,61 @@ class DatabaseManager:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def add_client_server(self, client_uuid: str, client_email: str, server_name: str,
+                                inbound_id: int = 1, expire_days: int = 0,
+                                expire_timestamp: int = 0, total_gb: int = 0,
+                                ip_limit: int = 2) -> bool:
+        """Зафиксировать сервер, на котором создан клиент"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    '''INSERT OR REPLACE INTO client_servers
+                       (client_uuid, client_email, server_name, inbound_id, expire_days, expire_timestamp, total_gb, ip_limit)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (client_uuid, client_email, server_name, inbound_id, expire_days, expire_timestamp, total_gb, ip_limit)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error adding client server: {e}")
+            return False
+
+    async def get_client_servers(self, client_uuid: str) -> List[Dict]:
+        """Получить список серверов клиента"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    'SELECT * FROM client_servers WHERE client_uuid = ?',
+                    (client_uuid,)
+                )
+                return [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting client servers: {e}")
+            return []
+
+    async def get_all_client_servers(self) -> List[Dict]:
+        """Получить все записи client_servers (для бэкапа)"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('SELECT * FROM client_servers ORDER BY created_at DESC')
+                return [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting all client servers: {e}")
+            return []
+
     async def add_key_to_history(self, manager_id: int, client_email: str, phone_number: str,
-                                  period: str, expire_days: int, client_id: str, price: int = 0) -> bool:
+                                  period: str, expire_days: int, client_id: str, price: int = 0,
+                                  server_name: str = None) -> bool:
         """Добавить запись о созданном ключе"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     '''INSERT INTO keys_history
-                       (manager_id, client_email, phone_number, period, expire_days, client_id, price)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    (manager_id, client_email, phone_number, period, expire_days, client_id, price)
+                       (manager_id, client_email, phone_number, period, expire_days, client_id, price, server_name)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (manager_id, client_email, phone_number, period, expire_days, client_id, price, server_name)
                 )
                 await db.commit()
                 return True
@@ -1021,3 +1099,28 @@ class DatabaseManager:
             ''', (client_uuid,))
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    # ==================== ADMIN SETTINGS ====================
+
+    async def get_setting(self, key: str) -> Optional[str]:
+        """Получить значение настройки"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'SELECT value FROM admin_settings WHERE key = ?', (key,)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def set_setting(self, key: str, value: str) -> bool:
+        """Установить значение настройки"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    'INSERT OR REPLACE INTO admin_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+                    (key, value)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error setting admin setting {key}: {e}")
+            return False

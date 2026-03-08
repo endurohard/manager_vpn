@@ -34,6 +34,11 @@ WEBAPP_URL = os.getenv('WEBAPP_URL', f'https://{DOMAIN}:8080')  # URL для д�
 ADMIN_ROOT_PATH = os.getenv('ADMIN_ROOT_PATH', '/manager')
 ADMIN_PANEL_URL = os.getenv('ADMIN_PANEL_URL', f'https://zov-gor.ru{ADMIN_ROOT_PATH}')
 
+# Yandex Disk (WebDAV backup)
+YANDEX_LOGIN = os.getenv('YANDEX_LOGIN', '')
+YANDEX_PASSWORD = os.getenv('YANDEX_PASSWORD', '')
+BACKUP_KEEP_DAYS = int(os.getenv('BACKUP_KEEP_DAYS', 7))
+
 # Импортируем функцию для получения актуальных цен
 from bot.price_config import get_subscription_periods
 
