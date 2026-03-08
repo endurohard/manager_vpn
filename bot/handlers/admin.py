@@ -5745,3 +5745,72 @@ async def restore_cancel_text(message: Message, state: FSMContext):
     """Отмена восстановления текстом"""
     await state.clear()
     await message.answer("❌ Восстановление отменено")
+
+
+# ===== Ручной бэкап =====
+
+@router.message(F.text == "/backup")
+async def cmd_manual_backup(message: Message, bot, **kwargs):
+    """Ручной бэкап всех баз — отправка в чат + Яндекс.Диск"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    await message.answer("⏳ Запускаю полный бэкап...")
+
+    import shutil
+    import json as _json
+    from pathlib import Path
+    from datetime import datetime
+    from aiogram.types import FSInputFile
+    from bot.config import DATABASE_PATH
+    from main import upload_to_yandex_disk, backup_remote_panels, create_clients_backup
+
+    backup_dir = Path('/root/manager_vpn/backups')
+    backup_dir.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    results = []
+
+    # 1. Локальная X-UI база
+    xui_db = Path('/etc/x-ui/x-ui.db')
+    if xui_db.exists():
+        try:
+            dst = backup_dir / f'x-ui_backup_{date_str}.db'
+            shutil.copy2(xui_db, dst)
+            doc = FSInputFile(dst)
+            await bot.send_document(ADMIN_ID, doc, caption=f"💾 X-UI local ({dst.stat().st_size/1024:.1f} KB)")
+            await upload_to_yandex_disk(dst)
+            results.append("✅ X-UI local")
+        except Exception as e:
+            results.append(f"❌ X-UI local: {e}")
+
+    # 2. bot_database.db
+    bot_db = Path(DATABASE_PATH)
+    if bot_db.exists():
+        try:
+            dst = backup_dir / f'bot_db_backup_{date_str}.db'
+            shutil.copy2(bot_db, dst)
+            doc = FSInputFile(dst)
+            await bot.send_document(ADMIN_ID, doc, caption=f"💾 bot_database ({dst.stat().st_size/1024:.1f} KB)")
+            await upload_to_yandex_disk(dst)
+            results.append("✅ bot_database")
+        except Exception as e:
+            results.append(f"❌ bot_database: {e}")
+
+    # 3. Удалённые панели
+    try:
+        await backup_remote_panels(bot)
+        results.append("✅ Удалённые панели")
+    except Exception as e:
+        results.append(f"❌ Удалённые панели: {e}")
+
+    # 4. JSON бэкап клиентов
+    try:
+        await create_clients_backup(bot)
+        results.append("✅ JSON клиентов")
+    except Exception as e:
+        results.append(f"❌ JSON клиентов: {e}")
+
+    await message.answer(
+        f"📋 <b>Бэкап завершён</b>\n\n" + "\n".join(results),
+        parse_mode="HTML"
+    )
