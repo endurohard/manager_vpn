@@ -3320,6 +3320,7 @@ class AddServerStates(StatesGroup):
     waiting_panel_port = State()
     waiting_panel_path = State()
     waiting_panel_credentials = State()
+    waiting_name_prefix = State()
     confirm = State()
 
 
@@ -4595,8 +4596,36 @@ async def process_panel_credentials(message: Message, state: FSMContext):
 
     await state.update_data(panel_username=panel_username, panel_password=panel_password)
 
-    # Показываем подтверждение
+    # Запрашиваем name_prefix для подписки
     data = await state.get_data()
+    default_prefix = f"📶 {data['name']}"
+
+    await message.answer(
+        "📝 <b>Имя сервера в подписке</b>\n\n"
+        "Это имя будет отображаться в VPN-приложении клиента.\n\n"
+        f"По умолчанию: <code>{default_prefix}</code>\n\n"
+        "Введите имя или отправьте <b>+</b> чтобы использовать по умолчанию:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddServerStates.waiting_name_prefix)
+
+
+@router.message(AddServerStates.waiting_name_prefix)
+async def process_name_prefix(message: Message, state: FSMContext):
+    """Обработка имени сервера для подписки"""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление сервера отменено", reply_markup=Keyboards.admin_menu())
+        return
+
+    data = await state.get_data()
+
+    if message.text.strip() == "+":
+        name_prefix = f"📶 {data['name']}"
+    else:
+        name_prefix = message.text.strip()
+
+    await state.update_data(name_prefix=name_prefix)
 
     text = (
         "📋 <b>ПРОВЕРЬТЕ ДАННЫЕ СЕРВЕРА</b>\n\n"
@@ -4604,7 +4633,8 @@ async def process_panel_credentials(message: Message, state: FSMContext):
         f"🌐 IP: <code>{data['ip']}</code>\n"
         f"🔗 Домен: <code>{data['domain']}</code>\n"
         f"🖥 Панель: <code>{data.get('panel_url', '')}</code>\n"
-        f"👤 Логин: {panel_username}\n\n"
+        f"👤 Логин: {data['panel_username']}\n"
+        f"📝 В подписке: <b>{name_prefix}</b>\n\n"
         "Всё верно?"
     )
 
@@ -4778,12 +4808,14 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                                             flow = c.get('flow')
                                             break
 
+                                    # Используем name_prefix из FSM (введённый пользователем)
+                                    user_prefix = data.get('name_prefix', f"📶 {data['name']}")
                                     inbound_config = {
                                         "id": int(inbound_id),
                                         "security": security,
                                         "flow": flow,
                                         "fp": "chrome",
-                                        "name_prefix": f"🌐 {remark}"
+                                        "name_prefix": user_prefix
                                     }
 
                                     if security == 'reality':
@@ -4845,7 +4877,7 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
                 "sid": "",
                 "flow": "",
                 "fp": "chrome",
-                "name_prefix": "🌐 Main"
+                "name_prefix": data.get('name_prefix', f"📶 {data['name']}")
             }
         }
     }

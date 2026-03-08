@@ -220,6 +220,35 @@
           "name_prefix": "🇷🇺 📶 LTE: Универсальный"
         }
       }
+    },
+    {
+      "name": "LTE📲",
+      "domain": "194.87.25.250",
+      "ip": "194.87.25.250",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер LTE📲",
+      "panel": {
+        "url": "https://194.87.25.250:42175/RmL5UcIIbOgfSt00Xr",
+        "port": 42175,
+        "path": "/RmL5UcIIbOgfSt00Xr",
+        "username": "esFETzGAxU",
+        "password": "4QSFGnzQFX"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "example.com",
+          "pbk": "",
+          "sid": "",
+          "flow": "",
+          "fp": "chrome",
+          "name_prefix": "📶 LTE📲"
+        }
+      }
     }
   ]
 }
