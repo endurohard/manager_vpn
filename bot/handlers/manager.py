@@ -55,6 +55,11 @@ class ReplaceKeyStates(StatesGroup):
     confirm = State()
 
 
+class SearchClientStates(StatesGroup):
+    """Состояния для поиска клиента менеджером"""
+    waiting_for_query = State()
+
+
 class FixKeyStates(StatesGroup):
     """Состояния для исправления ключа"""
     waiting_for_key = State()
@@ -1959,6 +1964,204 @@ async def _generate_fixed_link(message: Message, state: FSMContext, target_serve
 
     await state.clear()
     await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+
+
+# ==================== ПОИСК КЛИЕНТА ====================
+
+@router.message(F.text == "🔍 Найти клиента")
+async def start_search_client(message: Message, state: FSMContext, db: DatabaseManager):
+    """Начало поиска клиента менеджером"""
+    user_id = message.from_user.id
+    if not await is_authorized(user_id, db):
+        await message.answer("У вас нет доступа к этой функции.")
+        return
+
+    await state.set_state(SearchClientStates.waiting_for_query)
+    await message.answer(
+        "🔍 <b>ПОИСК КЛИЕНТА</b>\n\n"
+        "Введите номер телефона или имя клиента для поиска.\n\n"
+        "Примеры:\n"
+        "• <code>+79001234567</code>\n"
+        "• <code>client_name</code>\n\n"
+        "Или нажмите 'Отмена' для возврата.",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel()
+    )
+
+
+@router.message(SearchClientStates.waiting_for_query, F.text == "Отмена")
+async def cancel_search_client(message: Message, state: FSMContext):
+    """Отмена поиска"""
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+    await state.clear()
+    await message.answer(
+        "Поиск отменен.",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+
+
+@router.message(SearchClientStates.waiting_for_query)
+async def process_search_client(message: Message, state: FSMContext, db: DatabaseManager):
+    """Обработка поиска клиента менеджером"""
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+    query = message.text.strip()
+
+    # Если нажата кнопка меню — выходим
+    menu_buttons = {
+        "Создать ключ", "🔄 Замена ключа", "🔧 Исправить ключ",
+        "💰 Прайс", "Моя статистика", "🔍 Найти клиента",
+        "Панель администратора", "Назад",
+    }
+    if query in menu_buttons:
+        await state.clear()
+        await message.answer("🔍 Поиск отменен.", reply_markup=Keyboards.main_menu(is_admin))
+        return
+
+    if len(query) < 2:
+        await message.answer("❌ Введите минимум 2 символа для поиска.")
+        return
+
+    status_msg = await message.answer("🔍 Поиск...")
+
+    # Для админа ищем по всем менеджерам, для менеджера — только по своим
+    if is_admin:
+        keys = await db.search_keys(query)
+    else:
+        keys = await db.search_keys_by_manager(user_id, query)
+
+    if not keys:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
+            "Попробуйте другой запрос или нажмите 'Отмена' для выхода.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+
+    # Если один результат — сразу показываем подписку с QR
+    if len(keys) == 1:
+        key = keys[0]
+        client_uuid = key.get('client_id', '')
+        phone = key.get('phone_number', key.get('client_email', 'N/A'))
+        period = key.get('period', 'N/A')
+        price = key.get('price', 0) or 0
+        server_name = key.get('server_name', '')
+        created_at = key['created_at'][:16].replace('T', ' ')
+
+        if client_uuid:
+            subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+            try:
+                qr_code = generate_qr_code(subscription_url)
+                await status_msg.delete()
+                await message.answer_photo(
+                    BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+                    caption=(
+                        f"🔍 <b>Найден клиент:</b>\n\n"
+                        f"📱 Клиент: <b>{phone}</b>\n"
+                        f"📅 Срок: {period}\n"
+                        f"💰 Цена: {price} ₽\n"
+                        f"🖥 Сервер: {server_name or 'N/A'}\n"
+                        f"📆 Создан: {created_at}\n\n"
+                        f"📱 QR код подписки для сканирования в VPN приложении"
+                    ),
+                    parse_mode="HTML"
+                )
+                await message.answer(
+                    f"🔄 Ссылка подписки:\n<code>{subscription_url}</code>\n\n"
+                    f"💡 Скопируйте и отправьте клиенту.",
+                    parse_mode="HTML",
+                    reply_markup=Keyboards.main_menu(is_admin)
+                )
+                return
+            except Exception as e:
+                logger.error(f"QR generation error in search: {e}")
+
+        # Если нет UUID или ошибка QR
+        await status_msg.edit_text(
+            f"🔍 <b>Найден клиент:</b>\n\n"
+            f"📱 Клиент: <b>{phone}</b>\n"
+            f"📅 Срок: {period}\n"
+            f"💰 Цена: {price} ₽\n"
+            f"🖥 Сервер: {server_name or 'N/A'}\n"
+            f"📆 Создан: {created_at}\n"
+            f"🔑 UUID: <code>{client_uuid or 'N/A'}</code>",
+            parse_mode="HTML"
+        )
+        await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+        return
+
+    # Несколько результатов — показываем список с кнопками
+    text = f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\n"
+    text += f"Запрос: «{query}» — найдено: {len(keys)}\n\n"
+
+    buttons = []
+    for idx, key in enumerate(keys[:10], 1):
+        phone = key.get('phone_number', key.get('client_email', 'N/A'))
+        period = key.get('period', 'N/A')
+        price = key.get('price', 0) or 0
+        server_name = key.get('server_name', '')
+        created_at = key['created_at'][:10]
+        client_uuid = key.get('client_id', '')
+
+        text += f"{idx}. <b>{phone}</b>\n"
+        text += f"   📅 {period} | 💰 {price} ₽ | 🖥 {server_name or 'N/A'}\n"
+        text += f"   📆 {created_at}\n\n"
+
+        if client_uuid:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"📱 {phone[:25]}",
+                    callback_data=f"mgr_sub_{client_uuid[:36]}"
+                )
+            ])
+
+        if len(text) > 3000:
+            text += "<i>... показаны первые результаты</i>\n"
+            break
+
+    if buttons:
+        text += "👆 Нажмите на клиента чтобы получить подписку и QR код"
+
+    from aiogram.types import InlineKeyboardMarkup
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+
+
+@router.callback_query(F.data.startswith("mgr_sub_"))
+async def show_client_subscription(callback: CallbackQuery, db: DatabaseManager):
+    """Показать подписку и QR код клиента"""
+    user_id = callback.from_user.id
+    if not await is_authorized(user_id, db):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    client_uuid = callback.data.replace("mgr_sub_", "")
+    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
+    try:
+        qr_code = generate_qr_code(subscription_url)
+        await callback.message.answer_photo(
+            BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+            caption=(
+                f"📱 QR код подписки\n\n"
+                f"🔄 Подписка:\n<code>{subscription_url}</code>\n\n"
+                f"💡 Отсканируйте QR или скопируйте ссылку"
+            ),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"QR generation error: {e}")
+        await callback.message.answer(
+            f"🔄 Ссылка подписки:\n<code>{subscription_url}</code>",
+            parse_mode="HTML"
+        )
+        await callback.answer()
 
 
 @router.message(F.text == "Моя статистика")

@@ -19,7 +19,8 @@ class Keyboards:
         buttons = [
             [KeyboardButton(text="Создать ключ"), KeyboardButton(text="🔄 Замена ключа")],
             [KeyboardButton(text="🔧 Исправить ключ"), KeyboardButton(text="💰 Прайс")],
-            [KeyboardButton(text="Моя статистика"), KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
+            [KeyboardButton(text="🔍 Найти клиента"), KeyboardButton(text="Моя статистика")],
+            [KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
         ]
 
         if is_admin:

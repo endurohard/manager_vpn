@@ -818,6 +818,24 @@ class DatabaseManager:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def search_keys_by_manager(self, manager_id: int, query: str, limit: int = 20) -> List[Dict]:
+        """Поиск ключей менеджера по номеру телефона или имени клиента"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            search_pattern = f'%{query}%'
+            cursor = await db.execute(
+                '''SELECT k.id, k.manager_id, k.client_email, k.phone_number,
+                          k.period, k.expire_days, k.price, k.client_id, k.server_name,
+                          k.created_at
+                   FROM keys_history k
+                   WHERE k.manager_id = ? AND (k.phone_number LIKE ? OR k.client_email LIKE ?)
+                   ORDER BY k.created_at DESC
+                   LIMIT ?''',
+                (manager_id, search_pattern, search_pattern, limit)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
     # ==================== МЕТОДЫ ДЛЯ ЗАМЕНЫ КЛЮЧЕЙ ====================
 
     async def add_key_replacement(self, manager_id: int, client_email: str, phone_number: str,
