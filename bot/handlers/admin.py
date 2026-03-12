@@ -45,6 +45,12 @@ def get_manager_display_name(manager: dict) -> str:
 class AddManagerStates(StatesGroup):
     """Состояния для добавления менеджера"""
     waiting_for_user_id = State()
+    waiting_for_server_permissions = State()
+
+
+class EditManagerServersStates(StatesGroup):
+    """Состояния для редактирования серверов менеджера"""
+    waiting_for_server_selection = State()
 
 
 class EditPriceStates(StatesGroup):
@@ -685,11 +691,30 @@ async def process_add_manager(message: Message, state: FSMContext, db: DatabaseM
         )
 
         if success:
-            await message.answer(
-                f"Менеджер с ID {user_id} успешно добавлен!\n\n"
-                f"Пользователь теперь может использовать бота.",
-                reply_markup=Keyboards.admin_menu()
-            )
+            # Показываем выбор серверов для менеджера
+            from bot.api.remote_xui import load_servers_config
+            servers_config = load_servers_config()
+            all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+            if all_servers:
+                await state.update_data(new_manager_id=user_id, selected_servers=[s['name'] for s in all_servers])
+                await state.set_state(AddManagerStates.waiting_for_server_permissions)
+                keyboard = Keyboards.manager_server_permissions(all_servers, [s['name'] for s in all_servers])
+                await message.answer(
+                    f"✅ Менеджер с ID {user_id} успешно добавлен!\n\n"
+                    f"🖥 <b>Выберите серверы, доступные менеджеру:</b>\n"
+                    f"Нажмите на сервер чтобы включить/выключить доступ.\n"
+                    f"По умолчанию доступны все серверы.",
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                await message.answer(
+                    f"✅ Менеджер с ID {user_id} успешно добавлен!\n\n"
+                    f"Пользователь теперь может использовать бота.",
+                    reply_markup=Keyboards.admin_menu()
+                )
         else:
             await message.answer(
                 "Произошла ошибка при добавлении менеджера.",
@@ -706,6 +731,152 @@ async def process_add_manager(message: Message, state: FSMContext, db: DatabaseM
     await state.clear()
 
 
+@router.callback_query(AddManagerStates.waiting_for_server_permissions, F.data.startswith("mgr_srv_toggle_"))
+async def toggle_server_permission_new_manager(callback: CallbackQuery, state: FSMContext):
+    """Переключение доступа к серверу при добавлении менеджера"""
+    server_name = callback.data.replace("mgr_srv_toggle_", "")
+    data = await state.get_data()
+    selected = data.get('selected_servers', [])
+
+    if server_name in selected:
+        selected.remove(server_name)
+    else:
+        selected.append(server_name)
+
+    await state.update_data(selected_servers=selected)
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+    keyboard = Keyboards.manager_server_permissions(all_servers, selected)
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(AddManagerStates.waiting_for_server_permissions, F.data == "mgr_srv_save")
+async def save_server_permission_new_manager(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Сохранение серверов при добавлении менеджера"""
+    data = await state.get_data()
+    manager_id = data.get('new_manager_id')
+    selected = data.get('selected_servers', [])
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    all_names = [s['name'] for s in all_servers]
+
+    # Если выбраны все серверы - сохраняем NULL (все доступны)
+    if set(selected) >= set(all_names):
+        await db.set_manager_allowed_servers(manager_id, None)
+        servers_text = "все серверы"
+    else:
+        await db.set_manager_allowed_servers(manager_id, selected)
+        servers_text = ", ".join(selected) if selected else "нет серверов"
+
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Менеджер с ID {manager_id} успешно добавлен!\n\n"
+        f"🖥 Доступные серверы: <b>{servers_text}</b>\n\n"
+        f"Пользователь теперь может использовать бота.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_mgr_servers_"))
+async def start_edit_manager_servers(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Начать редактирование серверов менеджера"""
+    manager_id = int(callback.data.replace("edit_mgr_servers_", ""))
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+    if not all_servers:
+        await callback.answer("Нет доступных серверов", show_alert=True)
+        return
+
+    allowed = await db.get_manager_allowed_servers(manager_id)
+    # Если None - значит все серверы разрешены
+    if allowed is None:
+        selected = [s['name'] for s in all_servers]
+    else:
+        selected = allowed
+
+    await state.set_state(EditManagerServersStates.waiting_for_server_selection)
+    await state.update_data(edit_manager_id=manager_id, selected_servers=selected)
+
+    keyboard = Keyboards.manager_server_permissions(all_servers, selected, edit_mode=True)
+    await callback.message.edit_text(
+        f"🖥 <b>СЕРВЕРЫ МЕНЕДЖЕРА</b> (ID: <code>{manager_id}</code>)\n\n"
+        f"Нажмите на сервер чтобы включить/выключить доступ.\n"
+        f"✅ = доступен, ❌ = недоступен",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(EditManagerServersStates.waiting_for_server_selection, F.data.startswith("mgr_srv_edit_toggle_"))
+async def toggle_server_permission_edit(callback: CallbackQuery, state: FSMContext):
+    """Переключение доступа к серверу при редактировании"""
+    server_name = callback.data.replace("mgr_srv_edit_toggle_", "")
+    data = await state.get_data()
+    selected = data.get('selected_servers', [])
+
+    if server_name in selected:
+        selected.remove(server_name)
+    else:
+        selected.append(server_name)
+
+    await state.update_data(selected_servers=selected)
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+    keyboard = Keyboards.manager_server_permissions(all_servers, selected, edit_mode=True)
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(EditManagerServersStates.waiting_for_server_selection, F.data == "mgr_srv_edit_save")
+async def save_server_permission_edit(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Сохранение серверов при редактировании"""
+    data = await state.get_data()
+    manager_id = data.get('edit_manager_id')
+    selected = data.get('selected_servers', [])
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    all_names = [s['name'] for s in all_servers]
+
+    if set(selected) >= set(all_names):
+        await db.set_manager_allowed_servers(manager_id, None)
+        servers_text = "все серверы"
+    else:
+        await db.set_manager_allowed_servers(manager_id, selected)
+        servers_text = ", ".join(selected) if selected else "нет серверов"
+
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Серверы менеджера обновлены!\n\n"
+        f"🖥 Доступные серверы: <b>{servers_text}</b>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(EditManagerServersStates.waiting_for_server_selection, F.data == "mgr_srv_edit_cancel")
+async def cancel_edit_manager_servers(callback: CallbackQuery, state: FSMContext):
+    """Отмена редактирования серверов"""
+    await state.clear()
+    await callback.message.edit_text("❌ Редактирование серверов отменено.")
+    await callback.answer()
+
+
 @router.message(F.text == "Список менеджеров")
 @admin_only
 async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
@@ -716,8 +887,9 @@ async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
         await message.answer("Список менеджеров пуст.")
         return
 
+    import json as _json
     text = "👥 <b>СПИСОК МЕНЕДЖЕРОВ</b>\n\n"
-    text += "Нажмите кнопку \"✏️\" чтобы изменить имя менеджера\n\n"
+    text += "✏️ - изменить имя | 🖥 - настроить серверы\n\n"
 
     buttons = []
 
@@ -748,11 +920,26 @@ async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
         text += f"   ID: <code>{manager['user_id']}</code>\n"
         text += f"   Добавлен: {added_at}\n"
 
-        # Кнопка редактирования
+        # Показываем доступные серверы
+        allowed_raw = manager.get('allowed_servers')
+        if allowed_raw:
+            try:
+                allowed_list = _json.loads(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw
+                text += f"   🖥 Серверы: {', '.join(allowed_list)}\n"
+            except Exception:
+                text += f"   🖥 Серверы: все\n"
+        else:
+            text += f"   🖥 Серверы: все\n"
+
+        # Кнопки редактирования
         buttons.append([
             InlineKeyboardButton(
-                text=f"✏️ {display_name[:20]}...",
+                text=f"✏️ {display_name[:20]}",
                 callback_data=f"edit_mgr_name_{manager['user_id']}"
+            ),
+            InlineKeyboardButton(
+                text=f"🖥 Серверы",
+                callback_data=f"edit_mgr_servers_{manager['user_id']}"
             )
         ])
         text += "\n"
@@ -5749,7 +5936,7 @@ async def restore_cancel_text(message: Message, state: FSMContext):
 
 # ===== Ручной бэкап =====
 
-@router.message(F.text == "/backup")
+@router.message(F.text.in_({"/backup", "💾 Бэкап"}))
 async def cmd_manual_backup(message: Message, bot, **kwargs):
     """Ручной бэкап всех баз — отправка в чат + Яндекс.Диск"""
     if message.from_user.id != ADMIN_ID:

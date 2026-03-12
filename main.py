@@ -208,6 +208,18 @@ async def backup_remote_panels(bot: Bot):
             results.append(f"✅ {server_name}: {size_kb:.1f} KB")
             logger.info(f"Бэкап панели {server_name} сохранён: {backup_file}")
 
+            # Отправляем файл админу в чат
+            try:
+                document = FSInputFile(backup_file)
+                await bot.send_document(
+                    ADMIN_ID,
+                    document,
+                    caption=f"💾 <b>X-UI {server_name}</b>\n📦 {size_kb:.1f} KB",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить бэкап {server_name} в чат: {e}")
+
             # Загрузка на Яндекс.Диск
             await upload_to_yandex_disk(backup_file)
 

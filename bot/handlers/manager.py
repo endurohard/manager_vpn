@@ -20,6 +20,16 @@ from bot.price_config import get_subscription_periods
 router = Router()
 
 
+async def _get_allowed_servers(user_id: int, db: DatabaseManager, all_servers: list) -> list:
+    """Фильтрация серверов по разрешениям менеджера. Админ видит все."""
+    if user_id == ADMIN_ID:
+        return all_servers
+    allowed = await db.get_manager_allowed_servers(user_id)
+    if allowed is None:
+        return all_servers
+    return [s for s in all_servers if s.get('name') in allowed]
+
+
 class CreateKeyStates(StatesGroup):
     """Состояния для создания ключа"""
     waiting_for_phone = State()
@@ -74,7 +84,7 @@ async def start_create_key(message: Message, state: FSMContext, db: DatabaseMana
 
 
 @router.message(CreateKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
-async def generate_user_identifier(message: Message, state: FSMContext, xui_client: XUIClient):
+async def generate_user_identifier(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager):
     """Генерация случайного ID пользователя"""
     from bot.api.remote_xui import load_servers_config
 
@@ -84,6 +94,7 @@ async def generate_user_identifier(message: Message, state: FSMContext, xui_clie
     # Загружаем список серверов
     servers_config = load_servers_config()
     servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    servers = await _get_allowed_servers(message.from_user.id, db, servers)
 
     if not servers:
         # Если нет удалённых серверов, используем локальный
@@ -122,7 +133,7 @@ async def cancel_key_creation(message: Message, state: FSMContext):
 
 
 @router.message(CreateKeyStates.waiting_for_phone)
-async def process_phone_input(message: Message, state: FSMContext, xui_client: XUIClient):
+async def process_phone_input(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager):
     """Обработка введенного ID/номера телефона"""
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
@@ -140,6 +151,7 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
 
         servers_config = load_servers_config()
         servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+        servers = await _get_allowed_servers(user_id, db, servers)
 
         if not servers:
             await state.set_state(CreateKeyStates.waiting_for_period)
@@ -196,6 +208,7 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
     from bot.api.remote_xui import load_servers_config
     servers_config = load_servers_config()
     servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    servers = await _get_allowed_servers(user_id, db, servers)
 
     if not servers:
         # Если нет удалённых серверов, используем локальный

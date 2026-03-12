@@ -2,6 +2,7 @@
 Менеджер базы данных для хранения информации о менеджерах и ключах
 """
 import aiosqlite
+import json
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -65,6 +66,12 @@ class DatabaseManager:
             # Добавляем колонку custom_name для пользовательских имен менеджеров
             try:
                 await db.execute('ALTER TABLE managers ADD COLUMN custom_name TEXT')
+            except Exception:
+                pass  # Колонка уже существует
+
+            # Добавляем колонку allowed_servers для ограничения серверов менеджера (JSON массив имён серверов, NULL = все)
+            try:
+                await db.execute('ALTER TABLE managers ADD COLUMN allowed_servers TEXT DEFAULT NULL')
             except Exception:
                 pass  # Колонка уже существует
 
@@ -261,12 +268,43 @@ class DatabaseManager:
             logger.error(f"Error setting custom name: {e}")
             return False
 
+    async def get_manager_allowed_servers(self, user_id: int) -> Optional[List[str]]:
+        """Получить список разрешённых серверов для менеджера. None = все серверы."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    'SELECT allowed_servers FROM managers WHERE user_id = ? AND is_active = 1',
+                    (user_id,)
+                )
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    return json.loads(row[0])
+                return None  # NULL = все серверы
+        except Exception as e:
+            logger.error(f"Error getting allowed servers: {e}")
+            return None
+
+    async def set_manager_allowed_servers(self, user_id: int, servers: Optional[List[str]]) -> bool:
+        """Установить список разрешённых серверов для менеджера. None = все серверы."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                value = json.dumps(servers, ensure_ascii=False) if servers is not None else None
+                await db.execute(
+                    'UPDATE managers SET allowed_servers = ? WHERE user_id = ?',
+                    (value, user_id)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error setting allowed servers: {e}")
+            return False
+
     async def get_all_managers(self) -> List[Dict]:
         """Получить список всех активных менеджеров"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                'SELECT user_id, username, full_name, custom_name, added_at FROM managers WHERE is_active = 1'
+                'SELECT user_id, username, full_name, custom_name, allowed_servers, added_at FROM managers WHERE is_active = 1'
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

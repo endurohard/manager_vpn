@@ -47,7 +47,7 @@ class Keyboards:
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
             [KeyboardButton(text="📡 Добавить сервер")],
             [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
-            [KeyboardButton(text="🌐 Админ-панель сайта")],
+            [KeyboardButton(text="🌐 Админ-панель сайта"), KeyboardButton(text="💾 Бэкап")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(
@@ -375,4 +375,29 @@ class Keyboards:
             ])
 
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sni_cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def manager_server_permissions(servers: list, selected_servers: list, edit_mode: bool = False):
+        """Клавиатура для выбора серверов менеджера (мульти-выбор)"""
+        buttons = []
+        prefix = "mgr_srv_edit_toggle_" if edit_mode else "mgr_srv_toggle_"
+
+        for server in servers:
+            name = server.get('name', 'Unknown')
+            is_selected = name in selected_servers
+            icon = "✅" if is_selected else "❌"
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{icon} {name}",
+                    callback_data=f"{prefix}{name}"
+                )
+            ])
+
+        save_cb = "mgr_srv_edit_save" if edit_mode else "mgr_srv_save"
+        action_buttons = [InlineKeyboardButton(text="💾 Сохранить", callback_data=save_cb)]
+        if edit_mode:
+            action_buttons.append(InlineKeyboardButton(text="❌ Отмена", callback_data="mgr_srv_edit_cancel"))
+        buttons.append(action_buttons)
+
         return InlineKeyboardMarkup(inline_keyboard=buttons)
