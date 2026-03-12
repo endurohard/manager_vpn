@@ -112,14 +112,14 @@ async def generate_user_identifier(message: Message, state: FSMContext, xui_clie
         )
         return
 
-    await state.update_data(servers=servers)
+    all_indices = list(range(len(servers)))
+    await state.update_data(servers=servers, selected_server_indices=all_indices)
     await state.set_state(CreateKeyStates.waiting_for_server)
     await message.answer(
         f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
-        f"🖥 <b>Выберите сервер:</b>\n"
-        f"🟢 - активен для новых\n"
-        f"🟡 - отключен для новых",
-        reply_markup=Keyboards.server_selection(servers),
+        f"🖥 <b>Выберите серверы</b> (можно несколько):\n"
+        f"Нажмите на сервер чтобы вкл/выкл, затем ✅ Продолжить",
+        reply_markup=Keyboards.server_multi_selection(servers, all_indices),
         parse_mode="HTML"
     )
 
@@ -168,14 +168,14 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
                 parse_mode="HTML"
             )
         else:
-            await state.update_data(servers=servers)
+            all_indices = list(range(len(servers)))
+            await state.update_data(servers=servers, selected_server_indices=all_indices)
             await state.set_state(CreateKeyStates.waiting_for_server)
             await message.answer(
                 f"🆔 Сгенерирован ID: <code>{generated_id}</code>\n\n"
-                f"🖥 <b>Выберите сервер:</b>\n"
-                f"🟢 - активен для новых\n"
-                f"🟡 - отключен для новых",
-                reply_markup=Keyboards.server_selection(servers),
+                f"🖥 <b>Выберите серверы</b> (можно несколько):\n"
+                f"Нажмите на сервер чтобы вкл/выкл, затем ✅ Продолжить",
+                reply_markup=Keyboards.server_multi_selection(servers, all_indices),
                 parse_mode="HTML"
             )
         return
@@ -225,16 +225,92 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
         )
         return
 
-    await state.update_data(servers=servers)
+    all_indices = list(range(len(servers)))
+    await state.update_data(servers=servers, selected_server_indices=all_indices)
     await state.set_state(CreateKeyStates.waiting_for_server)
     await message.answer(
         format_message +
-        "🖥 <b>Выберите сервер:</b>\n"
-        "🟢 - активен для новых\n"
-        "🟡 - отключен для новых",
-        reply_markup=Keyboards.server_selection(servers),
+        "🖥 <b>Выберите серверы</b> (можно несколько):\n"
+        "Нажмите на сервер чтобы вкл/выкл, затем ✅ Продолжить",
+        reply_markup=Keyboards.server_multi_selection(servers, all_indices),
         parse_mode="HTML"
     )
+
+
+@router.callback_query(CreateKeyStates.waiting_for_server, F.data.startswith("mserver_"))
+async def process_multi_server_toggle(callback: CallbackQuery, state: FSMContext):
+    """Переключение сервера в мульти-выборе"""
+    data = await state.get_data()
+    servers = data.get('servers', [])
+    selected = data.get('selected_server_indices', [])
+    action = callback.data.replace("mserver_", "")
+
+    if action == "all":
+        # Переключить все: если все выбраны — снять все, иначе выбрать все
+        if set(selected) == set(range(len(servers))):
+            selected = []
+        else:
+            selected = list(range(len(servers)))
+        await state.update_data(selected_server_indices=selected)
+        await callback.message.edit_reply_markup(
+            reply_markup=Keyboards.server_multi_selection(servers, selected)
+        )
+        await callback.answer()
+        return
+
+    if action == "done":
+        # Продолжить — переход к выбору периода
+        if not selected:
+            await callback.answer("Выберите хотя бы один сервер!", show_alert=True)
+            return
+
+        phone = data.get('phone', '')
+        selected_servers = [servers[i] for i in selected if i < len(servers)]
+
+        # Если один сервер — сохраняем как раньше
+        if len(selected_servers) == 1:
+            srv = selected_servers[0]
+            main_inbound = srv.get('inbounds', {}).get('main', {})
+            await state.update_data(
+                selected_server=srv,
+                selected_inbound=main_inbound,
+                inbound_id=main_inbound.get('id', 1),
+                multi_servers=None
+            )
+            server_text = srv.get('name', 'Unknown')
+        else:
+            # Мульти-сервер: сохраняем список
+            await state.update_data(
+                selected_server=selected_servers[0],
+                selected_inbound=selected_servers[0].get('inbounds', {}).get('main', {}),
+                inbound_id=selected_servers[0].get('inbounds', {}).get('main', {}).get('id', 1),
+                multi_servers=selected_servers
+            )
+            server_text = ", ".join(s.get('name', '?') for s in selected_servers)
+
+        await state.set_state(CreateKeyStates.waiting_for_period)
+        await callback.message.edit_text(
+            f"🆔 ID: <code>{phone}</code>\n"
+            f"🖥 Серверы: <b>{server_text}</b>\n\n"
+            "Выберите срок действия ключа:",
+            reply_markup=Keyboards.subscription_periods(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    # Toggle конкретного сервера
+    idx = int(action)
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+    await state.update_data(selected_server_indices=selected)
+    await callback.message.edit_reply_markup(
+        reply_markup=Keyboards.server_multi_selection(servers, selected)
+    )
+    await callback.answer()
 
 
 @router.callback_query(CreateKeyStates.waiting_for_server, F.data.startswith("server_"))
@@ -544,75 +620,93 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
     inbound_id = data.get("inbound_id", INBOUND_ID)  # Используем выбранный или дефолтный
     selected_server = data.get("selected_server")  # Выбранный сервер (если есть)
     selected_inbound = data.get("selected_inbound")  # Выбранный inbound
+    multi_servers = data.get("multi_servers")  # Список серверов для мульти-выбора
 
     await callback.message.edit_text("Создание ключа...")
 
     try:
-        # Если выбран конкретный сервер - создаём только на нём
+        # Если выбраны серверы (один или несколько)
         if selected_server and not selected_server.get('local', False):
             import uuid as uuid_module
             from bot.api.remote_xui import create_client_on_remote_server, load_servers_config
 
             client_uuid = str(uuid_module.uuid4())
-            server_total_gb = selected_server.get('traffic_limit_gb', 0)
-            success = await create_client_on_remote_server(
-                server_config=selected_server,
-                client_uuid=client_uuid,
-                email=phone,
-                expire_days=period_days,
-                ip_limit=2,
-                inbound_id=inbound_id,
-                total_gb=server_total_gb
-            )
 
-            if success:
+            # Определяем список серверов для создания
+            servers_to_create = multi_servers if multi_servers else [selected_server]
+
+            # Вычисляем expire_timestamp (мс)
+            from datetime import timedelta
+            _expire_ts = int((datetime.now() + timedelta(days=period_days)).timestamp() * 1000)
+
+            created_servers = []
+            failed_servers = []
+
+            for srv in servers_to_create:
+                srv_name = srv.get('name', 'Unknown')
+                srv_inbound_id = srv.get('inbounds', {}).get('main', {}).get('id', 1)
+                srv_total_gb = srv.get('traffic_limit_gb', 0)
+                try:
+                    success = await create_client_on_remote_server(
+                        server_config=srv,
+                        client_uuid=client_uuid,
+                        email=phone,
+                        expire_days=period_days,
+                        ip_limit=2,
+                        inbound_id=srv_inbound_id,
+                        total_gb=srv_total_gb
+                    )
+                    if success:
+                        created_servers.append(srv_name)
+                        await db.add_client_server(
+                            client_uuid=client_uuid, client_email=phone,
+                            server_name=srv_name,
+                            inbound_id=srv_inbound_id, expire_days=period_days,
+                            expire_timestamp=_expire_ts,
+                            total_gb=srv_total_gb, ip_limit=2
+                        )
+                    else:
+                        failed_servers.append(srv_name)
+                except Exception as e:
+                    logger.error(f"Ошибка создания на {srv_name}: {e}")
+                    failed_servers.append(srv_name)
+
+            # Авто-добавление на серверы с лимитом трафика (LTE) если не были выбраны явно
+            created_names = set(created_servers)
+            all_servers = load_servers_config().get('servers', [])
+            for srv in all_servers:
+                if (srv.get('traffic_limit_gb', 0) > 0
+                        and srv.get('enabled', True)
+                        and not srv.get('local', False)
+                        and srv.get('name') not in created_names):
+                    try:
+                        await create_client_on_remote_server(
+                            server_config=srv,
+                            client_uuid=client_uuid,
+                            email=phone,
+                            expire_days=period_days,
+                            ip_limit=2,
+                            total_gb=srv.get('traffic_limit_gb', 0)
+                        )
+                        await db.add_client_server(
+                            client_uuid=client_uuid, client_email=phone,
+                            server_name=srv.get('name', ''),
+                            inbound_id=srv.get('inbounds', {}).get('main', {}).get('id', 1),
+                            expire_days=period_days,
+                            expire_timestamp=_expire_ts,
+                            total_gb=srv.get('traffic_limit_gb', 0), ip_limit=2
+                        )
+                        logger.info(f"Авто-добавлен на {srv.get('name')} с лимитом {srv.get('traffic_limit_gb')} ГБ")
+                    except Exception as e:
+                        logger.error(f"Ошибка авто-добавления на {srv.get('name')}: {e}")
+
+            if created_servers:
                 client_data = {
                     'client_id': client_uuid,
-                    'local_created': False
+                    'local_created': False,
+                    'created_servers': created_servers,
+                    'failed_servers': failed_servers
                 }
-
-                # Вычисляем expire_timestamp (мс)
-                from datetime import timedelta
-                _expire_ts = int((datetime.now() + timedelta(days=period_days)).timestamp() * 1000)
-
-                # Фиксируем основной сервер
-                await db.add_client_server(
-                    client_uuid=client_uuid, client_email=phone,
-                    server_name=selected_server.get('name', ''),
-                    inbound_id=inbound_id, expire_days=period_days,
-                    expire_timestamp=_expire_ts,
-                    total_gb=server_total_gb, ip_limit=2
-                )
-
-                # Авто-добавление на серверы с лимитом трафика (LTE Билайн)
-                selected_name = selected_server.get('name', '')
-                all_servers = load_servers_config().get('servers', [])
-                for srv in all_servers:
-                    if (srv.get('traffic_limit_gb', 0) > 0
-                            and srv.get('enabled', True)
-                            and not srv.get('local', False)
-                            and srv.get('name') != selected_name):
-                        try:
-                            await create_client_on_remote_server(
-                                server_config=srv,
-                                client_uuid=client_uuid,
-                                email=phone,
-                                expire_days=period_days,
-                                ip_limit=2,
-                                total_gb=srv.get('traffic_limit_gb', 0)
-                            )
-                            # Фиксируем доп. сервер
-                            await db.add_client_server(
-                                client_uuid=client_uuid, client_email=phone,
-                                server_name=srv.get('name', ''),
-                                inbound_id=srv.get('inbounds', {}).get('main', {}).get('id', 1),
-                                expire_days=period_days,
-                                expire_timestamp=_expire_ts,
-                                total_gb=srv.get('traffic_limit_gb', 0), ip_limit=2
-                            )
-                            logger.info(f"Авто-добавлен на {srv.get('name')} с лимитом {srv.get('traffic_limit_gb')} ГБ")
-                        except Exception as e:
-                            logger.error(f"Ошибка авто-добавления на {srv.get('name')}: {e}")
             else:
                 client_data = None
         else:
@@ -836,6 +930,11 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         # Получаем цену из данных
         period_price = data.get("period_price", 0)
 
+        # Формируем имя серверов для записи
+        created_srv_list = client_data.get('created_servers', [])
+        failed_srv_list = client_data.get('failed_servers', [])
+        server_name_for_db = ", ".join(created_srv_list) if created_srv_list else (selected_server.get('name') if selected_server else None)
+
         # Сохраняем в базу данных
         await db.add_key_to_history(
             manager_id=user_id,
@@ -845,11 +944,18 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
             expire_days=period_days,
             client_id=client_uuid,
             price=period_price,
-            server_name=selected_server.get('name') if selected_server else None
+            server_name=server_name_for_db
         )
 
         # Формируем ссылку подписки
         subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
+        # Информация о серверах
+        servers_info = ""
+        if created_srv_list:
+            servers_info = f"🖥 Серверы: {', '.join(created_srv_list)}\n"
+        if failed_srv_list:
+            servers_info += f"⚠️ Не удалось: {', '.join(failed_srv_list)}\n"
 
         # Генерируем QR код для ссылки подписки (автообновление)
         try:
@@ -863,6 +969,7 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
                     f"🆔 ID клиента: {phone}\n"
                     f"⏰ Срок действия: {period_name}\n"
                     f"💰 Стоимость: {period_price} ₽\n"
+                    f"{servers_info}"
                     f"🌐 Лимит IP: 2\n"
                     f"📊 Трафик: безлимит\n\n"
                     f"📱 Отсканируйте QR код подписки в приложении VPN"

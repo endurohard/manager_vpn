@@ -308,6 +308,30 @@ class Keyboards:
         return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
+    def server_multi_selection(servers: list, selected_indices: list):
+        """Клавиатура для мульти-выбора серверов при создании ключа"""
+        buttons = []
+        for i, server in enumerate(servers):
+            name = server.get('name', f'Server {i}')
+            is_selected = i in selected_indices
+            icon = "✅" if is_selected else "⬜"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{icon} {name}",
+                    callback_data=f"mserver_{i}"
+                )
+            ])
+
+        # Кнопки "Выбрать все" и "Продолжить"
+        buttons.append([
+            InlineKeyboardButton(text="☑️ Все", callback_data="mserver_all"),
+            InlineKeyboardButton(text="✅ Продолжить", callback_data="mserver_done"),
+        ])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_creation")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
     def inbound_selection(inbounds: list):
         """Клавиатура для выбора inbound (только для админа)"""
         buttons = []
