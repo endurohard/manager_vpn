@@ -77,6 +77,11 @@ class ManageSNIStates(StatesGroup):
     waiting_for_action = State()
 
 
+class EditServerStates(StatesGroup):
+    """Состояния для редактирования сервера"""
+    waiting_for_field_value = State()
+
+
 class SearchKeyStates(StatesGroup):
     """Состояния для поиска ключей"""
     waiting_for_search_query = State()
@@ -4380,7 +4385,10 @@ async def check_servers_status(message: Message, **kwargs):
         is_active = srv.get('active_for_new', True)
         action = "disable" if is_active else "enable"
         btn_text = f"{'🔴 Выкл' if is_active else '🟢 Вкл'} {srv_name}"
-        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"server_{action}_{srv_name}")])
+        buttons.append([
+            InlineKeyboardButton(text=btn_text, callback_data=f"server_{action}_{srv_name}"),
+            InlineKeyboardButton(text=f"✏️", callback_data=f"srv_edit_{srv_name}")
+        ])
 
     # Кнопка добавления нового сервера
     buttons.append([InlineKeyboardButton(text="➕ Добавить сервер", callback_data="add_new_server")])
@@ -4598,6 +4606,225 @@ async def toggle_server_for_new(callback: CallbackQuery):
     status_text = "включен" if action == "enable" else "выключен"
     await callback.answer(f"Сервер {server_name} {status_text}", show_alert=False)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ============ РЕДАКТИРОВАНИЕ СЕРВЕРА ============
+
+@router.callback_query(F.data.startswith("srv_edit_"))
+async def show_edit_server_menu(callback: CallbackQuery, state: FSMContext):
+    """Показать меню редактирования сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    server_name = callback.data.replace("srv_edit_", "")
+    config = load_servers_config()
+
+    server = None
+    for s in config.get('servers', []):
+        if s.get('name') == server_name:
+            server = s
+            break
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    domain = server.get('domain', 'N/A')
+    ip = server.get('ip', 'N/A')
+    port = server.get('port', 443)
+    enabled = server.get('enabled', True)
+    active_for_new = server.get('active_for_new', True)
+    description = server.get('description', '')
+
+    text = f"✏️ <b>РЕДАКТИРОВАНИЕ СЕРВЕРА</b>\n\n"
+    text += f"📛 Имя: <b>{server_name}</b>\n"
+    text += f"🌐 Домен: <code>{domain}</code>\n"
+    text += f"📍 IP: <code>{ip}</code>\n"
+    text += f"🔌 Порт: <code>{port}</code>\n"
+    text += f"📋 Описание: {description or 'нет'}\n"
+    text += f"✅ Включен: {'Да' if enabled else 'Нет'}\n"
+    text += f"🆕 Для новых: {'Да' if active_for_new else 'Нет'}\n\n"
+
+    # Показываем inbounds
+    inbounds = server.get('inbounds', {})
+    if inbounds:
+        text += "<b>Inbounds:</b>\n"
+        for inb_name, inb_data in inbounds.items():
+            sni = inb_data.get('sni', 'N/A')
+            prefix = inb_data.get('name_prefix', '')
+            text += f"  • <b>{inb_name}</b>: SNI=<code>{sni}</code> | {prefix}\n"
+    text += "\n👇 Выберите что изменить:"
+
+    buttons = [
+        [
+            InlineKeyboardButton(text="📛 Имя", callback_data=f"srvedit_name_{server_name}"),
+            InlineKeyboardButton(text="🌐 Домен", callback_data=f"srvedit_domain_{server_name}"),
+        ],
+        [
+            InlineKeyboardButton(text="📍 IP", callback_data=f"srvedit_ip_{server_name}"),
+            InlineKeyboardButton(text="🔌 Порт", callback_data=f"srvedit_port_{server_name}"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 Описание", callback_data=f"srvedit_desc_{server_name}"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'❌ Выключить' if enabled else '✅ Включить'} сервер",
+                callback_data=f"srvedit_toggle_enabled_{server_name}"
+            ),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="srvedit_back")],
+    ]
+
+    await callback.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("srvedit_toggle_enabled_"))
+async def toggle_server_enabled(callback: CallbackQuery):
+    """Переключить enabled/disabled сервер"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    server_name = callback.data.replace("srvedit_toggle_enabled_", "")
+    config = load_servers_config()
+
+    for s in config.get('servers', []):
+        if s.get('name') == server_name:
+            s['enabled'] = not s.get('enabled', True)
+            new_status = s['enabled']
+            save_servers_config(config)
+            await callback.answer(f"Сервер {'включен' if new_status else 'выключен'}")
+            # Перерисовываем меню
+            callback.data = f"srv_edit_{server_name}"
+            await show_edit_server_menu(callback, None)
+            return
+
+    await callback.answer("Сервер не найден", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("srvedit_name_") | F.data.startswith("srvedit_domain_") |
+                        F.data.startswith("srvedit_ip_") | F.data.startswith("srvedit_port_") |
+                        F.data.startswith("srvedit_desc_"))
+async def start_edit_server_field(callback: CallbackQuery, state: FSMContext):
+    """Начать редактирование поля сервера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    # Парсим: srvedit_{field}_{server_name}
+    parts = callback.data.split("_", 2)
+    field = parts[1]
+    server_name = callback.data.split(f"srvedit_{field}_", 1)[1]
+
+    field_labels = {
+        "name": "название",
+        "domain": "домен",
+        "ip": "IP адрес",
+        "port": "порт",
+        "desc": "описание",
+    }
+
+    config = load_servers_config()
+    current_value = ""
+    for s in config.get('servers', []):
+        if s.get('name') == server_name:
+            if field == "desc":
+                current_value = s.get('description', '')
+            elif field == "name":
+                current_value = s.get('name', '')
+            else:
+                current_value = str(s.get(field, ''))
+            break
+
+    await state.set_state(EditServerStates.waiting_for_field_value)
+    await state.update_data(edit_server_name=server_name, edit_field=field)
+
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование {field_labels.get(field, field)}</b>\n\n"
+        f"Сервер: <b>{server_name}</b>\n"
+        f"Текущее значение: <code>{current_value or 'не задано'}</code>\n\n"
+        f"Введите новое значение или /cancel для отмены:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(EditServerStates.waiting_for_field_value)
+async def process_edit_server_field(message: Message, state: FSMContext):
+    """Обработка нового значения поля сервера"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text = message.text.strip()
+
+    if text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Редактирование отменено.", reply_markup=Keyboards.admin_menu())
+        return
+
+    data = await state.get_data()
+    server_name = data.get('edit_server_name')
+    field = data.get('edit_field')
+
+    config = load_servers_config()
+    server_found = False
+    old_name = server_name
+
+    for s in config.get('servers', []):
+        if s.get('name') == server_name:
+            if field == "name":
+                s['name'] = text
+            elif field == "domain":
+                s['domain'] = text
+            elif field == "ip":
+                s['ip'] = text
+            elif field == "port":
+                try:
+                    s['port'] = int(text)
+                except ValueError:
+                    await message.answer("❌ Порт должен быть числом. Попробуйте ещё раз:")
+                    return
+            elif field == "desc":
+                s['description'] = text
+            server_found = True
+            break
+
+    if not server_found:
+        await state.clear()
+        await message.answer("❌ Сервер не найден.", reply_markup=Keyboards.admin_menu())
+        return
+
+    save_servers_config(config)
+    await state.clear()
+
+    field_labels = {
+        "name": "Название",
+        "domain": "Домен",
+        "ip": "IP",
+        "port": "Порт",
+        "desc": "Описание",
+    }
+
+    await message.answer(
+        f"✅ {field_labels.get(field, field)} сервера <b>{old_name}</b> изменён на:\n"
+        f"<code>{text}</code>",
+        parse_mode="HTML",
+        reply_markup=Keyboards.admin_menu()
+    )
+
+
+@router.callback_query(F.data == "srvedit_back")
+async def edit_server_back(callback: CallbackQuery, state: FSMContext):
+    """Назад из редактирования сервера"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer()
 
 
 # ============ ДОБАВЛЕНИЕ НОВОГО СЕРВЕРА ============
