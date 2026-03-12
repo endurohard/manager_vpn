@@ -4670,6 +4670,12 @@ async def show_edit_server_menu(callback: CallbackQuery, state: FSMContext):
         ],
         [
             InlineKeyboardButton(
+                text="🔄 Загрузить inbounds из панели",
+                callback_data=f"srvedit_fetch_inbounds_{server_name}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 text=f"{'❌ Выключить' if enabled else '✅ Включить'} сервер",
                 callback_data=f"srvedit_toggle_enabled_{server_name}"
             ),
@@ -4682,6 +4688,173 @@ async def show_edit_server_menu(callback: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("srvedit_fetch_inbounds_"))
+async def fetch_inbounds_from_panel(callback: CallbackQuery):
+    """Загрузить inbounds с панели X-UI и обновить конфиг"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    server_name = callback.data.replace("srvedit_fetch_inbounds_", "")
+    config = load_servers_config()
+
+    server = None
+    server_idx = None
+    for i, s in enumerate(config.get('servers', [])):
+        if s.get('name') == server_name:
+            server = s
+            server_idx = i
+            break
+
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    panel = server.get('panel', {})
+    if not panel.get('url'):
+        await callback.answer("У сервера нет настроек панели", show_alert=True)
+        return
+
+    await callback.message.edit_text(f"⏳ Загружаю inbounds с панели <b>{server_name}</b>...", parse_mode="HTML")
+
+    import json as _json
+    panel_url = panel['url']
+    panel_username = panel.get('username', '')
+    panel_password = panel.get('password', '')
+
+    try:
+        import aiohttp
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        inbounds_data = {}
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Авторизация
+            logged_in = False
+            for auth_method in ['json', 'data']:
+                kwargs = {'json' if auth_method == 'json' else 'data': {"username": panel_username, "password": panel_password}}
+                async with session.post(f"{panel_url}/login", timeout=aiohttp.ClientTimeout(total=15), **kwargs) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        if result.get('success'):
+                            logged_in = True
+                            break
+
+            if not logged_in:
+                await callback.message.edit_text(f"❌ Не удалось авторизоваться в панели <b>{server_name}</b>", parse_mode="HTML")
+                await callback.answer()
+                return
+
+            # Получаем inbounds
+            async with session.get(f"{panel_url}/panel/api/inbounds/list", timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    await callback.message.edit_text("❌ Ошибка получения inbounds")
+                    await callback.answer()
+                    return
+
+                response_data = await resp.json()
+                if not response_data.get('success'):
+                    await callback.message.edit_text("❌ API вернул ошибку")
+                    await callback.answer()
+                    return
+
+                # Сохраняем существующие name_prefix
+                old_inbounds = server.get('inbounds', {})
+
+                for inbound in response_data.get('obj', []):
+                    if not inbound.get('enable'):
+                        continue
+
+                    inbound_id = inbound.get('id')
+                    remark = inbound.get('remark', f'inbound_{inbound_id}')
+                    protocol = inbound.get('protocol', '')
+
+                    try:
+                        stream = _json.loads(inbound.get('streamSettings', '{}'))
+                        settings = _json.loads(inbound.get('settings', '{}'))
+                        security = stream.get('security', 'none')
+                        network = stream.get('network', 'tcp')
+
+                        flow = ''
+                        for c in settings.get('clients', []):
+                            if c.get('flow'):
+                                flow = c['flow']
+                                break
+
+                        # Берём name_prefix из старого конфига если есть
+                        old_prefix = ''
+                        for old_key, old_val in old_inbounds.items():
+                            if old_val.get('id') == inbound_id:
+                                old_prefix = old_val.get('name_prefix', '')
+                                break
+
+                        inbound_config = {
+                            "id": int(inbound_id),
+                            "security": security,
+                            "flow": flow,
+                            "fp": "chrome",
+                            "name_prefix": old_prefix or f"📶 {server_name}"
+                        }
+
+                        if security == 'reality':
+                            reality = stream.get('realitySettings', {})
+                            sni_list = reality.get('serverNames', [])
+                            short_ids = reality.get('shortIds', [])
+                            inbound_config.update({
+                                "sni": sni_list[0] if sni_list else '',
+                                "pbk": reality.get('settings', {}).get('publicKey', ''),
+                                "sid": short_ids[0] if short_ids else '',
+                                "fp": reality.get('settings', {}).get('fingerprint', 'chrome'),
+                            })
+                        elif security == 'tls':
+                            tls = stream.get('tlsSettings', {})
+                            inbound_config["sni"] = tls.get('serverName', '')
+
+                        if network and network != 'tcp':
+                            inbound_config["network"] = network
+
+                        inbounds_data[remark] = inbound_config
+                    except Exception as e:
+                        logger.error(f"Ошибка парсинга inbound {inbound_id}: {e}")
+
+        if not inbounds_data:
+            await callback.message.edit_text(f"⚠️ Не найдено активных inbounds на <b>{server_name}</b>", parse_mode="HTML")
+            await callback.answer()
+            return
+
+        # Первый inbound = main
+        if 'main' not in inbounds_data:
+            first_key = next(iter(inbounds_data))
+            inbounds_data['main'] = inbounds_data.pop(first_key)
+
+        # Сохраняем
+        config['servers'][server_idx]['inbounds'] = inbounds_data
+        save_servers_config(config)
+
+        text = f"✅ <b>Inbounds обновлены для {server_name}</b>\n\n"
+        for key, val in inbounds_data.items():
+            sni = val.get('sni', 'N/A')
+            pbk = val.get('pbk', '')
+            pbk_short = f"{pbk[:15]}..." if pbk else 'N/A'
+            text += f"• <b>{key}</b> (ID: {val.get('id')})\n"
+            text += f"  SNI: <code>{sni}</code>\n"
+            text += f"  PBK: <code>{pbk_short}</code>\n"
+            text += f"  Flow: {val.get('flow') or 'нет'}\n"
+            text += f"  FP: {val.get('fp', 'chrome')}\n\n"
+
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.answer("Inbounds обновлены!")
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки inbounds для {server_name}: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("srvedit_toggle_enabled_"))
@@ -5282,18 +5455,7 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
             "username": panel_username,
             "password": panel_password
         },
-        "inbounds": inbounds_data if inbounds_data else {
-            "main": {
-                "id": 1,
-                "security": "reality",
-                "sni": "example.com",
-                "pbk": "",
-                "sid": "",
-                "flow": "",
-                "fp": "chrome",
-                "name_prefix": data.get('name_prefix', f"📶 {data['name']}")
-            }
-        }
+        "inbounds": inbounds_data if inbounds_data else {}
     }
 
     # Сохраняем в конфиг

@@ -241,11 +241,11 @@
         "main": {
           "id": 1,
           "security": "reality",
-          "sni": "example.com",
-          "pbk": "",
-          "sid": "",
-          "flow": "",
-          "fp": "chrome",
+          "sni": "eh.vk.com",
+          "pbk": "o49ISED911Msd0s2XcaYad-r9S_k1cjPxfhxWw5Uy3o",
+          "sid": "5a2a06",
+          "flow": "xtls-rprx-vision",
+          "fp": "safari",
           "name_prefix": "📶 LTE📲"
         }
       }
