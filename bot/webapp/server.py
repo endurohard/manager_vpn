@@ -16,6 +16,14 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 
 logger = logging.getLogger(__name__)
 
+# Кэш подписок: {client_id: {'data': response_data, 'time': timestamp}}
+_subscription_cache = {}
+SUBSCRIPTION_CACHE_TTL = 60  # секунд
+
+# Кэш здоровья серверов: {server_ip: {'healthy': bool, 'time': timestamp}}
+_server_health_cache = {}
+SERVER_HEALTH_CACHE_TTL = 120  # помечаем недоступный сервер на 2 минуты
+
 # Путь к базе данных бота для связанных ключей
 BOT_DB_PATH = Path(__file__).parent.parent.parent / 'bot_data.db'
 
@@ -381,6 +389,31 @@ def find_client_on_remote_server(uuid_str, server):
     return None, None
 
 
+def _is_server_healthy(server):
+    """Проверить, считается ли сервер доступным (по кэшу здоровья)"""
+    import time as _time
+    ip = server.get('ip', '')
+    cached = _server_health_cache.get(ip)
+    if cached and not cached['healthy'] and (_time.time() - cached['time']) < SERVER_HEALTH_CACHE_TTL:
+        return False
+    return True
+
+
+def _mark_server_unhealthy(server):
+    """Пометить сервер как недоступный"""
+    import time as _time
+    ip = server.get('ip', '')
+    _server_health_cache[ip] = {'healthy': False, 'time': _time.time()}
+    logger.warning(f"Server {server.get('name', ip)} marked unhealthy for {SERVER_HEALTH_CACHE_TTL}s")
+
+
+def _mark_server_healthy(server):
+    """Пометить сервер как доступный"""
+    import time as _time
+    ip = server.get('ip', '')
+    _server_health_cache[ip] = {'healthy': True, 'time': _time.time()}
+
+
 def check_client_exists_via_panel(uuid_str, server):
     """Проверить существование клиента через API панели X-UI"""
     import urllib.request
@@ -390,6 +423,11 @@ def check_client_exists_via_panel(uuid_str, server):
 
     panel = server.get('panel', {})
     if not panel:
+        return False
+
+    # Пропускаем недоступные серверы
+    if not _is_server_healthy(server):
+        logger.debug(f"Skipping unhealthy server {server.get('name', server.get('ip', '?'))}")
         return False
 
     ip = server.get('ip', '')
@@ -428,7 +466,7 @@ def check_client_exists_via_panel(uuid_str, server):
         )
         login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 
-        resp = opener.open(login_req, timeout=10)
+        resp = opener.open(login_req, timeout=5)
         login_result = json.loads(resp.read())
 
         if not login_result.get('success'):
@@ -436,8 +474,10 @@ def check_client_exists_via_panel(uuid_str, server):
 
         # Получаем список inbounds
         list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
-        resp = opener.open(list_req, timeout=10)
+        resp = opener.open(list_req, timeout=5)
         data = json.loads(resp.read())
+
+        _mark_server_healthy(server)
 
         if not data.get('success'):
             return False
@@ -456,6 +496,7 @@ def check_client_exists_via_panel(uuid_str, server):
         return False
 
     except Exception as e:
+        _mark_server_unhealthy(server)
         logger.error(f"Error checking client via panel on {server.get('name', ip)}: {e}")
         return False
 
@@ -922,7 +963,8 @@ def is_browser_request(request):
 
     # VPN клиенты обычно имеют специфичные User-Agent
     vpn_clients = ['v2ray', 'clash', 'shadowrocket', 'quantumult', 'surge', 'stash',
-                   'loon', 'sing-box', 'hiddify', 'nekoray', 'nekobox', 'v2rayn', 'v2rayng']
+                   'loon', 'sing-box', 'hiddify', 'happ', 'nekoray', 'nekobox', 'v2rayn', 'v2rayng',
+                   'v2raytun', 'streisand', 'foxray']
 
     for client in vpn_clients:
         if client in user_agent:
@@ -950,6 +992,11 @@ async def get_client_info_from_panel(uuid_str, server):
     if not panel:
         return None
 
+    # Пропускаем недоступные серверы
+    if not _is_server_healthy(server):
+        logger.debug(f"Skipping unhealthy server {server.get('name', server.get('ip', '?'))} for panel info")
+        return None
+
     ip = server.get('ip', '')
     port = panel.get('port', 1020)
     path = panel.get('path', '')
@@ -974,7 +1021,7 @@ async def get_client_info_from_panel(uuid_str, server):
             async with session.post(
                 f"{base_url}/login",
                 data={'username': username, 'password': password},
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
                 login_result = await resp.json()
                 if not login_result.get('success'):
@@ -984,7 +1031,7 @@ async def get_client_info_from_panel(uuid_str, server):
             # Получаем список inbounds
             async with session.get(
                 f"{base_url}/panel/api/inbounds/list",
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
                 data = await resp.json()
 
@@ -1024,8 +1071,10 @@ async def get_client_info_from_panel(uuid_str, server):
                     except:
                         continue
 
+        _mark_server_healthy(server)
         return None
     except Exception as e:
+        _mark_server_unhealthy(server)
         logger.error(f"Error getting client info from panel {server.get('name', ip)}: {e}")
         return None
 
@@ -1388,19 +1437,15 @@ def render_subscription_page(client_id, client_info, links_count, servers_list):
     return html
 
 
-async def subscription_handler(request):
-    """Обработчик подписки - возвращает ключи клиента с активных серверов"""
-    client_id = request.match_info.get('client_id', '')
+async def _build_subscription_data(client_id):
+    """Собрать данные подписки (links, client_info, client_email, traffic) с кэшированием"""
+    import time as _time
 
-    if not client_id:
-        return web.Response(text="Client ID required", status=400)
-
-    # Проверяем формат UUID
-    import re
-    uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
-
-    if not uuid_pattern.match(client_id):
-        return web.Response(text="Invalid client ID format", status=400)
+    # Проверяем кэш
+    cached = _subscription_cache.get(client_id)
+    if cached and (_time.time() - cached['time']) < SUBSCRIPTION_CACHE_TTL:
+        logger.debug(f"Subscription cache hit for {client_id[:8]}...")
+        return cached['data']
 
     # Получаем связанные UUID (master + linked)
     linked_uuids = await get_linked_clients_for_subscription(client_id)
@@ -1424,6 +1469,8 @@ async def subscription_handler(request):
         client_email = client_keys[0]['client'].get('email', 'client')
 
     # Если клиента нет локально — получаем email с удалённых серверов (параллельно)
+    # Сохраняем результат для повторного использования ниже
+    _cached_panel_info = None
     if client_email == 'client':
         remote_servers = [
             s for s in servers_config.get('servers', [])
@@ -1437,6 +1484,7 @@ async def subscription_handler(request):
             for panel_info in panel_results:
                 if isinstance(panel_info, dict) and panel_info.get('email'):
                     client_email = panel_info['email']
+                    _cached_panel_info = panel_info
                     break
 
     # Получаем данные клиента из базы данных (срок, трафик)
@@ -1532,18 +1580,9 @@ async def subscription_handler(request):
             if isinstance(result, list):
                 links.extend(result)
 
-    # Если нет ключей - возвращаем 404
+    # Если нет ключей - возвращаем None
     if not links:
-        # Для браузера показываем красивую страницу с ошибкой
-        if is_browser_request(request):
-            error_html = '''<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZoVGoR VPN - Ошибка</title>
-<style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:20px;}
-.container{text-align:center;max-width:400px;}.icon{font-size:64px;margin-bottom:20px;}h1{margin-bottom:10px;}p{color:#888;}</style>
-</head><body><div class="container"><div class="icon">😔</div><h1>Клиент не найден</h1><p>Подписка не найдена или истекла. Обратитесь в поддержку: <a href="https://t.me/bagamedovit" style="color:#667eea">@bagamedovit</a></p></div></body></html>'''
-            return web.Response(text=error_html, content_type='text/html', status=404)
-        return web.Response(text="Client not found or no active servers", status=404)
+        return None
 
     # Собираем информацию о клиенте для браузера
     client_info = None
@@ -1560,28 +1599,32 @@ async def subscription_handler(request):
             'server': local_server.get('name', 'Local') if local_server else 'Local'
         }
 
-    # Если локальных данных нет - получаем с удалённых серверов (параллельно)
+    # Если локальных данных нет - используем ранее полученные данные или запрашиваем
     if not client_info:
-        info_servers = [
-            s for s in servers_config.get('servers', [])
-            if not s.get('local') and s.get('enabled')
-        ]
-        if info_servers:
-            info_results = await asyncio.gather(
-                *[get_client_info_from_panel(client_id, s) for s in info_servers],
-                return_exceptions=True
-            )
-            for panel_info in info_results:
-                if isinstance(panel_info, dict) and panel_info:
-                    client_info = panel_info
-                    client_email = panel_info.get('email', client_email)
-                    upload_bytes = panel_info.get('upload', 0)
-                    download_bytes = panel_info.get('download', 0)
-                    total_bytes = panel_info.get('total', 0)
-                    expire_time = panel_info.get('expiry_time', 0)
-                    if expire_time:
-                        expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
-                    break
+        panel_info = _cached_panel_info
+        if not panel_info:
+            info_servers = [
+                s for s in servers_config.get('servers', [])
+                if not s.get('local') and s.get('enabled')
+            ]
+            if info_servers:
+                info_results = await asyncio.gather(
+                    *[get_client_info_from_panel(client_id, s) for s in info_servers],
+                    return_exceptions=True
+                )
+                for r in info_results:
+                    if isinstance(r, dict) and r:
+                        panel_info = r
+                        break
+        if panel_info:
+            client_info = panel_info
+            client_email = panel_info.get('email', client_email)
+            upload_bytes = panel_info.get('upload', 0)
+            download_bytes = panel_info.get('download', 0)
+            total_bytes = panel_info.get('total', 0)
+            expire_time = panel_info.get('expiry_time', 0)
+            if expire_time:
+                expire_timestamp = int(expire_time / 1000) if expire_time > 9999999999 else expire_time
 
     # Fallback если ничего не нашли
     if not client_info:
@@ -1603,6 +1646,61 @@ async def subscription_handler(request):
             name = link.split('#')[-1]
             if name and name not in servers_list:
                 servers_list.append(name)
+
+    result = {
+        'links': links,
+        'client_info': client_info,
+        'client_email': client_email,
+        'upload_bytes': upload_bytes,
+        'download_bytes': download_bytes,
+        'total_bytes': total_bytes,
+        'expire_timestamp': expire_timestamp,
+        'servers_list': servers_list,
+    }
+
+    # Сохраняем в кэш
+    _subscription_cache[client_id] = {'data': result, 'time': _time.time()}
+
+    return result
+
+
+async def subscription_handler(request):
+    """Обработчик подписки - возвращает ключи клиента с активных серверов"""
+    client_id = request.match_info.get('client_id', '')
+
+    if not client_id:
+        return web.Response(text="Client ID required", status=400)
+
+    # Проверяем формат UUID
+    import re
+    uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+    if not uuid_pattern.match(client_id):
+        return web.Response(text="Invalid client ID format", status=400)
+
+    # Получаем данные подписки (с кэшированием)
+    data = await _build_subscription_data(client_id)
+
+    if not data:
+        # Для браузера показываем красивую страницу с ошибкой
+        if is_browser_request(request):
+            error_html = '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZoVGoR VPN - Ошибка</title>
+<style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:20px;}
+.container{text-align:center;max-width:400px;}.icon{font-size:64px;margin-bottom:20px;}h1{margin-bottom:10px;}p{color:#888;}</style>
+</head><body><div class="container"><div class="icon">😔</div><h1>Клиент не найден</h1><p>Подписка не найдена или истекла. Обратитесь в поддержку: <a href="https://t.me/bagamedovit" style="color:#667eea">@bagamedovit</a></p></div></body></html>'''
+            return web.Response(text=error_html, content_type='text/html', status=404)
+        return web.Response(text="Client not found or no active servers", status=404)
+
+    links = data['links']
+    client_info = data['client_info']
+    client_email = data['client_email']
+    upload_bytes = data['upload_bytes']
+    download_bytes = data['download_bytes']
+    total_bytes = data['total_bytes']
+    expire_timestamp = data['expire_timestamp']
+    servers_list = data['servers_list']
 
     # Если запрос из браузера - показываем HTML страницу
     if is_browser_request(request):

@@ -14,7 +14,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 # Таймаут для HTTP запросов к панелям (секунды)
-PANEL_REQUEST_TIMEOUT = 10
+PANEL_REQUEST_TIMEOUT = 5
 
 logger = logging.getLogger(__name__)
 
