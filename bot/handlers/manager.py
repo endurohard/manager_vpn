@@ -66,6 +66,14 @@ class FixKeyStates(StatesGroup):
     waiting_for_server_selection = State()  # Для админа - выбор сервера
 
 
+class MgrAddServerStates(StatesGroup):
+    """Состояния для добавления сервера менеджером"""
+    waiting_for_search = State()
+    waiting_for_server_select = State()
+    confirming = State()
+    waiting_for_traffic_choice = State()
+
+
 @router.message(F.text == "Создать ключ")
 async def start_create_key(message: Message, state: FSMContext, db: DatabaseManager):
     """Начало процесса создания ключа"""
@@ -2119,6 +2127,7 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
     menu_buttons = {
         "Создать ключ", "🔄 Замена ключа", "🔧 Исправить ключ",
         "💰 Прайс", "Моя статистика", "🔍 Найти клиента",
+        "📡 Управление подпиской",
         "Панель администратора", "Назад",
     }
     if query in menu_buttons:
@@ -2574,4 +2583,650 @@ async def cancel_reality_changes(callback: CallbackQuery, state: FSMContext):
         "❌ Изменения отменены."
     )
     await state.clear()
+    await callback.answer()
+
+
+# ============ УПРАВЛЕНИЕ ПОДПИСКОЙ (добавление/перенос сервера) ============
+
+@router.message(F.text == "📡 Управление подпиской")
+async def mgr_start_manage_sub(message: Message, state: FSMContext, db: DatabaseManager):
+    """Менеджер: начало управления подпиской клиента"""
+    user_id = message.from_user.id
+    if not await is_authorized(user_id, db):
+        await message.answer("У вас нет доступа к этой функции.")
+        return
+
+    await state.clear()
+    await state.set_state(MgrAddServerStates.waiting_for_search)
+    await message.answer(
+        "📡 <b>УПРАВЛЕНИЕ ПОДПИСКОЙ</b>\n\n"
+        "Здесь вы можете добавить сервер к подписке клиента "
+        "или перенести его на другой сервер.\n\n"
+        "Введите номер телефона, имя или UUID клиента:\n\n"
+        "Примеры:\n"
+        "• <code>79001234567</code>\n"
+        "• <code>Иван</code>",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel()
+    )
+
+
+@router.message(MgrAddServerStates.waiting_for_search, F.text == "Отмена")
+async def mgr_cancel_manage_sub(message: Message, state: FSMContext):
+    """Отмена управления подпиской"""
+    is_admin = message.from_user.id == ADMIN_ID
+    await state.clear()
+    await message.answer("Операция отменена.", reply_markup=Keyboards.main_menu(is_admin))
+
+
+@router.message(MgrAddServerStates.waiting_for_search)
+async def mgr_process_sub_search(message: Message, state: FSMContext, db: DatabaseManager):
+    """Поиск клиента для управления подпиской"""
+    from bot.handlers.admin import search_clients_on_servers
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    user_id = message.from_user.id
+    is_admin = user_id == ADMIN_ID
+    query = message.text.strip()
+
+    menu_buttons = {
+        "Создать ключ", "🔄 Замена ключа", "🔧 Исправить ключ",
+        "💰 Прайс", "Моя статистика", "🔍 Найти клиента",
+        "📡 Управление подпиской",
+        "Панель администратора", "Назад",
+    }
+    if query in menu_buttons:
+        await state.clear()
+        await message.answer("Операция отменена.", reply_markup=Keyboards.main_menu(is_admin))
+        return
+
+    if len(query) < 2:
+        await message.answer("❌ Введите минимум 2 символа для поиска.")
+        return
+
+    status_msg = await message.answer("🔍 Поиск клиента на серверах...")
+
+    # Ищем на всех серверах (как у админа)
+    xui_clients = await search_clients_on_servers(query)
+
+    # Дополнительно ищем по keys_history менеджера
+    if not xui_clients:
+        if is_admin:
+            keys = await db.search_keys(query)
+        else:
+            keys = await db.search_keys_by_manager(user_id, query)
+
+        if keys:
+            # Ищем UUID найденных ключей на серверах
+            for key in keys[:5]:
+                uuid = key.get('client_id', '')
+                if uuid:
+                    from bot.api.remote_xui import find_client_presence_on_all_servers
+                    presence = await find_client_presence_on_all_servers(uuid)
+                    for srv in presence.get('found_on', []):
+                        xui_clients.append({
+                            'email': key.get('client_email', key.get('phone_number', '')),
+                            'uuid': uuid,
+                            'server': srv.get('server_name', ''),
+                            'expiry_time': srv.get('expiry_time', 0),
+                            'limit_ip': srv.get('ip_limit', 2)
+                        })
+
+    if not xui_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
+            "Попробуйте другой запрос.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Группируем по UUID
+    clients_by_uuid = {}
+    for client in xui_clients:
+        uuid = client.get('uuid', '')
+        if not uuid:
+            continue
+        if uuid not in clients_by_uuid:
+            clients_by_uuid[uuid] = {
+                'email': client.get('email', ''),
+                'uuid': uuid,
+                'servers': [],
+                'expiry_time': client.get('expiry_time', 0),
+                'ip_limit': client.get('limit_ip', 2)
+            }
+        srv_name = client.get('server', 'Unknown')
+        if srv_name not in clients_by_uuid[uuid]['servers']:
+            clients_by_uuid[uuid]['servers'].append(srv_name)
+
+    unique_clients = list(clients_by_uuid.values())
+
+    if not unique_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(mgr_search_results=unique_clients, mgr_user_id=user_id)
+
+    text = f"🔍 <b>Найдено клиентов:</b> {len(unique_clients)}\n\n"
+    buttons = []
+
+    for idx, client in enumerate(unique_clients[:10]):
+        email = client['email']
+        uuid_short = client['uuid'][:8] + '...'
+        servers_str = ', '.join(client['servers'])
+        expiry_time = client.get('expiry_time', 0)
+
+        if expiry_time > 0:
+            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_dt.strftime("%d.%m.%Y")
+        else:
+            expiry_str = "Безлимит"
+
+        sub_url = f"https://zov-gor.ru/sub/{client['uuid']}"
+
+        text += f"{idx + 1}. <b>{email}</b>\n"
+        text += f"   🖥 Серверы: {servers_str}\n"
+        text += f"   ⏰ До: {expiry_str}\n"
+        text += f"   📱 <code>{sub_url}</code>\n\n"
+
+        buttons.append([InlineKeyboardButton(
+            text=f"📡 {email[:30]}",
+            callback_data=f"mgrsub_sel_{idx}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("mgrsub_sel_"))
+async def mgr_select_client_for_sub(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+    """Менеджер: выбор клиента — показ серверов и действий"""
+    from bot.api.remote_xui import find_client_presence_on_all_servers, load_servers_config
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    user_id = callback.from_user.id
+    if not await is_authorized(user_id, db):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    search_results = data.get('mgr_search_results', [])
+
+    if idx >= len(search_results):
+        await callback.answer("Ошибка: клиент не найден")
+        return
+
+    client = search_results[idx]
+    client_uuid = client['uuid']
+    email = client['email']
+
+    await callback.message.edit_text("🔍 Проверяю серверы...")
+
+    presence = await find_client_presence_on_all_servers(client_uuid)
+    found_on = presence.get('found_on', [])
+    not_found_on = presence.get('not_found_on', [])
+
+    # Фильтруем not_found_on по разрешённым серверам менеджера
+    servers_config = load_servers_config()
+    all_servers = servers_config.get('servers', [])
+    allowed = await _get_allowed_servers(user_id, db, all_servers)
+    allowed_names = {s.get('name') for s in allowed}
+
+    not_found_filtered = [
+        srv for srv in not_found_on
+        if srv['server_name'] in allowed_names
+    ]
+
+    # Берём expiry и ip_limit
+    expiry_time_ms = 0
+    ip_limit = 2
+    if found_on:
+        expiry_time_ms = found_on[0].get('expiry_time', 0)
+        ip_limit = found_on[0].get('ip_limit', 2)
+
+    available_servers = []
+    for srv in not_found_filtered:
+        available_servers.append({
+            'server_name': srv['server_name'],
+            'name_prefix': srv.get('name_prefix', srv['server_name']),
+            'server_config': srv['server_config']
+        })
+
+    await state.update_data(
+        mgr_client_uuid=client_uuid,
+        mgr_client_email=email,
+        mgr_expiry_time_ms=expiry_time_ms,
+        mgr_ip_limit=ip_limit,
+        mgr_available_servers=available_servers,
+        mgr_selected_indices=[],
+    )
+
+    # Формируем текст
+    sub_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n"
+    text += f"📱 Подписка: <code>{sub_url}</code>\n\n"
+
+    if found_on:
+        text += "<b>✅ Уже на серверах:</b>\n"
+        for srv in found_on:
+            exp = srv.get('expiry_time', 0)
+            if exp > 0:
+                exp_str = datetime.fromtimestamp(exp / 1000).strftime("%d.%m.%Y")
+            else:
+                exp_str = "Безлимит"
+            prefix = srv.get('name_prefix', '')
+            label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            text += f"  ✅ {label} — до {exp_str}\n"
+        text += "\n"
+
+    buttons = []
+
+    # QR код подписки
+    buttons.append([InlineKeyboardButton(
+        text="📱 QR код подписки",
+        callback_data=f"mgrsub_qr_{client_uuid[:36]}"
+    )])
+
+    if not not_found_filtered:
+        text += "🎉 <b>Клиент уже на всех доступных серверах!</b>"
+        buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="mgrsub_newsearch")])
+        buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="mgrsub_cancel")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        await callback.answer()
+        return
+
+    await state.set_state(MgrAddServerStates.waiting_for_server_select)
+
+    text += "<b>➕ Добавить на серверы:</b>\n"
+    for srv in not_found_filtered:
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  ➕ {label}\n"
+    text += "\nВыберите серверы для добавления:"
+
+    for idx_s, srv in enumerate(not_found_filtered):
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"➕ {btn_label}",
+            callback_data=f"mgrsub_srv_{idx_s}"
+        )])
+
+    if len(not_found_filtered) > 1:
+        buttons.append([InlineKeyboardButton(
+            text="📡 Добавить на ВСЕ",
+            callback_data="mgrsub_all"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mgrsub_qr_"))
+async def mgr_show_sub_qr(callback: CallbackQuery, db: DatabaseManager):
+    """Показать QR код подписки"""
+    user_id = callback.from_user.id
+    if not await is_authorized(user_id, db):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    client_uuid = callback.data[len("mgrsub_qr_"):]
+    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+
+    try:
+        qr_code = generate_qr_code(subscription_url)
+        await callback.message.answer_photo(
+            BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+            caption=(
+                f"📱 <b>QR код подписки</b>\n\n"
+                f"🔄 Ссылка:\n<code>{subscription_url}</code>\n\n"
+                f"💡 Отсканируйте QR или скопируйте ссылку и отправьте клиенту"
+            ),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"QR generation error: {e}")
+        await callback.message.answer(
+            f"🔄 Ссылка подписки:\n<code>{subscription_url}</code>",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+
+
+@router.callback_query(MgrAddServerStates.waiting_for_server_select, F.data.startswith("mgrsub_srv_"))
+async def mgr_toggle_server(callback: CallbackQuery, state: FSMContext):
+    """Менеджер: переключение выбора сервера"""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    selected = data.get('mgr_selected_indices', [])
+    available = data.get('mgr_available_servers', [])
+    email = data.get('mgr_client_email', '')
+    client_uuid = data.get('mgr_client_uuid', '')
+    expiry_time_ms = data.get('mgr_expiry_time_ms', 0)
+
+    if idx >= len(available):
+        await callback.answer("Ошибка")
+        return
+
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+    await state.update_data(mgr_selected_indices=selected)
+
+    buttons = []
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {btn_label}",
+            callback_data=f"mgrsub_srv_{i}"
+        )])
+
+    if len(available) > 1:
+        buttons.append([InlineKeyboardButton(text="📡 Добавить на ВСЕ", callback_data="mgrsub_all")])
+
+    if selected:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Подтвердить ({len(selected)})",
+            callback_data="mgrsub_go"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n\n"
+    text += "<b>Серверы:</b>\n"
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  {mark} {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(MgrAddServerStates.waiting_for_server_select, F.data == "mgrsub_all")
+async def mgr_select_all_servers(callback: CallbackQuery, state: FSMContext):
+    """Менеджер: выбрать все серверы"""
+    data = await state.get_data()
+    available = data.get('mgr_available_servers', [])
+    selected = list(range(len(available)))
+    await state.update_data(mgr_selected_indices=selected)
+    await state.set_state(MgrAddServerStates.confirming)
+
+    await _mgr_show_confirm(callback, state)
+
+
+@router.callback_query(MgrAddServerStates.waiting_for_server_select, F.data == "mgrsub_go")
+async def mgr_go_confirm(callback: CallbackQuery, state: FSMContext):
+    """Менеджер: перейти к подтверждению"""
+    data = await state.get_data()
+    selected = data.get('mgr_selected_indices', [])
+    if not selected:
+        await callback.answer("Выберите хотя бы один сервер")
+        return
+
+    await state.set_state(MgrAddServerStates.confirming)
+    await _mgr_show_confirm(callback, state)
+
+
+async def _mgr_show_confirm(callback: CallbackQuery, state: FSMContext):
+    """Показать экран подтверждения"""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    data = await state.get_data()
+    selected = data.get('mgr_selected_indices', [])
+    available = data.get('mgr_available_servers', [])
+    email = data.get('mgr_client_email', '')
+    client_uuid = data.get('mgr_client_uuid', '')
+    expiry_time_ms = data.get('mgr_expiry_time_ms', 0)
+
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    text = f"📡 <b>Подтверждение</b>\n\n"
+    text += f"Клиент: <code>{email}</code>\n\n"
+    text += "<b>Добавить на серверы:</b>\n"
+    for srv in selected_servers:
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  • {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        if expiry_time_ms < now_ms:
+            text += "\n⚠️ <i>Внимание: ключ просрочен!</i>"
+
+    buttons = [
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="mgrsub_confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mgrsub_back")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(MgrAddServerStates.confirming, F.data == "mgrsub_back")
+async def mgr_back_to_select(callback: CallbackQuery, state: FSMContext):
+    """Назад к выбору серверов"""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    await state.set_state(MgrAddServerStates.waiting_for_server_select)
+
+    data = await state.get_data()
+    selected = data.get('mgr_selected_indices', [])
+    available = data.get('mgr_available_servers', [])
+    email = data.get('mgr_client_email', '')
+    client_uuid = data.get('mgr_client_uuid', '')
+    expiry_time_ms = data.get('mgr_expiry_time_ms', 0)
+
+    buttons = []
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {btn_label}",
+            callback_data=f"mgrsub_srv_{i}"
+        )])
+
+    if len(available) > 1:
+        buttons.append([InlineKeyboardButton(text="📡 Добавить на ВСЕ", callback_data="mgrsub_all")])
+
+    if selected:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Подтвердить ({len(selected)})",
+            callback_data="mgrsub_go"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = f"📡 <b>Клиент:</b> <code>{email}</code>\n\n"
+    text += "<b>Серверы:</b>\n"
+    for i, srv in enumerate(available):
+        mark = "✅" if i in selected else "➕"
+        prefix = srv.get('name_prefix', '')
+        label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        text += f"  {mark} {label}\n"
+
+    if expiry_time_ms > 0:
+        exp_str = datetime.fromtimestamp(expiry_time_ms / 1000).strftime("%d.%m.%Y")
+        text += f"\n⏰ Срок: до {exp_str}"
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(MgrAddServerStates.confirming, F.data == "mgrsub_confirm")
+async def mgr_confirm_add_servers(callback: CallbackQuery, state: FSMContext):
+    """Менеджер: подтверждение — создаём клиента на выбранных серверах"""
+    from bot.api.remote_xui import create_client_via_panel
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    data = await state.get_data()
+    client_uuid = data.get('mgr_client_uuid', '')
+    email = data.get('mgr_client_email', '')
+    expiry_time_ms = data.get('mgr_expiry_time_ms', 0)
+    ip_limit = data.get('mgr_ip_limit', 2)
+    selected = data.get('mgr_selected_indices', [])
+    available = data.get('mgr_available_servers', [])
+
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    if not selected_servers:
+        await callback.answer("Нет выбранных серверов")
+        return
+
+    # Проверяем серверы с лимитом трафика
+    traffic_servers = [
+        srv for srv in selected_servers
+        if srv['server_config'].get('traffic_limit_gb', 0) > 0
+    ]
+    admin_total_gb = data.get('mgr_total_gb')
+    if traffic_servers and admin_total_gb is None:
+        traffic_limit = traffic_servers[0]['server_config']['traffic_limit_gb']
+        await state.set_state(MgrAddServerStates.waiting_for_traffic_choice)
+        await callback.message.edit_text(
+            f"📊 <b>Выбор трафика</b>\n\n"
+            f"Некоторые серверы имеют ограничение трафика.\n"
+            f"Выберите лимит:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"📊 {traffic_limit} ГБ (рекомендуется)", callback_data=f"mgrsub_traffic_{traffic_limit}")],
+                [InlineKeyboardButton(text="♾ Без ограничений", callback_data="mgrsub_traffic_0")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="mgrsub_cancel")]
+            ]),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    await _mgr_execute_add(callback, state, data, selected_servers)
+
+
+@router.callback_query(MgrAddServerStates.waiting_for_traffic_choice, F.data.startswith("mgrsub_traffic_"))
+async def mgr_traffic_choice(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора трафика"""
+    total_gb = int(callback.data.split("_")[-1])
+    await state.update_data(mgr_total_gb=total_gb)
+
+    data = await state.get_data()
+    selected = data.get('mgr_selected_indices', [])
+    available = data.get('mgr_available_servers', [])
+    selected_servers = [available[i] for i in selected if i < len(available)]
+
+    await _mgr_execute_add(callback, state, data, selected_servers)
+
+
+async def _mgr_execute_add(callback: CallbackQuery, state: FSMContext, data: dict, selected_servers: list):
+    """Выполнить добавление клиента на серверы"""
+    from bot.api.remote_xui import create_client_via_panel
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    client_uuid = data.get('mgr_client_uuid', '')
+    email = data.get('mgr_client_email', '')
+    expiry_time_ms = data.get('mgr_expiry_time_ms', 0)
+    ip_limit = data.get('mgr_ip_limit', 2)
+    total_gb = data.get('mgr_total_gb', 0) or 0
+
+    await callback.message.edit_text("⏳ Добавление клиента на серверы...")
+
+    results = []
+    for srv in selected_servers:
+        server_config = srv['server_config']
+        server_name = srv['server_name']
+
+        server_traffic_limit = server_config.get('traffic_limit_gb', 0)
+        srv_total_gb = total_gb if server_traffic_limit > 0 else 0
+
+        try:
+            result = await create_client_via_panel(
+                server_config=server_config,
+                client_uuid=client_uuid,
+                email=email,
+                expire_days=30,
+                ip_limit=ip_limit,
+                expire_time_ms=expiry_time_ms,
+                total_gb=srv_total_gb
+            )
+            success = result.get('success', False)
+            existing = result.get('existing', False)
+            results.append({'server': server_name, 'success': success, 'existing': existing})
+        except Exception as e:
+            logger.error(f"Ошибка добавления на {server_name}: {e}")
+            results.append({'server': server_name, 'success': False})
+
+    await state.clear()
+
+    sub_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    text = "📡 <b>Результат:</b>\n\n"
+    for r in results:
+        if r.get('success'):
+            if r.get('existing'):
+                text += f"✅ {r['server']} — клиент уже существовал\n"
+            else:
+                text += f"✅ {r['server']} — клиент добавлен\n"
+        else:
+            text += f"❌ {r['server']} — ошибка\n"
+
+    text += f"\n📱 Подписка: <code>{sub_url}</code>\n"
+    text += "Подписка обновлена автоматически."
+
+    buttons = [
+        [InlineKeyboardButton(text="📱 QR код", callback_data=f"mgrsub_qr_{client_uuid[:36]}")],
+        [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="mgrsub_newsearch")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="mgrsub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mgrsub_newsearch")
+async def mgr_new_search(callback: CallbackQuery, state: FSMContext):
+    """Новый поиск"""
+    await state.clear()
+    await state.set_state(MgrAddServerStates.waiting_for_search)
+    await callback.message.edit_text(
+        "📡 <b>УПРАВЛЕНИЕ ПОДПИСКОЙ</b>\n\n"
+        "Введите номер телефона, имя или UUID клиента для поиска.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mgrsub_cancel")
+async def mgr_cancel_sub_callback(callback: CallbackQuery, state: FSMContext):
+    """Отмена (inline)"""
+    is_admin = callback.from_user.id == ADMIN_ID
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer(
+        "Главное меню:",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
     await callback.answer()

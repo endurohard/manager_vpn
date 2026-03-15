@@ -9,12 +9,13 @@ import os
 import ssl
 import urllib.request
 import urllib.parse
+import urllib.error
 import http.cookiejar
 from pathlib import Path
 from datetime import datetime, timedelta
 
 # Таймаут для HTTP запросов к панелям (секунды)
-PANEL_REQUEST_TIMEOUT = 5
+PANEL_REQUEST_TIMEOUT = 15
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +256,14 @@ async def get_inbound_settings_from_panel(
         logger.warning(f"Inbound {inbound_id} не найден на {server_name}")
         return None
 
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            session['logged_in'] = False
+        logger.error(f"Ошибка получения настроек inbound с {server_name}: HTTP {e.code}")
+        return None
     except Exception as e:
+        # Не сбрасываем сессию при таймауте/сетевых ошибках — только при 401
         logger.error(f"Ошибка получения настроек inbound с {server_name}: {e}")
-        session['logged_in'] = False
         return None
 
 
@@ -319,9 +325,13 @@ async def get_all_clients_from_panel(server_config: dict) -> list:
 
         return clients
 
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            session['logged_in'] = False
+        logger.error(f"Ошибка получения клиентов с {server_name}: HTTP {e.code}")
+        return []
     except Exception as e:
         logger.error(f"Ошибка получения клиентов с {server_name}: {e}")
-        session['logged_in'] = False
         return []
 
 
@@ -372,9 +382,13 @@ async def reset_client_traffic_via_panel(server_config: dict, email: str, inboun
             logger.error(f"Ошибка сброса трафика {email} на {server_name}: {result.get('msg')}")
             return False
 
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            session['logged_in'] = False
+        logger.error(f"Ошибка сброса трафика {email} на {server_name}: HTTP {e.code}")
+        return False
     except Exception as e:
         logger.error(f"Ошибка сброса трафика {email} на {server_name}: {e}")
-        session['logged_in'] = False
         return False
 
 

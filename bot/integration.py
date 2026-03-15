@@ -65,10 +65,13 @@ class BotServices:
         if not self.notification_service:
             logger.warning("NotificationService не настроен, планировщик будет ограничен")
 
+        from bot.config import ADMIN_ID
         self.scheduler = SchedulerService(
             db_path=self.db_path,
             notification_service=self.notification_service,
-            client_manager=self.client_manager
+            client_manager=self.client_manager,
+            bot=self.bot,
+            admin_id=ADMIN_ID
         )
 
         await self.scheduler.start()

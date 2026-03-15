@@ -18,6 +18,7 @@ class TaskType(Enum):
     CLEANUP_CACHE = "cleanup_cache"
     SYNC_SERVERS = "sync_servers"
     DAILY_STATS = "daily_stats"
+    CHECK_SERVER_PAYMENTS = "check_server_payments"
     CUSTOM = "custom"
 
 
@@ -35,6 +36,7 @@ class Scheduler:
             TaskType.CLEANUP_CACHE.value: 3600,         # каждый час
             TaskType.SYNC_SERVERS.value: 600,           # каждые 10 минут
             TaskType.DAILY_STATS.value: 86400,          # раз в сутки
+            TaskType.CHECK_SERVER_PAYMENTS.value: 21600,  # каждые 6 часов
         }
 
     def register_handler(self, task_type: str, handler: Callable):
@@ -260,11 +262,14 @@ class Scheduler:
 class SchedulerService:
     """Сервис планировщика с предустановленными задачами"""
 
-    def __init__(self, db_path: str, notification_service=None, client_manager=None):
+    def __init__(self, db_path: str, notification_service=None, client_manager=None,
+                 bot=None, admin_id: int = 0):
         self.scheduler = Scheduler(db_path)
         self.db_path = db_path
         self.notification_service = notification_service
         self.client_manager = client_manager
+        self.bot = bot
+        self.admin_id = admin_id
         self._setup_handlers()
 
     def _setup_handlers(self):
@@ -293,6 +298,12 @@ class SchedulerService:
         self.scheduler.register_handler(
             TaskType.DAILY_STATS.value,
             self._handle_daily_stats
+        )
+
+        # Проверка оплаты серверов
+        self.scheduler.register_handler(
+            TaskType.CHECK_SERVER_PAYMENTS.value,
+            self._handle_check_server_payments
         )
 
     async def _handle_notifications(self, data: Dict = None):
@@ -414,6 +425,59 @@ class SchedulerService:
 
         logger.info(f"Собрана дневная статистика за {today}")
         return stats
+
+    async def _handle_check_server_payments(self, data: Dict = None):
+        """Проверка оплаты серверов и отправка предупреждений админу"""
+        if not self.bot or not self.admin_id:
+            return
+
+        from bot.database.db_manager import DatabaseManager
+        db = DatabaseManager(self.db_path)
+
+        warn_days = [7, 3, 1, 0]
+        expiring = await db.get_expiring_servers(warn_days)
+
+        if not expiring:
+            return {'checked': True, 'warnings': 0}
+
+        for server_info in expiring:
+            server_name = server_info['server_name']
+            paid_until = server_info['paid_until']
+            days_left = server_info['warn_days']
+            cost = server_info.get('monthly_cost', 0)
+            currency = server_info.get('currency', 'RUB')
+
+            if days_left <= 0:
+                emoji = "🔴"
+                urgency = "ПРОСРОЧЕНА"
+            elif days_left == 1:
+                emoji = "🟠"
+                urgency = "ЗАВТРА"
+            elif days_left <= 3:
+                emoji = "🟡"
+                urgency = f"через {days_left} дн."
+            else:
+                emoji = "⚠️"
+                urgency = f"через {days_left} дн."
+
+            text = (
+                f"{emoji} <b>Оплата сервера {urgency}!</b>\n\n"
+                f"🖥 Сервер: <b>{server_name}</b>\n"
+                f"📅 Оплачен до: <b>{paid_until}</b>\n"
+            )
+            if cost > 0:
+                text += f"💰 Стоимость: <b>{cost:.0f} {currency}</b>\n"
+            if server_info.get('notes'):
+                text += f"📝 {server_info['notes']}\n"
+
+            try:
+                await self.bot.send_message(self.admin_id, text, parse_mode="HTML")
+                await db.mark_server_payment_notified(server_name, days_left)
+                logger.info(f"Payment warning sent for {server_name} ({days_left} days left)")
+            except Exception as e:
+                logger.error(f"Failed to send payment warning for {server_name}: {e}")
+
+        return {'checked': True, 'warnings': len(expiring)}
 
     async def start(self):
         """Запуск сервиса"""

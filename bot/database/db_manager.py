@@ -1180,3 +1180,114 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error setting admin setting {key}: {e}")
             return False
+
+    # ============ ОПЛАТА СЕРВЕРОВ ============
+
+    async def set_server_payment(self, server_name: str, paid_until: str,
+                                  monthly_cost: float = 0, currency: str = 'RUB',
+                                  notes: str = '') -> bool:
+        """Установить дату оплаты сервера (paid_until в формате YYYY-MM-DD)"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO server_payments (server_name, paid_until, monthly_cost, currency, notes, updated_at)
+                       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                       ON CONFLICT(server_name) DO UPDATE SET
+                           paid_until = excluded.paid_until,
+                           monthly_cost = excluded.monthly_cost,
+                           currency = excluded.currency,
+                           notes = excluded.notes,
+                           last_notified_days = NULL,
+                           updated_at = CURRENT_TIMESTAMP""",
+                    (server_name, paid_until, monthly_cost, currency, notes)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error setting server payment for {server_name}: {e}")
+            return False
+
+    async def get_server_payment(self, server_name: str) -> dict:
+        """Получить информацию об оплате сервера"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT * FROM server_payments WHERE server_name = ?",
+                    (server_name,)
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting server payment for {server_name}: {e}")
+            return None
+
+    async def get_all_server_payments(self) -> list:
+        """Получить все записи оплаты серверов"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT * FROM server_payments ORDER BY paid_until ASC"
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting all server payments: {e}")
+            return []
+
+    async def get_expiring_servers(self, warn_days: list = None) -> list:
+        """Получить серверы с истекающей оплатой.
+        warn_days: список дней до истечения для предупреждения (например [7, 3, 1, 0])
+        """
+        if warn_days is None:
+            warn_days = [7, 3, 1, 0]
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                results = []
+                for days in sorted(warn_days, reverse=True):
+                    cursor = await db.execute(
+                        """SELECT * FROM server_payments
+                           WHERE DATE(paid_until) <= DATE('now', '+' || ? || ' days')
+                             AND (last_notified_days IS NULL OR last_notified_days > ?)""",
+                        (days, days)
+                    )
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        r = dict(row)
+                        r['warn_days'] = days
+                        results.append(r)
+                return results
+        except Exception as e:
+            logger.error(f"Error getting expiring servers: {e}")
+            return []
+
+    async def mark_server_payment_notified(self, server_name: str, days: int) -> bool:
+        """Отметить что уведомление об оплате отправлено"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """UPDATE server_payments SET last_notified_days = ?
+                       WHERE server_name = ?""",
+                    (days, server_name)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error marking payment notified for {server_name}: {e}")
+            return False
+
+    async def delete_server_payment(self, server_name: str) -> bool:
+        """Удалить запись оплаты сервера"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "DELETE FROM server_payments WHERE server_name = ?",
+                    (server_name,)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error deleting server payment for {server_name}: {e}")
+            return False

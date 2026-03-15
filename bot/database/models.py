@@ -329,6 +329,21 @@ CREATE TABLE IF NOT EXISTS cache (
 
 CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
 
+-- ==================== ОПЛАТА СЕРВЕРОВ ====================
+CREATE TABLE IF NOT EXISTS server_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_name TEXT UNIQUE NOT NULL,
+    paid_until DATE NOT NULL,
+    monthly_cost REAL DEFAULT 0,
+    currency TEXT DEFAULT 'RUB',
+    notes TEXT,
+    last_notified_days INTEGER,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_server_payments_date ON server_payments(paid_until);
+
 -- ==================== МИГРАЦИИ ====================
 CREATE TABLE IF NOT EXISTS migrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

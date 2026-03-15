@@ -20,6 +20,7 @@ class Keyboards:
             [KeyboardButton(text="Создать ключ"), KeyboardButton(text="🔄 Замена ключа")],
             [KeyboardButton(text="🔧 Исправить ключ"), KeyboardButton(text="💰 Прайс")],
             [KeyboardButton(text="🔍 Найти клиента"), KeyboardButton(text="Моя статистика")],
+            [KeyboardButton(text="📡 Управление подпиской")],
             [KeyboardButton(text="📖 Инструкции", web_app=WebAppInfo(url=WEBAPP_URL))]
         ]
 
@@ -42,12 +43,14 @@ class Keyboards:
             [KeyboardButton(text="Детальная статистика")],
             [KeyboardButton(text="💰 Изменить цены")],
             [KeyboardButton(text="🔍 Поиск ключа")],
+            [KeyboardButton(text="📅 Продлить подписку")],
             [KeyboardButton(text="🗑️ Удалить ключ")],
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
             [KeyboardButton(text="📡 Добавить сервер")],
             [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
+            [KeyboardButton(text="💳 Оплата серверов")],
             [KeyboardButton(text="🌐 Админ-панель сайта"), KeyboardButton(text="💾 Бэкап")],
             [KeyboardButton(text="Назад")]
         ]

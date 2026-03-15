@@ -22,7 +22,117 @@ SUBSCRIPTION_CACHE_TTL = 60  # секунд
 
 # Кэш здоровья серверов: {server_ip: {'healthy': bool, 'time': timestamp}}
 _server_health_cache = {}
-SERVER_HEALTH_CACHE_TTL = 120  # помечаем недоступный сервер на 2 минуты
+SERVER_HEALTH_CACHE_TTL = 60  # помечаем недоступный сервер на 1 минуту
+
+# Общий таймаут для панельных запросов (секунды)
+PANEL_TIMEOUT = 15
+
+# Переиспользуемая aiohttp сессия для панельных запросов
+_shared_panel_session = None
+_shared_ssl_context = None
+
+
+def _get_ssl_context():
+    """Получить или создать общий SSL контекст"""
+    global _shared_ssl_context
+    if _shared_ssl_context is None:
+        _shared_ssl_context = ssl.create_default_context()
+        _shared_ssl_context.check_hostname = False
+        _shared_ssl_context.verify_mode = ssl.CERT_NONE
+    return _shared_ssl_context
+
+
+async def _get_shared_session():
+    """Получить или создать общую aiohttp сессию для панельных запросов"""
+    global _shared_panel_session
+    if _shared_panel_session is None or _shared_panel_session.closed:
+        connector = aiohttp.TCPConnector(
+            ssl=_get_ssl_context(),
+            limit=20,
+            limit_per_host=5,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+        )
+        _shared_panel_session = aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            timeout=aiohttp.ClientTimeout(total=PANEL_TIMEOUT),
+        )
+    return _shared_panel_session
+
+
+# Кэш авторизации панелей: {base_url: {'cookies': dict, 'time': float}}
+_panel_auth_cache = {}
+PANEL_AUTH_CACHE_TTL = 1800  # 30 минут
+
+
+async def _panel_request(server, endpoint, method='GET', data=None):
+    """Единый метод для запросов к панелям с переиспользованием сессий и авторизации"""
+    import time as _time
+
+    panel = server.get('panel', {})
+    if not panel:
+        return None
+
+    ip = server.get('ip', '')
+    port = panel.get('port', 1020)
+    path = panel.get('path', '')
+    username = panel.get('username', '')
+    password = panel.get('password', '')
+
+    if not all([ip, username, password]):
+        return None
+
+    base_url = f"https://{ip}:{port}{path}"
+    session = await _get_shared_session()
+
+    # Проверяем кэш авторизации
+    auth = _panel_auth_cache.get(base_url)
+    need_login = not auth or (_time.time() - auth['time']) > PANEL_AUTH_CACHE_TTL
+
+    for attempt in range(2):  # 1 основная попытка + 1 retry после re-login
+        try:
+            if need_login:
+                async with session.post(
+                    f"{base_url}/login",
+                    data={'username': username, 'password': password},
+                ) as resp:
+                    login_result = await resp.json()
+                    if not login_result.get('success'):
+                        logger.warning(f"Panel login failed: {server.get('name', ip)}")
+                        return None
+                    # Сохраняем cookies
+                    _panel_auth_cache[base_url] = {
+                        'cookies': {c.key: c.value for c in session.cookie_jar},
+                        'time': _time.time(),
+                    }
+                    need_login = False
+
+            url = f"{base_url}{endpoint}"
+            if method == 'GET':
+                async with session.get(url) as resp:
+                    if resp.status == 401:
+                        need_login = True
+                        continue
+                    return await resp.json()
+            else:
+                async with session.post(url, data=data) as resp:
+                    if resp.status == 401:
+                        need_login = True
+                        continue
+                    return await resp.json()
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Panel timeout: {server.get('name', ip)} {endpoint}")
+            return None
+        except aiohttp.ClientError as e:
+            logger.warning(f"Panel connection error: {server.get('name', ip)} {endpoint}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Panel request error: {server.get('name', ip)} {endpoint}: {e}")
+            return None
+
+    return None
 
 # Путь к базе данных бота для связанных ключей
 BOT_DB_PATH = Path(__file__).parent.parent.parent / 'bot_data.db'
@@ -414,13 +524,8 @@ def _mark_server_healthy(server):
     _server_health_cache[ip] = {'healthy': True, 'time': _time.time()}
 
 
-def check_client_exists_via_panel(uuid_str, server):
-    """Проверить существование клиента через API панели X-UI"""
-    import urllib.request
-    import urllib.parse
-    import ssl
-    import http.cookiejar
-
+async def check_client_exists_via_panel_async(uuid_str, server):
+    """Проверить существование клиента через API панели X-UI (асинхронно)"""
     panel = server.get('panel', {})
     if not panel:
         return False
@@ -428,6 +533,45 @@ def check_client_exists_via_panel(uuid_str, server):
     # Пропускаем недоступные серверы
     if not _is_server_healthy(server):
         logger.debug(f"Skipping unhealthy server {server.get('name', server.get('ip', '?'))}")
+        return False
+
+    try:
+        data = await _panel_request(server, '/panel/api/inbounds/list')
+        if not data or not data.get('success'):
+            _mark_server_unhealthy(server)
+            return False
+
+        _mark_server_healthy(server)
+
+        for inbound in data.get('obj', []):
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('id') == uuid_str:
+                        return True
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        return False
+
+    except Exception as e:
+        _mark_server_unhealthy(server)
+        logger.error(f"Error checking client via panel on {server.get('name', server.get('ip', '?'))}: {e}")
+        return False
+
+
+def check_client_exists_via_panel(uuid_str, server):
+    """Синхронная обёртка (legacy) — используйте check_client_exists_via_panel_async"""
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+
+    panel = server.get('panel', {})
+    if not panel:
+        return False
+
+    if not _is_server_healthy(server):
         return False
 
     ip = server.get('ip', '')
@@ -440,59 +584,37 @@ def check_client_exists_via_panel(uuid_str, server):
         return False
 
     try:
-        # Создаём SSL контекст без проверки сертификата
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
+        ctx = _get_ssl_context()
         cookie_jar = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(cookie_jar),
             urllib.request.HTTPSHandler(context=ctx)
         )
-
         base_url = f"https://{ip}:{port}{path}"
 
-        # Авторизуемся
-        login_data = urllib.parse.urlencode({
-            'username': username,
-            'password': password
-        }).encode()
-
-        login_req = urllib.request.Request(
-            f"{base_url}/login",
-            data=login_data,
-            method='POST'
-        )
+        login_data = urllib.parse.urlencode({'username': username, 'password': password}).encode()
+        login_req = urllib.request.Request(f"{base_url}/login", data=login_data, method='POST')
         login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-
-        resp = opener.open(login_req, timeout=5)
+        resp = opener.open(login_req, timeout=PANEL_TIMEOUT)
         login_result = json.loads(resp.read())
-
         if not login_result.get('success'):
             return False
 
-        # Получаем список inbounds
         list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
-        resp = opener.open(list_req, timeout=5)
+        resp = opener.open(list_req, timeout=PANEL_TIMEOUT)
         data = json.loads(resp.read())
-
         _mark_server_healthy(server)
-
         if not data.get('success'):
             return False
 
-        # Ищем клиента
         for inbound in data.get('obj', []):
-            settings_str = inbound.get('settings', '{}')
             try:
-                settings = json.loads(settings_str)
+                settings = json.loads(inbound.get('settings', '{}'))
                 for client in settings.get('clients', []):
                     if client.get('id') == uuid_str:
                         return True
-            except:
+            except (json.JSONDecodeError, KeyError):
                 continue
-
         return False
 
     except Exception as e:
@@ -503,18 +625,18 @@ def check_client_exists_via_panel(uuid_str, server):
 
 def check_client_exists_on_server(uuid_str, server):
     """Проверить существование клиента на сервере (через panel или SSH)"""
-    # Сначала пробуем через API панели
     panel = server.get('panel', {})
     if panel:
         return check_client_exists_via_panel(uuid_str, server)
-
-    # Иначе через SSH
     client, inbound = find_client_on_remote_server(uuid_str, server)
     return client is not None
 
 
 async def check_client_exists_on_server_async(uuid_str, server):
     """Асинхронная проверка существования клиента на сервере"""
+    panel = server.get('panel', {})
+    if panel:
+        return await check_client_exists_via_panel_async(uuid_str, server)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, check_client_exists_on_server, uuid_str, server)
 
@@ -992,90 +1114,52 @@ async def get_client_info_from_panel(uuid_str, server):
     if not panel:
         return None
 
-    # Пропускаем недоступные серверы
     if not _is_server_healthy(server):
         logger.debug(f"Skipping unhealthy server {server.get('name', server.get('ip', '?'))} for panel info")
         return None
 
-    ip = server.get('ip', '')
-    port = panel.get('port', 1020)
-    path = panel.get('path', '')
-    username = panel.get('username', '')
-    password = panel.get('password', '')
-
-    if not all([ip, username, password]):
-        return None
-
     try:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        data = await _panel_request(server, '/panel/api/inbounds/list')
+        if not data or not data.get('success'):
+            _mark_server_unhealthy(server)
+            return None
 
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
-        cookie_jar = aiohttp.CookieJar(unsafe=True)
+        _mark_server_healthy(server)
 
-        async with aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar) as session:
-            base_url = f"https://{ip}:{port}{path}"
-
-            # Авторизация
-            async with session.post(
-                f"{base_url}/login",
-                data={'username': username, 'password': password},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                login_result = await resp.json()
-                if not login_result.get('success'):
-                    logger.warning(f"Failed to login to panel {server.get('name', ip)}")
-                    return None
-
-            # Получаем список inbounds
-            async with session.get(
-                f"{base_url}/panel/api/inbounds/list",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                data = await resp.json()
-
-                if not data.get('success'):
-                    return None
-
-                # Ищем клиента
-                for inbound in data.get('obj', []):
-                    settings_str = inbound.get('settings', '{}')
-                    try:
-                        settings = json.loads(settings_str)
-                        for client in settings.get('clients', []):
-                            if client.get('id') == uuid_str:
-                                # Получаем статистику трафика
-                                client_stats = inbound.get('clientStats', [])
-                                for stat in client_stats:
-                                    if stat.get('email') == client.get('email'):
-                                        return {
-                                            'email': client.get('email', 'client'),
-                                            'upload': stat.get('up', 0),
-                                            'download': stat.get('down', 0),
-                                            'total': stat.get('total', 0),
-                                            'expiry_time': client.get('expiryTime', 0),
-                                            'enable': client.get('enable', True),
-                                            'server': server.get('name', 'Server')
-                                        }
-                                # Если статистики нет, возвращаем базовую инфу
+        for inbound in data.get('obj', []):
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                for client in settings.get('clients', []):
+                    if client.get('id') == uuid_str:
+                        client_stats = inbound.get('clientStats', [])
+                        for stat in client_stats:
+                            if stat.get('email') == client.get('email'):
                                 return {
                                     'email': client.get('email', 'client'),
-                                    'upload': 0,
-                                    'download': 0,
-                                    'total': client.get('totalGB', 0) * 1024 * 1024 * 1024 if client.get('totalGB') else 0,
+                                    'upload': stat.get('up', 0),
+                                    'download': stat.get('down', 0),
+                                    'total': stat.get('total', 0),
                                     'expiry_time': client.get('expiryTime', 0),
                                     'enable': client.get('enable', True),
                                     'server': server.get('name', 'Server')
                                 }
-                    except:
-                        continue
+                        return {
+                            'email': client.get('email', 'client'),
+                            'upload': 0,
+                            'download': 0,
+                            'total': client.get('totalGB', 0) * 1024 * 1024 * 1024 if client.get('totalGB') else 0,
+                            'expiry_time': client.get('expiryTime', 0),
+                            'enable': client.get('enable', True),
+                            'server': server.get('name', 'Server')
+                        }
+            except (json.JSONDecodeError, KeyError):
+                continue
 
-        _mark_server_healthy(server)
         return None
     except Exception as e:
         _mark_server_unhealthy(server)
-        logger.error(f"Error getting client info from panel {server.get('name', ip)}: {e}")
+        logger.error(f"Error getting client info from panel {server.get('name', server.get('ip', '?'))}: {e}")
         return None
 
 

@@ -82,6 +82,12 @@ class EditServerStates(StatesGroup):
     waiting_for_field_value = State()
 
 
+class ServerPaymentStates(StatesGroup):
+    """Состояния для управления оплатой серверов"""
+    waiting_for_date = State()
+    waiting_for_cost = State()
+
+
 class SearchKeyStates(StatesGroup):
     """Состояния для поиска ключей"""
     waiting_for_search_query = State()
@@ -100,6 +106,11 @@ class AdminCreateKeyStates(StatesGroup):
     waiting_for_period = State()
     waiting_for_traffic = State()  # Выбор трафика (если сервер имеет лимит)
     confirming = State()
+
+
+class ExtendSubscriptionStates(StatesGroup):
+    """Состояния для продления подписки"""
+    waiting_for_search = State()
 
 
 class AddToSubscriptionStates(StatesGroup):
@@ -2819,8 +2830,9 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
         "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
         "Добавить менеджера", "Список менеджеров", "Общая статистика",
         "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "📅 Продлить подписку",
         "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
-        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI", "💳 Оплата серверов",
         "🌐 Админ-панель сайта",
         "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
         "🔧 Исправить ключ", "💰 Прайс", "Моя статистика",
@@ -2966,6 +2978,290 @@ async def new_search(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+# ==================== ПРОДЛЕНИЕ ПОДПИСКИ ====================
+
+@router.message(F.text == "📅 Продлить подписку")
+@admin_only
+async def start_extend_subscription(message: Message, state: FSMContext, **kwargs):
+    """Начало продления подписки клиента"""
+    await state.clear()
+    await state.set_state(ExtendSubscriptionStates.waiting_for_search)
+    await message.answer(
+        "📅 <b>ПРОДЛЕНИЕ ПОДПИСКИ</b>\n\n"
+        "Введите email, UUID или телефон клиента для поиска.\n\n"
+        "Подписка будет продлена на <b>всех серверах</b> клиента.\n\n"
+        "Или нажмите 'Отмена' для возврата.",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel()
+    )
+
+
+@router.message(ExtendSubscriptionStates.waiting_for_search, F.text == "Отмена")
+async def cancel_extend_subscription(message: Message, state: FSMContext):
+    """Отмена продления"""
+    await state.clear()
+    await message.answer("Операция отменена.", reply_markup=Keyboards.admin_menu())
+
+
+@router.message(ExtendSubscriptionStates.waiting_for_search)
+async def process_extend_search(message: Message, state: FSMContext):
+    """Поиск клиента для продления подписки"""
+    from datetime import datetime
+
+    query = message.text.strip()
+
+    # Если пользователь нажал кнопку меню - выходим
+    admin_menu_buttons = {
+        "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
+        "Добавить менеджера", "Список менеджеров", "Общая статистика",
+        "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "💳 Оплата серверов", "🌐 Админ-панель сайта", "📅 Продлить подписку",
+        "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
+        "🔧 Исправить ключ", "💰 Прайс", "Моя статистика",
+    }
+    if query in admin_menu_buttons:
+        await state.clear()
+        await message.answer("Операция отменена.", reply_markup=Keyboards.admin_menu())
+        return
+
+    if len(query) < 2:
+        await message.answer("❌ Введите минимум 2 символа для поиска.")
+        return
+
+    status_msg = await message.answer("🔍 Поиск клиента на серверах...")
+
+    xui_clients = await search_clients_on_servers(query)
+
+    if not xui_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
+            "Попробуйте другой запрос.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Группируем по UUID
+    clients_by_uuid = {}
+    for client in xui_clients:
+        uuid = client.get('uuid', '')
+        if not uuid:
+            continue
+        if uuid not in clients_by_uuid:
+            clients_by_uuid[uuid] = {
+                'email': client.get('email', ''),
+                'uuid': uuid,
+                'servers': [],
+                'expiry_time': client.get('expiry_time', 0),
+                'ip_limit': client.get('limit_ip', 2)
+            }
+        clients_by_uuid[uuid]['servers'].append(client.get('server', 'Unknown'))
+
+    unique_clients = list(clients_by_uuid.values())
+
+    if not unique_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+
+    text = f"📅 <b>ПРОДЛЕНИЕ ПОДПИСКИ</b>\n"
+    text += f"Запрос: «{query}»\n\n"
+
+    buttons = []
+
+    for idx, client in enumerate(unique_clients[:10]):
+        email = client['email']
+        uuid_val = client['uuid']
+        servers_str = ', '.join(client['servers'])
+        expiry_time = client.get('expiry_time', 0)
+
+        if expiry_time > 0:
+            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_dt.strftime("%d.%m.%Y")
+            now_ms = int(datetime.now().timestamp() * 1000)
+            if expiry_time < now_ms:
+                expiry_str += " ❌ истекла"
+        else:
+            expiry_str = "Безлимит"
+
+        text += f"{idx + 1}. <b>{email}</b>\n"
+        text += f"   🖥 Серверы: {servers_str}\n"
+        text += f"   ⏰ До: {expiry_str}\n\n"
+
+        # Кнопка продления на ВСЕХ серверах
+        buttons.append([InlineKeyboardButton(
+            text=f"📅 Продлить: {email[:30]}",
+            callback_data=f"extall_{uuid_val}"
+        )])
+
+        if len(text) > 3000:
+            text += "<i>... показаны первые результаты</i>\n"
+            break
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_key_delete")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("extall_"))
+async def extend_all_servers_select_period(callback: CallbackQuery):
+    """Выбор периода продления на ВСЕХ серверах"""
+    from bot.api.remote_xui import find_client_presence_on_all_servers
+    from datetime import datetime
+
+    client_uuid = callback.data.replace("extall_", "")
+    uuid_short = client_uuid[:8] + "..."
+
+    await callback.answer("⏳ Проверяю серверы...")
+    await callback.message.edit_text("🔍 Проверяю серверы клиента...")
+
+    # Находим клиента на всех серверах
+    presence = await find_client_presence_on_all_servers(client_uuid)
+    found_on = presence.get('found_on', [])
+
+    if not found_on:
+        await callback.message.edit_text(
+            f"❌ Клиент <code>{uuid_short}</code> не найден ни на одном сервере.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")]
+            ])
+        )
+        return
+
+    # Показываем информацию о клиенте и его серверах
+    email = found_on[0].get('email', uuid_short)
+    text = f"📅 <b>ПРОДЛЕНИЕ ПОДПИСКИ</b>\n\n"
+    text += f"👤 Клиент: <code>{email}</code>\n"
+    text += f"🔑 UUID: <code>{uuid_short}</code>\n\n"
+    text += f"<b>Серверы ({len(found_on)}):</b>\n"
+
+    for srv in found_on:
+        exp = srv.get('expiry_time', 0)
+        if exp > 0:
+            exp_str = datetime.fromtimestamp(exp / 1000).strftime("%d.%m.%Y")
+        else:
+            exp_str = "Безлимит"
+        prefix = srv.get('name_prefix', '')
+        label = srv['server_name']
+        if prefix and prefix != label:
+            label = f"{label} [{prefix}]"
+        text += f"  • {label} — до {exp_str}\n"
+
+    text += f"\n📌 Подписка будет продлена на <b>всех серверах</b>.\n"
+    text += "Выберите период:"
+
+    # Кнопки выбора периода
+    buttons = [
+        [
+            InlineKeyboardButton(text="1 мес", callback_data=f"doextall_{client_uuid}_30"),
+            InlineKeyboardButton(text="3 мес", callback_data=f"doextall_{client_uuid}_90"),
+        ],
+        [
+            InlineKeyboardButton(text="6 мес", callback_data=f"doextall_{client_uuid}_180"),
+            InlineKeyboardButton(text="1 год", callback_data=f"doextall_{client_uuid}_365"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_key_delete")]
+    ]
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("doextall_"))
+async def do_extend_all_servers(callback: CallbackQuery):
+    """Выполнить продление подписки на всех серверах"""
+    from bot.api.remote_xui import extend_client_on_all_servers
+    from bot.integration import get_services
+    from datetime import datetime
+
+    # Формат: doextall_{uuid}_{days}
+    parts = callback.data.replace("doextall_", "").rsplit("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+
+    client_uuid = parts[0]
+    try:
+        extend_days = int(parts[1])
+    except ValueError:
+        await callback.answer("❌ Ошибка: неверное количество дней", show_alert=True)
+        return
+
+    await callback.answer("⏳ Продлеваю подписку на всех серверах...")
+    await callback.message.edit_text("⏳ Продление подписки на всех серверах...")
+
+    # Продлеваем на всех серверах через API панелей
+    result = await extend_client_on_all_servers(client_uuid, extend_days)
+
+    if result.get('success'):
+        new_expiry_ms = result.get('new_expiry', 0)
+        if new_expiry_ms:
+            new_expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000).strftime('%d.%m.%Y %H:%M')
+        else:
+            new_expiry_date = "неизвестно"
+
+        # Обновляем локальную БД (clients и client_servers)
+        try:
+            services = get_services()
+            if services and services.client_manager:
+                # Ищем клиента в локальной БД по UUID
+                client_data = await services.client_manager.get_client(uuid=client_uuid)
+                if client_data:
+                    await services.client_manager.extend_subscription(
+                        client_id=client_data['id'],
+                        days=extend_days,
+                        manager_id=callback.from_user.id
+                    )
+                    logger.info(f"Локальная БД обновлена: клиент {client_uuid[:8]}... продлён на {extend_days} дней")
+        except Exception as e:
+            logger.warning(f"Не удалось обновить локальную БД: {e}")
+
+        # Формируем отчёт по серверам
+        results_text = ""
+        success_count = 0
+        fail_count = 0
+        for server_name, success in result.get('results', {}).items():
+            if success:
+                results_text += f"  ✅ {server_name}\n"
+                success_count += 1
+            else:
+                results_text += f"  ❌ {server_name}\n"
+                fail_count += 1
+
+        period_text = {30: "1 месяц", 90: "3 месяца", 180: "6 месяцев", 365: "1 год"}.get(extend_days, f"{extend_days} дней")
+
+        await callback.message.edit_text(
+            f"✅ <b>ПОДПИСКА ПРОДЛЕНА</b>\n\n"
+            f"🔑 UUID: <code>{client_uuid[:8]}...</code>\n"
+            f"📅 Период: +{period_text}\n"
+            f"⏰ Новый срок: <b>{new_expiry_date}</b>\n\n"
+            f"<b>Серверы:</b> ✅ {success_count}"
+            + (f" / ❌ {fail_count}" if fail_count else "") + f"\n{results_text}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📅 Продлить ещё", callback_data=f"extall_{client_uuid}")],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="cancel_key_delete")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка продления</b>\n\n"
+            f"Не удалось продлить подписку на серверах.\n"
+            f"UUID: <code>{client_uuid[:8]}...</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"extall_{client_uuid}")],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="new_search")]
+            ])
+        )
 
 
 @router.callback_query(F.data.startswith("exts_"))
@@ -4364,8 +4660,39 @@ async def check_servers_status(message: Message, **kwargs):
 
         text += "\n"
 
-    # Добавляем время проверки
-    from datetime import datetime
+    # Добавляем оплату серверов
+    from datetime import datetime, date
+    from bot.database.db_manager import DatabaseManager
+    from bot.config import DATABASE_PATH
+    db_mgr = DatabaseManager(DATABASE_PATH)
+    payments = await db_mgr.get_all_server_payments()
+    if payments:
+        payments_map = {p['server_name']: p for p in payments}
+        today = date.today()
+        text += "💳 <b>Оплата серверов:</b>\n"
+        for srv in servers:
+            srv_name = srv.get('name', 'Unknown')
+            payment = payments_map.get(srv_name)
+            if payment:
+                paid_until = datetime.strptime(payment['paid_until'], '%Y-%m-%d').date()
+                days_left = (paid_until - today).days
+                if days_left < 0:
+                    pay_icon = "🔴"
+                    pay_text = f"просрочено {abs(days_left)} дн."
+                elif days_left <= 3:
+                    pay_icon = "🟠"
+                    pay_text = f"{days_left} дн."
+                elif days_left <= 7:
+                    pay_icon = "🟡"
+                    pay_text = f"{days_left} дн."
+                else:
+                    pay_icon = "🟢"
+                    pay_text = f"{days_left} дн."
+                text += f"   {pay_icon} {srv_name}: до {payment['paid_until']} ({pay_text})\n"
+            else:
+                text += f"   ⚪ {srv_name}: не указана\n"
+        text += "\n"
+
     text += f"━━━━━━━━━━━━━━━━\n"
     text += f"🕐 Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
 
@@ -4400,6 +4727,256 @@ async def check_servers_status(message: Message, **kwargs):
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
+
+# ============ ОПЛАТА СЕРВЕРОВ ============
+
+@router.message(F.text == "💳 Оплата серверов")
+@admin_only
+async def server_payments_menu(message: Message, **kwargs):
+    """Показать статус оплаты серверов"""
+    from bot.api.remote_xui import load_servers_config
+    from bot.database.db_manager import DatabaseManager
+    from bot.config import DATABASE_PATH
+    from datetime import datetime, date
+
+    db = DatabaseManager(DATABASE_PATH)
+    payments = await db.get_all_server_payments()
+    servers_config = load_servers_config()
+    servers = servers_config.get('servers', [])
+
+    # Маппинг оплат по имени сервера
+    payments_map = {p['server_name']: p for p in payments}
+
+    today = date.today()
+    text = "💳 <b>ОПЛАТА СЕРВЕРОВ</b>\n\n"
+
+    buttons = []
+
+    for server in servers:
+        name = server.get('name', 'Unknown')
+        enabled = server.get('enabled', False)
+
+        payment = payments_map.get(name)
+
+        if payment:
+            paid_until = datetime.strptime(payment['paid_until'], '%Y-%m-%d').date()
+            days_left = (paid_until - today).days
+            cost = payment.get('monthly_cost', 0)
+            currency = payment.get('currency', 'RUB')
+
+            if days_left < 0:
+                emoji = "🔴"
+                status_text = f"просрочена {abs(days_left)} дн."
+            elif days_left == 0:
+                emoji = "🔴"
+                status_text = "истекает сегодня!"
+            elif days_left <= 3:
+                emoji = "🟠"
+                status_text = f"осталось {days_left} дн."
+            elif days_left <= 7:
+                emoji = "🟡"
+                status_text = f"осталось {days_left} дн."
+            else:
+                emoji = "🟢"
+                status_text = f"осталось {days_left} дн."
+
+            text += f"{emoji} <b>{name}</b>"
+            if not enabled:
+                text += " (выкл)"
+            text += f"\n   📅 До: <b>{payment['paid_until']}</b> ({status_text})\n"
+            if cost > 0:
+                text += f"   💰 {cost:.0f} {currency}/мес\n"
+            if payment.get('notes'):
+                text += f"   📝 {payment['notes']}\n"
+            text += "\n"
+        else:
+            text += f"⚪ <b>{name}</b>"
+            if not enabled:
+                text += " (выкл)"
+            text += "\n   📅 Дата оплаты не указана\n\n"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📅 {name}",
+                callback_data=f"srvpay_{name}"
+            )
+        ])
+
+    text += "━━━━━━━━━━━━━━━━\n"
+    text += "Нажмите на сервер, чтобы установить дату оплаты."
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("srvpay_"))
+async def server_payment_select(callback: CallbackQuery, state: FSMContext):
+    """Выбор сервера для установки даты оплаты"""
+    server_name = callback.data[len("srvpay_"):]
+
+    from bot.database.db_manager import DatabaseManager
+    from bot.config import DATABASE_PATH
+
+    db = DatabaseManager(DATABASE_PATH)
+    payment = await db.get_server_payment(server_name)
+
+    text = f"💳 <b>Оплата: {server_name}</b>\n\n"
+    if payment:
+        text += f"📅 Текущая дата: <b>{payment['paid_until']}</b>\n"
+        if payment.get('monthly_cost', 0) > 0:
+            text += f"💰 Стоимость: {payment['monthly_cost']:.0f} {payment.get('currency', 'RUB')}/мес\n"
+        if payment.get('notes'):
+            text += f"📝 Заметка: {payment['notes']}\n"
+        text += "\n"
+
+    text += "Введите дату оплаты (до какого числа оплачено):\n"
+    text += "Формат: <code>ДД.ММ.ГГГГ</code>\n"
+    text += "Например: <code>15.04.2026</code>"
+
+    await state.set_state(ServerPaymentStates.waiting_for_date)
+    await state.update_data(payment_server_name=server_name)
+
+    buttons = []
+    if payment:
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить запись", callback_data=f"srvpay_del_{server_name}")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="srvpay_cancel")])
+
+    await callback.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("srvpay_del_"))
+async def server_payment_delete(callback: CallbackQuery, state: FSMContext):
+    """Удалить запись оплаты"""
+    server_name = callback.data[len("srvpay_del_"):]
+
+    from bot.database.db_manager import DatabaseManager
+    from bot.config import DATABASE_PATH
+
+    db = DatabaseManager(DATABASE_PATH)
+    await db.delete_server_payment(server_name)
+    await state.clear()
+
+    await callback.message.edit_text(
+        f"✅ Запись оплаты для <b>{server_name}</b> удалена.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "srvpay_cancel")
+async def server_payment_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена установки оплаты"""
+    await state.clear()
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+@router.message(ServerPaymentStates.waiting_for_date)
+async def server_payment_process_date(message: Message, state: FSMContext):
+    """Обработка введённой даты оплаты"""
+    from datetime import datetime
+
+    text = message.text.strip()
+
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=Keyboards.admin_menu())
+        return
+
+    # Парсим дату
+    date_obj = None
+    for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+        try:
+            date_obj = datetime.strptime(text, fmt).date()
+            break
+        except ValueError:
+            continue
+
+    if not date_obj:
+        await message.answer(
+            "❌ Неверный формат даты.\n"
+            "Введите в формате <code>ДД.ММ.ГГГГ</code>, например: <code>15.04.2026</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(payment_date=date_obj.isoformat())
+    await state.set_state(ServerPaymentStates.waiting_for_cost)
+
+    data = await state.get_data()
+    server_name = data.get('payment_server_name', '?')
+
+    await message.answer(
+        f"📅 Дата: <b>{date_obj.strftime('%d.%m.%Y')}</b>\n\n"
+        f"Введите стоимость сервера в месяц (число).\n"
+        f"Или отправьте <code>0</code> чтобы не указывать.\n\n"
+        f"Можно добавить заметку через пробел:\n"
+        f"<code>500 Оплата через Payeer</code>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(ServerPaymentStates.waiting_for_cost)
+async def server_payment_process_cost(message: Message, state: FSMContext):
+    """Обработка стоимости и сохранение"""
+    from bot.database.db_manager import DatabaseManager
+    from bot.config import DATABASE_PATH
+    from datetime import datetime
+
+    text = message.text.strip()
+
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=Keyboards.admin_menu())
+        return
+
+    # Парсим стоимость и заметку
+    parts = text.split(None, 1)
+    try:
+        cost = float(parts[0].replace(',', '.'))
+    except (ValueError, IndexError):
+        await message.answer("❌ Введите число (стоимость). Например: <code>500</code>", parse_mode="HTML")
+        return
+
+    notes = parts[1] if len(parts) > 1 else ''
+
+    data = await state.get_data()
+    server_name = data.get('payment_server_name', '')
+    paid_until = data.get('payment_date', '')
+
+    db = DatabaseManager(DATABASE_PATH)
+    success = await db.set_server_payment(
+        server_name=server_name,
+        paid_until=paid_until,
+        monthly_cost=cost,
+        notes=notes
+    )
+
+    await state.clear()
+
+    if success:
+        date_display = datetime.strptime(paid_until, '%Y-%m-%d').strftime('%d.%m.%Y')
+        result_text = (
+            f"✅ <b>Оплата сервера обновлена</b>\n\n"
+            f"🖥 Сервер: <b>{server_name}</b>\n"
+            f"📅 Оплачен до: <b>{date_display}</b>\n"
+        )
+        if cost > 0:
+            result_text += f"💰 Стоимость: <b>{cost:.0f} RUB/мес</b>\n"
+        if notes:
+            result_text += f"📝 Заметка: {notes}\n"
+
+        result_text += "\nУведомления придут за 7, 3 и 1 день до истечения."
+
+        await message.answer(result_text, parse_mode="HTML", reply_markup=Keyboards.admin_menu())
+    else:
+        await message.answer("❌ Ошибка сохранения.", reply_markup=Keyboards.admin_menu())
 
 
 # ============ ПАНЕЛИ УПРАВЛЕНИЯ X-UI ============
@@ -5438,6 +6015,33 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
         first_key = next(iter(inbounds_data))
         inbounds_data['main'] = inbounds_data.pop(first_key)
 
+    # Добавляем network: tcp для всех inbound'ов где network не указан
+    for key, val in inbounds_data.items():
+        if 'network' not in val:
+            val['network'] = 'tcp'
+
+    # Если inbound'ы не определены — НЕ сохраняем, предлагаем повторить
+    if not inbounds_data:
+        await callback.message.edit_text(
+            f"⚠️ <b>НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ INBOUND'Ы</b>\n\n"
+            f"📛 Сервер: <b>{data['name']}</b>\n"
+            f"🌐 IP: <code>{data['ip']}</code>\n"
+            f"🖥 Панель: <code>{panel_url}</code>\n\n"
+            "Возможные причины:\n"
+            "• Панель недоступна\n"
+            "• Неверные логин/пароль\n"
+            "• Нет активных inbound'ов на панели\n\n"
+            "Сервер <b>НЕ сохранён</b>. Выберите действие:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить попытку", callback_data="confirm_add_server")],
+                [InlineKeyboardButton(text="💾 Сохранить без inbound'ов", callback_data="force_save_server")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add_server")]
+            ])
+        )
+        await callback.answer()
+        return
+
     # Создаём конфигурацию сервера (без SSH)
     new_server = {
         "name": data['name'],
@@ -5455,7 +6059,7 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
             "username": panel_username,
             "password": panel_password
         },
-        "inbounds": inbounds_data if inbounds_data else {}
+        "inbounds": inbounds_data
     }
 
     # Сохраняем в конфиг
@@ -5465,13 +6069,14 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    inbounds_info = ""
-    if inbounds_data:
-        inbounds_info = f"\n\n📋 Найдено inbound'ов: {len(inbounds_data)}\n"
-        for key, val in inbounds_data.items():
-            inbounds_info += f"   • {key}: {val.get('sni', 'N/A')}\n"
-    else:
-        inbounds_info = "\n\n⚠️ Inbound'ы не найдены автоматически.\nНастройте вручную в servers_config.json"
+    inbounds_info = f"\n\n📋 Найдено inbound'ов: {len(inbounds_data)}\n"
+    for key, val in inbounds_data.items():
+        sni = val.get('sni', 'N/A')
+        pbk_short = val.get('pbk', '')[:12] + '...' if val.get('pbk') else 'N/A'
+        flow = val.get('flow', '') or '-'
+        fp = val.get('fp', 'chrome')
+        inbounds_info += f"   • <b>{key}</b>: SNI={sni}, fp={fp}\n"
+        inbounds_info += f"     pbk={pbk_short}, flow={flow}\n"
 
     await callback.message.edit_text(
         f"✅ <b>СЕРВЕР ДОБАВЛЕН</b>\n\n"
@@ -5489,6 +6094,53 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
         reply_markup=Keyboards.admin_menu()
     )
     await callback.answer("Сервер успешно добавлен!")
+
+
+@router.callback_query(F.data == "force_save_server", AddServerStates.confirm)
+async def force_save_server(callback: CallbackQuery, state: FSMContext):
+    """Принудительное сохранение сервера без inbound'ов"""
+    data = await state.get_data()
+    panel_url = data.get('panel_url', '')
+
+    new_server = {
+        "name": data['name'],
+        "domain": data['domain'],
+        "ip": data['ip'],
+        "port": 443,
+        "enabled": True,
+        "active_for_new": False,  # Не активен для новых — inbound'ы не настроены
+        "local": False,
+        "description": f"Сервер {data['name']}",
+        "panel": {
+            "url": panel_url,
+            "port": data.get('panel_port', 1020),
+            "path": data.get('panel_path', '/'),
+            "username": data.get('panel_username'),
+            "password": data.get('panel_password')
+        },
+        "inbounds": {}
+    }
+
+    config = load_servers_config()
+    config['servers'].append(new_server)
+    save_servers_config(config)
+
+    await state.clear()
+
+    await callback.message.edit_text(
+        f"⚠️ <b>СЕРВЕР СОХРАНЁН БЕЗ INBOUND'ОВ</b>\n\n"
+        f"📛 Название: <b>{data['name']}</b>\n"
+        f"🌐 IP: <code>{data['ip']}</code>\n"
+        f"🖥 Панель: <code>{panel_url}</code>\n\n"
+        f"⚠️ <code>active_for_new: false</code> — сервер не будет использоваться для новых ключей.\n"
+        f"Настройте inbound'ы вручную или через 🖥 Статус серверов.",
+        parse_mode="HTML"
+    )
+    await callback.message.answer(
+        "Сервер добавлен (без inbound'ов).",
+        reply_markup=Keyboards.admin_menu()
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "cancel_add_server")
@@ -5570,8 +6222,9 @@ async def process_add_sub_search(message: Message, state: FSMContext):
         "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
         "Добавить менеджера", "Список менеджеров", "Общая статистика",
         "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "📅 Продлить подписку",
         "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
-        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI", "💳 Оплата серверов",
         "🌐 Админ-панель сайта",
         "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
         "🔧 Исправить ключ", "💰 Прайс", "Моя статистика",

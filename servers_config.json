@@ -156,7 +156,7 @@
       "ip": "217.77.2.14",
       "port": 443,
       "enabled": true,
-      "active_for_new": true,
+      "active_for_new": false,
       "local": false,
       "description": "Сервер 🇺🇸USA",
       "panel": {
@@ -247,6 +247,36 @@
           "flow": "xtls-rprx-vision",
           "fp": "safari",
           "name_prefix": "📶 LTE📲"
+        }
+      }
+    },
+    {
+      "name": "Niderland-2",
+      "domain": "lb-beeline.vpnpulse.ru",
+      "ip": "5.253.63.18",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер Niderland-2",
+      "panel": {
+        "url": "https://5.253.63.18:20264/Z6jovhvMLzYZqbgz2r",
+        "port": 20264,
+        "path": "/Z6jovhvMLzYZqbgz2r",
+        "username": "itadmin",
+        "password": "20TQNF_Srld"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "eh.vk.com",
+          "pbk": "phhcIiKOyhSWzktV4_FHwQ0TuBkI_SSk5tfDEFM8ung",
+          "sid": "259be97b5d95",
+          "flow": "xtls-rprx-vision",
+          "fp": "safari",
+          "network": "tcp",
+          "name_prefix": "🇳🇱 Niderland-2"
         }
       }
     }
