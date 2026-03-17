@@ -6863,6 +6863,7 @@ async def cancel_add_sub_callback(callback: CallbackQuery, state: FSMContext):
 async def start_bulk_add_server(message: Message, state: FSMContext, **kwargs):
     """Начало массового добавления сервера ко всем активным подпискам из локальной БД"""
     from bot.api.remote_xui import load_servers_config
+    from datetime import datetime
 
     await state.clear()
 
