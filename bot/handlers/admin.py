@@ -121,6 +121,15 @@ class AddToSubscriptionStates(StatesGroup):
     confirming = State()
 
 
+class BulkAddServerStates(StatesGroup):
+    """Состояния для массового добавления сервера ко всем активным подпискам"""
+    waiting_for_source = State()  # Выбор сервера-источника подписок
+    waiting_for_target = State()  # Выбор целевого сервера
+    waiting_for_traffic = State()
+    confirming = State()
+    processing = State()
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -176,9 +185,9 @@ async def admin_generate_id(message: Message, state: FSMContext, xui_client: XUI
     user_id_value = generate_user_id()
     await state.update_data(phone=user_id_value)
 
-    # Получаем список серверов
+    # Получаем список серверов (только включённые)
     servers_config = load_servers_config()
-    servers = servers_config.get('servers', [])
+    servers = [s for s in servers_config.get('servers', []) if s.get('enabled', False)]
 
     if not servers:
         await message.answer(
@@ -214,9 +223,9 @@ async def admin_process_phone(message: Message, state: FSMContext, xui_client: X
 
     await state.update_data(phone=user_input)
 
-    # Получаем список серверов
+    # Получаем список серверов (только включённые)
     servers_config = load_servers_config()
-    servers = servers_config.get('servers', [])
+    servers = [s for s in servers_config.get('servers', []) if s.get('enabled', False)]
 
     if not servers:
         await message.answer(
@@ -2827,7 +2836,7 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
 
     # Если пользователь нажал кнопку меню - выходим из режима поиска
     admin_menu_buttons = {
-        "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
+        "📡 Добавить сервер", "📡 Сервер → всем", "🔑 Создать ключ (выбор inbound)",
         "Добавить менеджера", "Список менеджеров", "Общая статистика",
         "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
         "📅 Продлить подписку",
@@ -3349,6 +3358,22 @@ async def do_extend_on_server_callback(callback: CallbackQuery):
         else:
             new_expiry_date = "неизвестно"
 
+        # Обновляем локальную БД (clients и client_servers)
+        try:
+            from bot.integration import get_services
+            services = get_services()
+            if services and services.client_manager:
+                client_data = await services.client_manager.get_client(uuid=client_uuid)
+                if client_data:
+                    await services.client_manager.extend_subscription(
+                        client_id=client_data['id'],
+                        days=extend_days,
+                        manager_id=callback.from_user.id
+                    )
+                    logger.info(f"Локальная БД обновлена: клиент {client_uuid[:8]}... продлён на {extend_days} дней на {server_name}")
+        except Exception as e:
+            logger.warning(f"Не удалось обновить локальную БД: {e}")
+
         period_text = {30: "1 месяц", 90: "3 месяца", 180: "6 месяцев", 365: "1 год"}.get(extend_days, f"{extend_days} дней")
 
         await callback.message.edit_text(
@@ -3785,7 +3810,18 @@ async def get_client_link_callback(callback: CallbackQuery):
             [InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_key_delete")]
         ])
 
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        # Генерируем QR код подписки
+        try:
+            qr_code = generate_qr_code(sub_url)
+            await callback.message.answer_photo(
+                BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"QR generation error in admin search: {e}")
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await callback.message.answer("❌ Не удалось сгенерировать ссылку")
 
@@ -4403,7 +4439,7 @@ async def check_servers_status(message: Message, **kwargs):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    servers = config.get('servers', [])
+    servers = [s for s in config.get('servers', []) if s.get('enabled', False)]
     if not servers:
         await message.answer(
             "❌ Серверы не настроены.",
@@ -4570,7 +4606,8 @@ async def check_servers_status(message: Message, **kwargs):
                     panel_pass = panel_config.get('password')
 
                     connector = aiohttp.TCPConnector(ssl=ssl_context)
-                    async with aiohttp.ClientSession(connector=connector) as session:
+                    jar = aiohttp.CookieJar(unsafe=True)
+                    async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as session:
                         # Авторизация
                         login_url = f"{panel_url}/login"
                         async with session.post(login_url, json={"username": panel_user, "password": panel_pass}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -5309,9 +5346,10 @@ async def fetch_inbounds_from_panel(callback: CallbackQuery):
         ssl_context.verify_mode = ssl.CERT_NONE
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
+        jar = aiohttp.CookieJar(unsafe=True)
         inbounds_data = {}
 
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as session:
             # Авторизация
             logged_in = False
             for auth_method in ['json', 'data']:
@@ -5834,7 +5872,8 @@ async def test_server_connection(callback: CallbackQuery, state: FSMContext):
         ssl_context.verify_mode = ssl.CERT_NONE
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as session:
             # Тест авторизации (form-data, не JSON!)
             login_url = f"{panel_url}/login"
             async with session.post(login_url, data={"username": panel_username, "password": panel_password}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -5912,7 +5951,8 @@ async def confirm_add_server(callback: CallbackQuery, state: FSMContext):
         ssl_context.verify_mode = ssl.CERT_NONE
 
         connector = aiohttp.TCPConnector(ssl=ssl_context)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as session:
             # Авторизация (JSON, как в xui_client)
             login_url = f"{panel_url}/login"
             logged_in = False
@@ -6219,7 +6259,7 @@ async def process_add_sub_search(message: Message, state: FSMContext):
 
     # Если пользователь нажал кнопку меню - выходим из режима поиска
     admin_menu_buttons = {
-        "📡 Добавить сервер", "🔑 Создать ключ (выбор inbound)",
+        "📡 Добавить сервер", "📡 Сервер → всем", "🔑 Создать ключ (выбор inbound)",
         "Добавить менеджера", "Список менеджеров", "Общая статистика",
         "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
         "📅 Продлить подписку",
@@ -6815,6 +6855,519 @@ async def cancel_add_sub_callback(callback: CallbackQuery, state: FSMContext):
         reply_markup=Keyboards.admin_menu()
     )
     await callback.answer()
+
+
+# ============ МАССОВОЕ ДОБАВЛЕНИЕ СЕРВЕРА КО ВСЕМ ПОДПИСКАМ ============
+
+@router.message(F.text == "📡 Сервер → всем")
+@admin_only
+async def start_bulk_add_server(message: Message, state: FSMContext, **kwargs):
+    """Начало массового добавления сервера ко всем активным подпискам"""
+    from bot.api.remote_xui import load_servers_config
+
+    await state.clear()
+
+    config = load_servers_config()
+    servers = [s for s in config.get('servers', []) if s.get('enabled', False)]
+
+    if len(servers) < 2:
+        await message.answer("❌ Нужно минимум 2 сервера.", reply_markup=Keyboards.admin_menu())
+        return
+
+    buttons = []
+    for idx, srv in enumerate(servers):
+        name = srv.get('name', 'Unknown')
+        prefix = srv.get('inbounds', {}).get('main', {}).get('name_prefix', name)
+        label = f"{name} [{prefix}]" if prefix and prefix != name else name
+        buttons.append([InlineKeyboardButton(
+            text=f"📡 {label}",
+            callback_data=f"bulksrc_{idx}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="bulkadd_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await state.set_state(BulkAddServerStates.waiting_for_source)
+    await state.update_data(servers_list=[{
+        'name': s.get('name', 'Unknown'),
+        'config': s
+    } for s in servers])
+
+    await message.answer(
+        "📡 <b>МАССОВОЕ ДОБАВЛЕНИЕ СЕРВЕРА</b>\n\n"
+        "Шаг 1/2: Выберите <b>сервер-источник</b> — откуда взять активные подписки.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(BulkAddServerStates.waiting_for_source, F.data.startswith("bulksrc_"))
+async def bulk_add_select_source(callback: CallbackQuery, state: FSMContext):
+    """Выбор сервера-источника — показываем список целевых серверов"""
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    servers_list = data.get('servers_list', [])
+
+    if idx >= len(servers_list):
+        await callback.answer("Ошибка")
+        return
+
+    source = servers_list[idx]
+    await state.update_data(source_server_idx=idx, source_server_name=source['name'])
+
+    # Кнопки целевых серверов (без источника)
+    buttons = []
+    for i, srv in enumerate(servers_list):
+        if i == idx:
+            continue
+        name = srv['name']
+        prefix = srv['config'].get('inbounds', {}).get('main', {}).get('name_prefix', name)
+        label = f"{name} [{prefix}]" if prefix and prefix != name else name
+        buttons.append([InlineKeyboardButton(
+            text=f"🎯 {label}",
+            callback_data=f"bulktgt_{i}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="bulkadd_back_source")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="bulkadd_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await state.set_state(BulkAddServerStates.waiting_for_target)
+    await callback.message.edit_text(
+        f"📡 <b>МАССОВОЕ ДОБАВЛЕНИЕ СЕРВЕРА</b>\n\n"
+        f"Источник: <b>{source['name']}</b>\n\n"
+        f"Шаг 2/2: Выберите <b>целевой сервер</b> — куда добавить все активные подписки.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@router.callback_query(BulkAddServerStates.waiting_for_target, F.data == "bulkadd_back_source")
+async def bulk_add_back_to_source(callback: CallbackQuery, state: FSMContext):
+    """Назад к выбору источника"""
+    data = await state.get_data()
+    servers_list = data.get('servers_list', [])
+
+    buttons = []
+    for idx, srv in enumerate(servers_list):
+        name = srv['name']
+        prefix = srv['config'].get('inbounds', {}).get('main', {}).get('name_prefix', name)
+        label = f"{name} [{prefix}]" if prefix and prefix != name else name
+        buttons.append([InlineKeyboardButton(
+            text=f"📡 {label}",
+            callback_data=f"bulksrc_{idx}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="bulkadd_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await state.set_state(BulkAddServerStates.waiting_for_source)
+    await callback.message.edit_text(
+        "📡 <b>МАССОВОЕ ДОБАВЛЕНИЕ СЕРВЕРА</b>\n\n"
+        "Шаг 1/2: Выберите <b>сервер-источник</b> — откуда взять активные подписки.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@router.callback_query(BulkAddServerStates.waiting_for_target, F.data.startswith("bulktgt_"))
+async def bulk_add_select_target(callback: CallbackQuery, state: FSMContext):
+    """Выбор целевого сервера — собираем клиентов с источника и фильтруем"""
+    from bot.api.remote_xui import get_all_clients_from_panel
+    from datetime import datetime
+    import sqlite3
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    servers_list = data.get('servers_list', [])
+    source_idx = data.get('source_server_idx')
+    source_name = data.get('source_server_name', '')
+
+    if idx >= len(servers_list):
+        await callback.answer("Ошибка")
+        return
+
+    target = servers_list[idx]
+    target_name = target['name']
+    target_config = target['config']
+    source_config = servers_list[source_idx]['config']
+
+    await callback.message.edit_text(
+        f"⏳ Получаю активные подписки с <b>{source_name}</b>...",
+        parse_mode="HTML"
+    )
+
+    # 1. Собираем клиентов с сервера-источника (только с активным сроком подписки)
+    source_clients = {}  # uuid -> {email, expiry_time, ip_limit}
+    now_ms = int(datetime.now().timestamp() * 1000)
+
+    try:
+        if source_config.get('local', False):
+            conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+            rows = cursor.fetchall()
+            conn.close()
+
+            for (settings_str,) in rows:
+                try:
+                    import json as _json
+                    settings = _json.loads(settings_str)
+                    for client in settings.get('clients', []):
+                        uuid = client.get('id', '')
+                        email = client.get('email', '')
+                        if not uuid or not email:
+                            continue
+                        expiry = client.get('expiryTime', 0)
+                        # Только активные с конечным сроком подписки
+                        if expiry <= 0 or expiry < now_ms:
+                            continue
+                        if uuid not in source_clients:
+                            source_clients[uuid] = {
+                                'email': email,
+                                'uuid': uuid,
+                                'expiry_time': expiry,
+                                'ip_limit': client.get('limitIp', 2)
+                            }
+                except Exception:
+                    continue
+        else:
+            clients = await get_all_clients_from_panel(source_config)
+            for client in clients:
+                uuid = client.get('uuid', '')
+                email = client.get('email', '')
+                if not uuid or not email:
+                    continue
+                expiry = client.get('expiryTime', 0)
+                # Только активные с конечным сроком подписки
+                if expiry <= 0 or expiry < now_ms:
+                    continue
+                if uuid not in source_clients:
+                    source_clients[uuid] = {
+                        'email': email,
+                        'uuid': uuid,
+                        'expiry_time': expiry,
+                        'ip_limit': client.get('limitIp', 2)
+                    }
+    except Exception as e:
+        logger.error(f"Ошибка получения клиентов с {source_name}: {e}")
+        await callback.message.edit_text(
+            f"❌ Ошибка получения клиентов с {source_name}: {e}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="bulkadd_cancel")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    if not source_clients:
+        await callback.message.edit_text(
+            f"❌ На сервере <b>{source_name}</b> нет активных подписок с действующим сроком.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="bulkadd_cancel")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        f"⏳ Найдено {len(source_clients)} активных подписок на <b>{source_name}</b>.\n"
+        f"Проверяю, кого нет на <b>{target_name}</b>...",
+        parse_mode="HTML"
+    )
+
+    # 2. Получаем кто уже есть на целевом сервере
+    existing_uuids = set()
+    try:
+        if target_config.get('local', False):
+            conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+            rows = cursor.fetchall()
+            conn.close()
+            for (settings_str,) in rows:
+                try:
+                    import json as _json
+                    settings = _json.loads(settings_str)
+                    for client in settings.get('clients', []):
+                        uuid = client.get('id', '')
+                        if uuid:
+                            existing_uuids.add(uuid)
+                except Exception:
+                    continue
+        else:
+            target_clients = await get_all_clients_from_panel(target_config)
+            for c in target_clients:
+                uuid = c.get('uuid', '')
+                if uuid:
+                    existing_uuids.add(uuid)
+    except Exception as e:
+        logger.error(f"Ошибка получения клиентов целевого сервера {target_name}: {e}")
+
+    # 3. Фильтруем — только те, кого нет на целевом сервере
+    missing_clients = [
+        c for uuid, c in source_clients.items()
+        if uuid not in existing_uuids
+    ]
+
+    if not missing_clients:
+        await callback.message.edit_text(
+            f"🎉 Все активные клиенты с <b>{source_name}</b> уже есть на <b>{target_name}</b>!",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="bulkadd_cancel")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    missing_clients.sort(key=lambda c: c['email'].lower())
+
+    await state.update_data(
+        target_server_name=target_name,
+        target_server_config=target_config,
+        missing_clients=missing_clients,
+        total_source=len(source_clients)
+    )
+
+    # Проверяем, нужен ли выбор трафика
+    traffic_limit = target_config.get('traffic_limit_gb', 0)
+    if traffic_limit > 0:
+        await state.set_state(BulkAddServerStates.waiting_for_traffic)
+        await callback.message.edit_text(
+            f"📊 <b>Выбор трафика</b>\n\n"
+            f"Сервер <b>{target_name}</b> имеет ограничение трафика.\n"
+            f"Выберите лимит трафика для добавляемых клиентов:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"📊 {traffic_limit} ГБ (рекомендуется)", callback_data=f"bulkadd_traffic_{traffic_limit}")],
+                [InlineKeyboardButton(text="♾ Без ограничений", callback_data="bulkadd_traffic_0")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="bulkadd_cancel")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    await state.update_data(bulk_total_gb=0)
+    await _show_bulk_add_confirm(callback, state)
+
+
+@router.callback_query(BulkAddServerStates.waiting_for_traffic, F.data.startswith("bulkadd_traffic_"))
+async def bulk_add_traffic_choice(callback: CallbackQuery, state: FSMContext):
+    """Выбор трафика для массового добавления"""
+    total_gb = int(callback.data.split("_")[-1])
+    await state.update_data(bulk_total_gb=total_gb)
+    await _show_bulk_add_confirm(callback, state)
+
+
+async def _show_bulk_add_confirm(callback: CallbackQuery, state: FSMContext):
+    """Показать подтверждение массового добавления"""
+    from datetime import datetime
+
+    data = await state.get_data()
+    source_name = data.get('source_server_name', '')
+    target_name = data.get('target_server_name', '')
+    missing_clients = data.get('missing_clients', [])
+    total_source = data.get('total_source', 0)
+    bulk_total_gb = data.get('bulk_total_gb', 0)
+
+    await state.set_state(BulkAddServerStates.confirming)
+
+    text = f"📡 <b>МАССОВОЕ ДОБАВЛЕНИЕ</b>\n\n"
+    text += f"Источник: <b>{source_name}</b> ({total_source} активных)\n"
+    text += f"Целевой: <b>{target_name}</b>\n"
+    text += f"Клиентов для добавления: <b>{len(missing_clients)}</b>\n"
+    if bulk_total_gb > 0:
+        text += f"Лимит трафика: <b>{bulk_total_gb} ГБ</b>\n"
+    else:
+        text += f"Лимит трафика: <b>без ограничений</b>\n"
+
+    text += f"\n<b>Список клиентов:</b>\n"
+    # Показываем первых 20
+    show_count = min(len(missing_clients), 20)
+    for i, client in enumerate(missing_clients[:show_count]):
+        email = client['email']
+        expiry = client.get('expiry_time', 0)
+        if expiry > 0:
+            exp_str = datetime.fromtimestamp(expiry / 1000).strftime("%d.%m.%y")
+        else:
+            exp_str = "∞"
+        text += f"  {i+1}. <code>{email}</code> — до {exp_str}\n"
+
+    if len(missing_clients) > show_count:
+        text += f"  ... и ещё {len(missing_clients) - show_count}\n"
+
+    text += f"\n⚠️ <b>Подтвердите добавление {len(missing_clients)} клиентов на {target_name}.</b>"
+
+    buttons = [
+        [InlineKeyboardButton(text=f"✅ Добавить {len(missing_clients)} клиентов", callback_data="bulkadd_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="bulkadd_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(BulkAddServerStates.confirming, F.data == "bulkadd_confirm")
+async def bulk_add_execute(callback: CallbackQuery, state: FSMContext):
+    """Выполнить массовое добавление клиентов на сервер"""
+    from bot.api.remote_xui import create_client_via_panel, _create_client_local_with_uuid
+
+    data = await state.get_data()
+    target_name = data.get('target_server_name', '')
+    target_config = data.get('target_server_config', {})
+    missing_clients = data.get('missing_clients', [])
+    bulk_total_gb = data.get('bulk_total_gb', 0)
+
+    await state.set_state(BulkAddServerStates.processing)
+
+    total = len(missing_clients)
+    await callback.message.edit_text(
+        f"⏳ Добавление {total} клиентов на <b>{target_name}</b>...\n"
+        f"Это может занять некоторое время.",
+        parse_mode="HTML"
+    )
+
+    success_count = 0
+    error_count = 0
+    existing_count = 0
+    errors = []
+
+    for i, client in enumerate(missing_clients):
+        client_uuid = client['uuid']
+        email = client['email']
+        expiry_time_ms = client.get('expiry_time', 0)
+        ip_limit = client.get('ip_limit', 2)
+
+        try:
+            if target_config.get('local', False):
+                success = await _create_client_local_with_uuid(
+                    client_uuid=client_uuid,
+                    email=email,
+                    expire_time_ms=expiry_time_ms,
+                    ip_limit=ip_limit,
+                    total_gb=bulk_total_gb
+                )
+                if success:
+                    success_count += 1
+                else:
+                    error_count += 1
+                    errors.append(email)
+            else:
+                result = await create_client_via_panel(
+                    server_config=target_config,
+                    client_uuid=client_uuid,
+                    email=email,
+                    expire_days=30,
+                    ip_limit=ip_limit,
+                    expire_time_ms=expiry_time_ms,
+                    total_gb=bulk_total_gb
+                )
+                if result.get('success'):
+                    if result.get('existing'):
+                        existing_count += 1
+                    else:
+                        success_count += 1
+                else:
+                    error_count += 1
+                    errors.append(email)
+        except Exception as e:
+            logger.error(f"Ошибка добавления {email} на {target_name}: {e}")
+            error_count += 1
+            errors.append(email)
+
+        # Обновляем прогресс каждые 10 клиентов
+        if (i + 1) % 10 == 0:
+            try:
+                await callback.message.edit_text(
+                    f"⏳ Добавление клиентов на <b>{target_name}</b>...\n"
+                    f"Прогресс: {i + 1}/{total}\n"
+                    f"✅ Добавлено: {success_count}\n"
+                    f"❌ Ошибок: {error_count}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass  # Telegram rate limit
+
+    await state.clear()
+
+    # Формируем результат
+    text = f"📡 <b>РЕЗУЛЬТАТ МАССОВОГО ДОБАВЛЕНИЯ</b>\n\n"
+    text += f"Сервер: <b>{target_name}</b>\n"
+    text += f"Всего клиентов: {total}\n\n"
+    text += f"✅ Добавлено: {success_count}\n"
+    if existing_count > 0:
+        text += f"ℹ️ Уже существовали: {existing_count}\n"
+    if error_count > 0:
+        text += f"❌ Ошибок: {error_count}\n"
+        if errors[:5]:
+            text += f"\nОшибки:\n"
+            for err_email in errors[:5]:
+                text += f"  • {err_email}\n"
+            if len(errors) > 5:
+                text += f"  ... и ещё {len(errors) - 5}\n"
+
+    text += "\n📱 Подписки обновлены автоматически."
+
+    buttons = [
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="bulkadd_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bulkadd_cancel")
+async def cancel_bulk_add(callback: CallbackQuery, state: FSMContext):
+    """Отмена массового добавления"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer(
+        "Панель администратора:",
+        reply_markup=Keyboards.admin_menu()
+    )
+    await callback.answer()
+
+
+# ===== Синхронизация подписок в локальную БД =====
+
+@router.message(F.text == "/sync")
+@admin_only
+async def sync_subscriptions_command(message: Message, **kwargs):
+    """Синхронизировать всех клиентов со всех серверов в локальную БД"""
+    from bot.database.client_manager import ClientManager
+    from bot.config import DATABASE_PATH
+
+    await message.answer("⏳ Синхронизация подписок со всех серверов...")
+
+    cm = ClientManager(DATABASE_PATH)
+    result = await cm.sync_all_from_panels()
+
+    text = f"✅ <b>Синхронизация завершена</b>\n\n"
+    text += f"Серверов обработано: {result['servers']}\n"
+    text += f"Записей синхронизировано: {result['synced']}\n"
+
+    if result['errors']:
+        text += f"\n❌ Ошибки:\n"
+        for err in result['errors'][:5]:
+            text += f"  • {err}\n"
+
+    # Подсчитаем итого в БД
+    import aiosqlite
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM clients")
+        total = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM clients WHERE status = 'active'")
+        active = (await cursor.fetchone())[0]
+
+    text += f"\n📊 Итого в БД: {total} клиентов ({active} активных)"
+
+    await message.answer(text, parse_mode="HTML", reply_markup=Keyboards.admin_menu())
 
 
 # ===== Восстановление клиентов из бэкапа =====

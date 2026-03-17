@@ -48,7 +48,7 @@ class Keyboards:
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
-            [KeyboardButton(text="📡 Добавить сервер")],
+            [KeyboardButton(text="📡 Добавить сервер"), KeyboardButton(text="📡 Сервер → всем")],
             [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
             [KeyboardButton(text="💳 Оплата серверов")],
             [KeyboardButton(text="🌐 Админ-панель сайта"), KeyboardButton(text="💾 Бэкап")],

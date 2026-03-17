@@ -65,6 +65,121 @@ def load_servers_config():
     return config
 
 
+# Путь к БД бота для трекинга подписок
+_BOT_DB_PATH = '/root/manager_vpn/bot_database.db'
+
+
+def _get_local_server_name() -> str:
+    """Получить имя локального сервера из конфига"""
+    config = load_servers_config()
+    for server in config.get('servers', []):
+        if server.get('local', False):
+            return server.get('name', 'Local')
+    return 'Local'
+
+
+async def _track_client_server(
+    client_uuid: str, email: str, server_name: str,
+    inbound_id: int, expire_days: int, expire_time_ms: int,
+    total_gb: int, ip_limit: int
+):
+    """Зафиксировать клиента и его сервер в локальной БД для бэкапа"""
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(_BOT_DB_PATH) as db:
+            await db.execute(
+                '''INSERT OR REPLACE INTO client_servers
+                   (client_uuid, client_email, server_name, inbound_id, expire_days, expire_timestamp, total_gb, ip_limit)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (client_uuid, email, server_name, inbound_id, expire_days, expire_time_ms, total_gb, ip_limit)
+            )
+            await db.commit()
+        logger.debug(f"Tracked client {email} on {server_name}")
+    except Exception as e:
+        logger.error(f"Ошибка трекинга клиента {email} на {server_name}: {e}")
+
+    # Синхронизируем в таблицу clients (центральная база подписок)
+    try:
+        from bot.database.client_manager import ClientManager
+        cm = ClientManager(_BOT_DB_PATH)
+        await cm.ensure_client(
+            uuid=client_uuid,
+            email=email,
+            expire_time_ms=expire_time_ms,
+            ip_limit=ip_limit,
+            server_name=server_name,
+            inbound_id=inbound_id
+        )
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации клиента {email} в clients: {e}")
+
+
+async def sync_all_subscriptions_to_db():
+    """
+    Полная синхронизация: пройти все серверы, собрать активных клиентов
+    и обновить client_servers в локальной БД. Вызывается перед бэкапом.
+    """
+    import aiosqlite
+    import sqlite3
+
+    config = load_servers_config()
+    servers = [s for s in config.get('servers', []) if s.get('enabled', True)]
+    now_ms = int(datetime.now().timestamp() * 1000)
+    synced = 0
+
+    for server in servers:
+        server_name = server.get('name', 'Unknown')
+        main_inbound = server.get('inbounds', {}).get('main', {})
+        inbound_id = main_inbound.get('id', 1)
+
+        try:
+            if server.get('local', False):
+                conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+                rows = cursor.fetchall()
+                conn.close()
+
+                for (settings_str,) in rows:
+                    try:
+                        settings = json.loads(settings_str)
+                        for client in settings.get('clients', []):
+                            uuid = client.get('id', '')
+                            email = client.get('email', '')
+                            if not uuid or not email:
+                                continue
+                            expiry = client.get('expiryTime', 0)
+                            if expiry > 0 and expiry < now_ms:
+                                continue
+                            await _track_client_server(
+                                uuid, email, server_name, inbound_id, 0,
+                                expiry, client.get('totalGB', 0), client.get('limitIp', 2)
+                            )
+                            synced += 1
+                    except Exception:
+                        continue
+            else:
+                clients = await get_all_clients_from_panel(server)
+                for client in clients:
+                    uuid = client.get('uuid', '')
+                    email = client.get('email', '')
+                    if not uuid or not email:
+                        continue
+                    expiry = client.get('expiryTime', 0)
+                    if expiry > 0 and expiry < now_ms:
+                        continue
+                    await _track_client_server(
+                        uuid, email, server_name, inbound_id, 0,
+                        expiry, client.get('totalGB', 0), client.get('limitIp', 2)
+                    )
+                    synced += 1
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации клиентов с {server_name}: {e}")
+
+    logger.info(f"Синхронизация подписок: {synced} записей обновлено")
+    return synced
+
+
 async def _get_panel_opener(server_name: str):
     """Получить или создать opener для панели (потокобезопасно)"""
     async with _panel_sessions_lock:
@@ -490,6 +605,7 @@ async def create_client_via_panel(
 
             if result.get('success'):
                 logger.info(f"Клиент {email} создан на {server_name} через API")
+                await _track_client_server(client_uuid, email, server_name, inbound_id, expire_days, expire_time, total_gb, ip_limit)
                 return {'success': True, 'uuid': client_uuid, 'existing': False}
             else:
                 error_msg = result.get('msg', '')
@@ -499,6 +615,7 @@ async def create_client_via_panel(
                     existing_uuid = await _find_client_uuid_by_email(server_config, email)
                     if existing_uuid:
                         logger.info(f"Найден существующий клиент {email} с UUID {existing_uuid}")
+                        await _track_client_server(existing_uuid, email, server_name, inbound_id, expire_days, expire_time, total_gb, ip_limit)
                         return {'success': True, 'uuid': existing_uuid, 'existing': True}
                     else:
                         logger.warning(f"Не удалось найти UUID клиента {email}")
@@ -1508,6 +1625,10 @@ async def _create_client_local_with_uuid(
         except Exception as e:
             logger.warning(f"Не удалось перезапустить x-ui: {e}")
 
+        # Фиксируем в локальной БД
+        local_server_name = _get_local_server_name()
+        await _track_client_server(client_uuid, email, local_server_name, inbound_id, 0, expire_time_ms, total_gb, ip_limit)
+
         return True
     except Exception as e:
         logger.error(f"Ошибка создания клиента локально: {e}")
@@ -1665,6 +1786,8 @@ async def extend_client_expiry_via_panel(
                 continue
 
         if any_updated:
+            # Обновляем expire_timestamp в трекинге
+            await _track_client_server(client_uuid, client_email, server_name, inbound_id or 1, extend_days, new_expiry, 0, 0)
             return {'success': True, 'new_expiry': new_expiry, 'email': client_email}
         return {'success': False, 'error': 'Клиент не найден'}
 

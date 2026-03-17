@@ -25,7 +25,7 @@ from bot.api import XUIClient
 from bot.handlers import common, manager, admin, extended
 from bot.middlewares import BanCheckMiddleware, ThrottlingMiddleware, MaintenanceMiddleware
 from bot.webapp.server import start_webapp_server, set_bot_instance
-from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server, get_all_clients_from_panel, reset_client_traffic_via_panel, PANEL_REQUEST_TIMEOUT
+from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server, get_all_clients_from_panel, reset_client_traffic_via_panel, get_inbound_settings_from_panel, PANEL_REQUEST_TIMEOUT
 
 # Путь к базе данных X-UI
 XUI_DB_PATH = Path("/etc/x-ui/x-ui.db")
@@ -267,10 +267,43 @@ async def daily_backup_task(bot: Bot):
             logger.info(f"Следующий бэкап через {wait_seconds/3600:.1f} часов")
             await asyncio.sleep(wait_seconds)
 
+            # Синхронизируем подписки перед бэкапом
+            try:
+                from bot.api.remote_xui import sync_all_subscriptions_to_db
+                synced = await sync_all_subscriptions_to_db()
+                logger.info(f"Перед бэкапом синхронизировано {synced} записей подписок")
+            except Exception as e:
+                logger.error(f"Ошибка синхронизации подписок: {e}")
+
             # Выполняем бэкап
             await send_xui_backup(bot)
             await backup_remote_panels(bot)
             await create_clients_backup(bot)
+
+            # Бэкап файла bot_database.db (содержит подписки, менеджеров, историю)
+            try:
+                bot_db_path = Path(DATABASE_PATH)
+                if bot_db_path.exists():
+                    backup_dir = Path("/root/manager_vpn/backups")
+                    backup_dir.mkdir(exist_ok=True)
+                    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    bot_db_backup = backup_dir / f"bot_database_{date_str}.db"
+                    shutil.copy2(bot_db_path, bot_db_backup)
+                    document = FSInputFile(bot_db_backup)
+                    await bot.send_document(
+                        ADMIN_ID, document,
+                        caption=f"💾 <b>Бэкап БД бота</b>\n"
+                                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                                f"📦 {bot_db_backup.stat().st_size / 1024:.1f} KB",
+                        parse_mode="HTML"
+                    )
+                    # Ротация: 7 последних
+                    db_backups = sorted(backup_dir.glob("bot_database_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
+                    for old in db_backups[7:]:
+                        old.unlink()
+                    logger.info(f"Бэкап bot_database.db отправлен: {bot_db_backup}")
+            except Exception as e:
+                logger.error(f"Ошибка бэкапа bot_database.db: {e}")
 
         except asyncio.CancelledError:
             logger.info("Задача бэкапа отменена")
@@ -441,14 +474,26 @@ async def create_clients_backup(bot: Bot):
             )
             client_servers = [dict(row) for row in await cursor.fetchall()]
 
+        # Получаем подписки из таблицы clients
+        subscriptions = []
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT id, uuid, email, expire_time, ip_limit, status, '
+                'created_by, created_at, updated_at FROM clients ORDER BY created_at DESC'
+            )
+            subscriptions = [dict(row) for row in await cursor.fetchall()]
+
         backup_data = {
             'backup_date': datetime.now().isoformat(),
             'clients': clients_list,
+            'subscriptions': subscriptions,
             'servers': servers_info,
             'linked_clients': linked_clients,
             'client_servers': client_servers,
             'stats': {
                 'total_keys': len(keys_data),
+                'total_subscriptions': len(subscriptions),
                 'active_servers': len(active_servers),
                 'client_server_records': len(client_servers),
             }
@@ -469,9 +514,10 @@ async def create_clients_backup(bot: Bot):
         await bot.send_document(
             ADMIN_ID,
             document,
-            caption=f"📋 <b>Бэкап клиентов со списком серверов</b>\n\n"
+            caption=f"📋 <b>Бэкап клиентов и подписок</b>\n\n"
                     f"📅 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
                     f"🔑 Ключей: {len(keys_data)}\n"
+                    f"📋 Подписок: {len(subscriptions)}\n"
                     f"🌐 Серверов: {len(active_servers)}\n"
                     f"📦 Размер: {json_file.stat().st_size / 1024:.1f} KB",
             parse_mode="HTML"
@@ -495,6 +541,87 @@ async def create_clients_backup(bot: Bot):
             await bot.send_message(ADMIN_ID, f"❌ Ошибка JSON бэкапа клиентов: {e}")
         except:
             pass
+
+
+async def sync_server_settings_task(bot: Bot):
+    """Периодическая синхронизация настроек inbound с панелей в servers_config.json (каждые 10 минут)"""
+    await asyncio.sleep(60)  # Даём боту запуститься
+
+    SYNC_INTERVAL = 600  # 10 минут
+    CONFIG_PATH = Path('/root/manager_vpn/servers_config.json')
+
+    while True:
+        try:
+            config = load_servers_config()
+            servers = config.get('servers', [])
+            changes = []
+
+            for server in servers:
+                if not server.get('enabled', False):
+                    continue
+                if not server.get('panel'):
+                    continue
+
+                server_name = server.get('name', 'Unknown')
+                inbounds = server.get('inbounds', {})
+
+                for inbound_key, inbound_cfg in inbounds.items():
+                    inbound_id = inbound_cfg.get('id')
+                    if inbound_id is None:
+                        continue
+
+                    try:
+                        panel_settings = await get_inbound_settings_from_panel(server, inbound_id)
+                        if not panel_settings:
+                            continue
+
+                        # Сравниваем ключевые параметры
+                        sync_fields = ['sni', 'pbk', 'sid', 'flow', 'fp', 'security', 'network']
+                        updated_fields = []
+
+                        for field in sync_fields:
+                            panel_val = panel_settings.get(field, '')
+                            config_val = inbound_cfg.get(field, '')
+
+                            if str(panel_val) != str(config_val) and panel_val:
+                                updated_fields.append(f"{field}: {config_val} → {panel_val}")
+                                inbound_cfg[field] = panel_val
+
+                        if updated_fields:
+                            changes.append(f"🔄 <b>{server_name}</b> [{inbound_key}]:\n" +
+                                         "\n".join(f"  • {f}" for f in updated_fields))
+
+                    except Exception as e:
+                        logger.warning(f"Ошибка синхронизации {server_name}/{inbound_key}: {e}")
+
+                    await asyncio.sleep(1)  # Пауза между запросами к панелям
+
+            # Сохраняем если были изменения
+            if changes:
+                with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+
+                report = (
+                    f"⚙️ <b>Синхронизация настроек серверов</b>\n"
+                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    + "\n\n".join(changes)
+                )
+                try:
+                    await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"Не удалось отправить отчёт синхронизации: {e}")
+
+                logger.info(f"Синхронизация серверов: {len(changes)} изменений сохранено")
+            else:
+                logger.debug("Синхронизация серверов: изменений нет")
+
+        except asyncio.CancelledError:
+            logger.info("Задача синхронизации серверов отменена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации настроек серверов: {e}")
+
+        await asyncio.sleep(SYNC_INTERVAL)
 
 
 async def monthly_traffic_reset_task(bot: Bot):
@@ -1130,6 +1257,22 @@ async def main():
     traffic_reset_task = asyncio.create_task(monthly_traffic_reset_task(bot))
     logger.info("Задача ежемесячного сброса трафика запущена (1-го числа в 3:00)")
 
+    # Запуск задачи синхронизации настроек серверов
+    sync_settings_task = asyncio.create_task(sync_server_settings_task(bot))
+    logger.info("Задача синхронизации настроек серверов запущена (каждые 10 минут)")
+
+    # Синхронизация подписок при старте
+    try:
+        from bot.database.client_manager import ClientManager
+        cm = ClientManager(DATABASE_PATH)
+        sync_result = await cm.sync_all_from_panels()
+        logger.info(f"Синхронизация подписок: {sync_result['synced']} записей с {sync_result['servers']} серверов")
+        if sync_result['errors']:
+            for err in sync_result['errors']:
+                logger.warning(f"Ошибка синхронизации: {err}")
+    except Exception as e:
+        logger.error(f"Ошибка начальной синхронизации подписок: {e}")
+
     # Запуск бота
     try:
         logger.info("Бот запущен и готов к работе")
@@ -1139,6 +1282,7 @@ async def main():
         retry_task.cancel()
         expiry_task.cancel()
         traffic_reset_task.cancel()
+        sync_settings_task.cancel()
         try:
             await backup_task
         except asyncio.CancelledError:
@@ -1153,6 +1297,10 @@ async def main():
             pass
         try:
             await traffic_reset_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await sync_settings_task
         except asyncio.CancelledError:
             pass
         await bot.session.close()

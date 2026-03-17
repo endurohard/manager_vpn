@@ -198,6 +198,12 @@ class DatabaseManager:
                 )
             ''')
 
+            # Миграция: добавляем updated_at если его нет
+            cursor = await db.execute("PRAGMA table_info(admin_settings)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'updated_at' not in columns:
+                await db.execute('ALTER TABLE admin_settings ADD COLUMN updated_at TIMESTAMP')
+
             logger.info("Индексы базы данных созданы/проверены")
 
             await db.commit()
@@ -806,7 +812,8 @@ class DatabaseManager:
             search_pattern = f'%{query}%'
             cursor = await db.execute(
                 '''SELECT k.id, k.manager_id, k.client_email, k.phone_number,
-                          k.period, k.expire_days, k.price, k.created_at,
+                          k.period, k.expire_days, k.price, k.client_id, k.server_name,
+                          k.created_at,
                           m.username, m.full_name, m.custom_name
                    FROM keys_history k
                    LEFT JOIN managers m ON k.manager_id = m.user_id
@@ -832,6 +839,23 @@ class DatabaseManager:
                    ORDER BY k.created_at DESC
                    LIMIT ?''',
                 (manager_id, search_pattern, search_pattern, limit)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def search_client_servers(self, query: str, limit: int = 50) -> List[Dict]:
+        """Поиск клиентов в client_servers по email/uuid"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            search_pattern = f'%{query}%'
+            cursor = await db.execute(
+                '''SELECT DISTINCT client_uuid as client_id, client_email,
+                          server_name, created_at
+                   FROM client_servers
+                   WHERE client_email LIKE ? OR client_uuid LIKE ?
+                   ORDER BY created_at DESC
+                   LIMIT ?''',
+                (search_pattern, search_pattern, limit)
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

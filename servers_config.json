@@ -111,12 +111,13 @@
         "main": {
           "id": 1,
           "security": "reality",
-          "sni": "m.vk.com",
+          "sni": "eh.vk.com",
           "pbk": "HXNuA3woMvkSZbrJ2qiuKSwI2mksCvb1owrWHYuE4Uo",
           "sid": "2672b3",
-          "flow": "",
+          "flow": "xtls-rprx-vision",
           "fp": "chrome",
-          "name_prefix": "🇩🇪 ГОС"
+          "name_prefix": "🇩🇪 ГОС",
+          "network": "tcp"
         }
       }
     },
@@ -155,7 +156,7 @@
       "domain": "217.77.2.14",
       "ip": "217.77.2.14",
       "port": 443,
-      "enabled": true,
+      "enabled": false,
       "active_for_new": false,
       "local": false,
       "description": "Сервер 🇺🇸USA",
@@ -246,7 +247,8 @@
           "sid": "5a2a06",
           "flow": "xtls-rprx-vision",
           "fp": "safari",
-          "name_prefix": "📶 LTE📲"
+          "name_prefix": "📶 LTE📲",
+          "network": "tcp"
         }
       }
     },
@@ -277,6 +279,36 @@
           "fp": "safari",
           "network": "tcp",
           "name_prefix": "🇳🇱 Niderland-2"
+        }
+      }
+    },
+    {
+      "name": "MSK",
+      "domain": "157.22.230.58",
+      "ip": "157.22.230.58",
+      "port": 443,
+      "enabled": true,
+      "active_for_new": true,
+      "local": false,
+      "description": "Сервер MSK",
+      "panel": {
+        "url": "https://157.22.230.58:8749/t5u18fVgkaDCh7l8v5",
+        "port": 8749,
+        "path": "/t5u18fVgkaDCh7l8v5",
+        "username": "itadmin",
+        "password": "5TQNF_Srld"
+      },
+      "inbounds": {
+        "main": {
+          "id": 1,
+          "security": "reality",
+          "sni": "hrc.tbank.ru",
+          "pbk": "X4wrvsZm5AoZLrTtUShaneq1sKKf1UoaOn_yGBlIvXo",
+          "sid": "03bf0448",
+          "flow": "xtls-rprx-vision",
+          "fp": "chrome",
+          "network": "tcp",
+          "name_prefix": "🇷🇺 MSK"
         }
       }
     }

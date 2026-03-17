@@ -325,6 +325,171 @@ class ClientManager:
             logger.error(f"Ошибка удаления сервера: {e}")
             return False
 
+    # ==================== СИНХРОНИЗАЦИЯ С ПАНЕЛЯМИ ====================
+
+    async def ensure_client(
+        self,
+        uuid: str,
+        email: str,
+        expire_time_ms: int = 0,
+        ip_limit: int = 2,
+        server_name: str = None,
+        inbound_id: int = None,
+        created_by: int = None
+    ) -> Optional[int]:
+        """
+        Убедиться что клиент есть в БД. Создаёт если нет, обновляет expire если есть.
+        Возвращает client_id.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                # Ищем по UUID
+                cursor = await db.execute(
+                    "SELECT id, expire_time, status FROM clients WHERE uuid = ?", (uuid,)
+                )
+                row = await cursor.fetchone()
+
+                if row:
+                    client_id = row['id']
+                    old_expire = row['expire_time'] or 0
+                    # Обновляем expire_time если новый больше
+                    if expire_time_ms > 0 and expire_time_ms > old_expire:
+                        now_ms = int(datetime.now().timestamp() * 1000)
+                        new_status = 'active' if expire_time_ms > now_ms else row['status']
+                        await db.execute(
+                            """UPDATE clients SET expire_time = ?, status = ?,
+                               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                            (expire_time_ms, new_status, client_id)
+                        )
+                else:
+                    # Проверяем конфликт по email (один email на разных серверах)
+                    cursor = await db.execute(
+                        "SELECT id, expire_time FROM clients WHERE email = ?", (email,)
+                    )
+                    email_row = await cursor.fetchone()
+
+                    if email_row:
+                        # Email уже есть — обновляем UUID и expire если нужно
+                        client_id = email_row['id']
+                        old_expire = email_row['expire_time'] or 0
+                        if expire_time_ms > 0 and expire_time_ms > old_expire:
+                            await db.execute(
+                                """UPDATE clients SET uuid = ?, expire_time = ?,
+                                   updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                                (uuid, expire_time_ms, client_id)
+                            )
+                        else:
+                            await db.execute(
+                                "UPDATE clients SET uuid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                (uuid, client_id)
+                            )
+                    else:
+                        # Создаём нового клиента
+                        cursor = await db.execute(
+                            """INSERT INTO clients
+                               (uuid, email, expire_time, ip_limit, created_by, status)
+                               VALUES (?, ?, ?, ?, ?, 'active')""",
+                            (uuid, email, expire_time_ms, ip_limit, created_by)
+                        )
+                        client_id = cursor.lastrowid
+
+                # Добавляем сервер если указан (реальная схема: client_uuid, server_name)
+                if server_name and client_id:
+                    await db.execute(
+                        """INSERT OR REPLACE INTO client_servers
+                           (client_uuid, client_email, server_name, inbound_id, expire_timestamp, ip_limit)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (uuid, email, server_name, inbound_id, expire_time_ms, ip_limit)
+                    )
+
+                await db.commit()
+                return client_id
+
+        except Exception as e:
+            logger.error(f"Ошибка ensure_client {email}: {e}")
+            return None
+
+    async def sync_all_from_panels(self) -> dict:
+        """
+        Синхронизировать всех клиентов со всех серверов в локальную БД.
+        Возвращает {'synced': int, 'servers': int, 'errors': list}
+        """
+        from bot.api.remote_xui import load_servers_config, get_all_clients_from_panel
+        import sqlite3
+
+        config = load_servers_config()
+        servers = [s for s in config.get('servers', []) if s.get('enabled', False)]
+
+        synced = 0
+        errors = []
+        now_ms = int(datetime.now().timestamp() * 1000)
+
+        for srv in servers:
+            server_name = srv.get('name', 'Unknown')
+            inbound_id = srv.get('inbounds', {}).get('main', {}).get('id', 1)
+
+            try:
+                if srv.get('local', False):
+                    # Локальный сервер
+                    conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+                    rows = cursor.fetchall()
+                    conn.close()
+
+                    for (settings_str,) in rows:
+                        try:
+                            settings = json.loads(settings_str)
+                            for client in settings.get('clients', []):
+                                client_uuid = client.get('id', '')
+                                email = client.get('email', '')
+                                expiry = client.get('expiryTime', 0)
+                                if not client_uuid or not email:
+                                    continue
+                                # Пропускаем просроченных
+                                if expiry > 0 and expiry < now_ms:
+                                    continue
+                                result = await self.ensure_client(
+                                    uuid=client_uuid,
+                                    email=email,
+                                    expire_time_ms=expiry,
+                                    ip_limit=client.get('limitIp', 2),
+                                    server_name=server_name,
+                                    inbound_id=inbound_id
+                                )
+                                if result:
+                                    synced += 1
+                        except Exception:
+                            continue
+                else:
+                    # Удалённый сервер
+                    clients = await get_all_clients_from_panel(srv)
+                    for client in clients:
+                        client_uuid = client.get('uuid', '')
+                        email = client.get('email', '')
+                        expiry = client.get('expiryTime', 0)
+                        if not client_uuid or not email:
+                            continue
+                        if expiry > 0 and expiry < now_ms:
+                            continue
+                        result = await self.ensure_client(
+                            uuid=client_uuid,
+                            email=email,
+                            expire_time_ms=expiry,
+                            ip_limit=client.get('limitIp', 2),
+                            server_name=server_name,
+                            inbound_id=client.get('inbound_id', inbound_id)
+                        )
+                        if result:
+                            synced += 1
+
+            except Exception as e:
+                errors.append(f"{server_name}: {e}")
+                logger.error(f"Ошибка синхронизации с {server_name}: {e}")
+
+        return {'synced': synced, 'servers': len(servers), 'errors': errors}
+
     # ==================== ПОИСК И ФИЛЬТРАЦИЯ ====================
 
     async def search_clients(

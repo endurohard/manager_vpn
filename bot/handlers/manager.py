@@ -3,7 +3,7 @@
 """
 import logging
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
@@ -2148,6 +2148,72 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
         keys = await db.search_keys_by_manager(user_id, query)
 
     if not keys:
+        # Fallback: ищем в client_servers (ключи, созданные напрямую на серверах)
+        cs_results = await db.search_client_servers(query)
+        if cs_results:
+            await state.clear()
+            if len(cs_results) == 1:
+                r = cs_results[0]
+                client_uuid = r.get('client_id', '')
+                client_email = r.get('client_email', 'N/A')
+                server_name = r.get('server_name', '')
+                if client_uuid:
+                    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+                    try:
+                        qr_code = generate_qr_code(subscription_url)
+                        await status_msg.delete()
+                        await message.answer_photo(
+                            BufferedInputFile(qr_code.read(), filename="qrcode.png"),
+                            caption=(
+                                f"🔍 <b>Найден клиент:</b>\n\n"
+                                f"👤 Email: <b>{client_email}</b>\n"
+                                f"🖥 Сервер: {server_name}\n"
+                                f"📱 QR код подписки для сканирования в VPN приложении"
+                            ),
+                            parse_mode="HTML"
+                        )
+                        await message.answer(
+                            f"🔄 Ссылка подписки:\n<code>{subscription_url}</code>\n\n"
+                            f"💡 Скопируйте и отправьте клиенту.",
+                            parse_mode="HTML",
+                            reply_markup=Keyboards.main_menu(is_admin)
+                        )
+                        return
+                    except Exception as e:
+                        logger.error(f"QR generation error in search: {e}")
+
+                await status_msg.edit_text(
+                    f"🔍 <b>Найден клиент:</b>\n\n"
+                    f"👤 Email: <b>{client_email}</b>\n"
+                    f"🖥 Сервер: {server_name}\n"
+                    f"🔑 UUID: <code>{client_uuid or 'N/A'}</code>",
+                    parse_mode="HTML"
+                )
+                await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+                return
+            else:
+                # Несколько результатов — группируем по UUID
+                seen_uuids = set()
+                text = f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\nЗапрос: «{query}» — найдено: {len(cs_results)}\n\n"
+                buttons = []
+                for idx, r in enumerate(cs_results[:10], 1):
+                    client_uuid = r.get('client_id', '')
+                    client_email = r.get('client_email', 'N/A')
+                    server_name = r.get('server_name', '')
+                    if client_uuid and client_uuid not in seen_uuids:
+                        seen_uuids.add(client_uuid)
+                        text += f"{len(seen_uuids)}. <b>{client_email}</b> | 🖥 {server_name}\n"
+                        buttons.append([InlineKeyboardButton(
+                            text=f"📱 {client_email[:25]}",
+                            callback_data=f"mgr_sub_{client_uuid[:36]}"
+                        )])
+                if buttons:
+                    text += "\n👆 Нажмите на клиента чтобы получить подписку и QR код"
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+                await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+                await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
+                return
+
         await status_msg.edit_text(
             f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
             "Попробуйте другой запрос или нажмите 'Отмена' для выхода.",
@@ -2241,7 +2307,6 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
     if buttons:
         text += "👆 Нажмите на клиента чтобы получить подписку и QR код"
 
-    from aiogram.types import InlineKeyboardMarkup
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
     await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
