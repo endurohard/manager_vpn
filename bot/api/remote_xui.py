@@ -1647,7 +1647,8 @@ async def find_client_presence_on_all_servers(client_uuid: str) -> dict:
     not_found_on = []
 
     for server in config.get('servers', []):
-        if not server.get('enabled', True):
+        # Пропускаем disabled удалённые серверы, но local проверяем всегда
+        if not server.get('enabled', True) and not server.get('local', False):
             continue
 
         server_name = server.get('name', 'Unknown')
@@ -1799,42 +1800,172 @@ async def extend_client_expiry_via_panel(
 
 async def extend_client_on_all_servers(client_uuid: str, extend_days: int) -> dict:
     """
-    Продлить срок действия клиента на всех серверах
-
-    :param client_uuid: UUID клиента
-    :param extend_days: Количество дней для продления
-    :return: {'success': bool, 'results': dict, 'new_expiry': timestamp}
+    Продлить срок действия клиента на всех серверах.
+    Сначала определяется максимальная дата истечения среди всех серверов,
+    затем новая дата рассчитывается от неё — чтобы на всех серверах была одинаковая.
     """
     config = load_servers_config()
+
+    # Шаг 1: Найти максимальную дату истечения среди всех серверов
+    presence = await find_client_presence_on_all_servers(client_uuid)
+    found_on = presence.get('found_on', [])
+
+    max_expiry = 0
+    for srv_info in found_on:
+        exp = srv_info.get('expiry_time', 0)
+        if exp > max_expiry:
+            max_expiry = exp
+
+    # Вычисляем единую новую дату
+    now_ms = int(datetime.now().timestamp() * 1000)
+    if max_expiry > 0 and max_expiry > now_ms:
+        unified_expiry = max_expiry + (extend_days * 24 * 60 * 60 * 1000)
+    else:
+        unified_expiry = int((datetime.now() + timedelta(days=extend_days)).timestamp() * 1000)
+
+    # Шаг 2: Установить единую дату на всех серверах
     results = {}
-    new_expiry = None
     any_success = False
 
     for server in config.get('servers', []):
-        if not server.get('enabled', True):
+        if not server.get('enabled', True) and not server.get('local', False):
             continue
 
         server_name = server.get('name', 'Unknown')
 
         if server.get('local', False):
-            # Локальный сервер - используем прямое подключение к SQLite
-            result = await _extend_client_local(client_uuid, extend_days)
+            result = await _set_client_expiry_local(client_uuid, unified_expiry)
         else:
-            # Удалённый сервер - через API панели
-            result = await extend_client_expiry_via_panel(server, client_uuid, extend_days)
+            result = await _set_client_expiry_via_panel(server, client_uuid, unified_expiry)
 
         results[server_name] = result.get('success', False)
 
         if result.get('success'):
             any_success = True
-            if result.get('new_expiry'):
-                new_expiry = result.get('new_expiry')
 
     return {
         'success': any_success,
         'results': results,
-        'new_expiry': new_expiry
+        'new_expiry': unified_expiry
     }
+
+
+async def _set_client_expiry_local(client_uuid: str, new_expiry_ms: int) -> dict:
+    """Установить точную дату истечения клиента в локальной базе X-UI"""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, settings FROM inbounds")
+        rows = cursor.fetchall()
+
+        updated = False
+
+        for inbound_id, settings_str in rows:
+            try:
+                settings = json.loads(settings_str)
+                clients = settings.get('clients', [])
+
+                for client in clients:
+                    if client.get('id') == client_uuid:
+                        client['expiryTime'] = new_expiry_ms
+                        cursor.execute(
+                            "UPDATE inbounds SET settings=? WHERE id=?",
+                            (json.dumps(settings), inbound_id)
+                        )
+                        updated = True
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        conn.commit()
+        conn.close()
+
+        if updated:
+            logger.info(f"Клиент {client_uuid[:8]}... - установлена единая дата (локально)")
+            import subprocess
+            try:
+                subprocess.run(['systemctl', 'restart', 'x-ui'], timeout=30, check=False)
+            except Exception:
+                pass
+            return {'success': True, 'new_expiry': new_expiry_ms}
+        return {'success': False, 'error': 'Клиент не найден'}
+
+    except Exception as e:
+        logger.error(f"Ошибка установки даты клиента локально: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def _set_client_expiry_via_panel(server_config: dict, client_uuid: str, new_expiry_ms: int) -> dict:
+    """Установить точную дату истечения клиента через API панели X-UI"""
+    server_name = server_config.get('name', 'Unknown')
+    panel = server_config.get('panel', {})
+
+    if not panel:
+        return {'success': False, 'error': 'Нет конфигурации панели'}
+
+    session = await _get_panel_opener(server_name)
+    if not session.get('logged_in'):
+        if not await _panel_login(server_config):
+            return {'success': False, 'error': 'Ошибка авторизации'}
+
+    base_url = session.get('base_url', '')
+    opener = session.get('opener')
+
+    try:
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        list_req = urllib.request.Request(list_url)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, functools.partial(opener.open, list_req, timeout=PANEL_REQUEST_TIMEOUT))
+        data = json.loads(response.read().decode())
+
+        if not data.get('success'):
+            return {'success': False, 'error': 'Не удалось получить список inbounds'}
+
+        any_updated = False
+
+        for inbound in data.get('obj', []):
+            settings_str = inbound.get('settings', '{}')
+            try:
+                settings = json.loads(settings_str)
+                clients = settings.get('clients', [])
+
+                for i, client in enumerate(clients):
+                    if client.get('id') == client_uuid:
+                        client['expiryTime'] = new_expiry_ms
+
+                        new_settings = json.dumps(settings)
+                        inbound_id = inbound.get('id')
+
+                        update_url = f"{base_url}/panel/api/inbounds/update/{inbound_id}"
+                        update_data = inbound.copy()
+                        update_data['settings'] = new_settings
+                        update_payload = json.dumps(update_data).encode()
+
+                        update_req = urllib.request.Request(
+                            update_url, data=update_payload, method='POST'
+                        )
+                        update_req.add_header('Content-Type', 'application/json')
+
+                        update_resp = await loop.run_in_executor(
+                            None, functools.partial(opener.open, update_req, timeout=PANEL_REQUEST_TIMEOUT)
+                        )
+                        update_result = json.loads(update_resp.read().decode())
+
+                        if update_result.get('success'):
+                            any_updated = True
+                            logger.info(f"Клиент {client_uuid[:8]}... - единая дата на {server_name}")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        if any_updated:
+            return {'success': True, 'new_expiry': new_expiry_ms}
+        return {'success': False, 'error': 'Клиент не найден'}
+
+    except Exception as e:
+        logger.error(f"Ошибка установки даты на {server_name}: {e}")
+        return {'success': False, 'error': str(e)}
 
 
 async def extend_client_on_server(server_name: str, client_uuid: str, extend_days: int) -> dict:

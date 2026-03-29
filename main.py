@@ -21,10 +21,13 @@ import json
 
 from bot.config import BOT_TOKEN, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, DATABASE_PATH, WEBAPP_HOST, WEBAPP_PORT, ADMIN_ID, INBOUND_ID, YANDEX_LOGIN, YANDEX_PASSWORD, BACKUP_KEEP_DAYS
 from bot.database import DatabaseManager
+from bot.database.brand_manager import BrandManager
 from bot.api import XUIClient
 from bot.handlers import common, manager, admin, extended
-from bot.middlewares import BanCheckMiddleware, ThrottlingMiddleware, MaintenanceMiddleware
-from bot.webapp.server import start_webapp_server, set_bot_instance
+from bot.handlers.manager import set_sub_domain as set_manager_sub_domain
+from bot.handlers.admin import set_sub_domain as set_admin_sub_domain
+from bot.middlewares import BanCheckMiddleware, ThrottlingMiddleware, MaintenanceMiddleware, BrandMiddleware, BrandContext
+from bot.webapp.server import start_webapp_server, set_bot_instance, set_brand_manager
 from bot.api.remote_xui import load_servers_config, get_client_link_from_active_server, get_all_clients_from_panel, reset_client_traffic_via_panel, get_inbound_settings_from_panel, PANEL_REQUEST_TIMEOUT
 
 # Путь к базе данных X-UI
@@ -1158,6 +1161,134 @@ async def backfill_client_servers(db: DatabaseManager):
         logger.error(f"Ошибка заполнения client_servers: {e}")
 
 
+
+
+class BotManager:
+    """Менеджер мульти-бот системы — управляет жизненным циклом брендированных ботов"""
+
+    def __init__(self, brand_mgr, db: DatabaseManager, xui_client):
+        self.brand_mgr = brand_mgr
+        self.db = db
+        self.xui_client = xui_client
+        self.bots: dict = {}  # {brand_id: {'bot': Bot, 'dp': Dispatcher, 'task': Task}}
+
+    async def start_brand_bot(self, brand) -> bool:
+        """Запустить бота для конкретного бренда"""
+        if brand.id in self.bots:
+            logger.warning(f"Бот бренда {brand.name} уже запущен")
+            return False
+
+        try:
+            brand_bot = Bot(
+                token=brand.bot_token,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+            )
+            brand_dp = Dispatcher(storage=MemoryStorage())
+
+            # Brand context для этого бота
+            brand_ctx = BrandContext(
+                brand_id=brand.id,
+                name=brand.name,
+                domain=brand.domain,
+                bot_token=brand.bot_token,
+                theme_color=brand.theme_color,
+                logo_url=brand.logo_url,
+                admin_id=brand.admin_id,
+                allowed_servers=brand.allowed_servers
+            )
+
+            # Регистрация middleware
+            brand_dp.update.middleware(ThrottlingMiddleware(default_ttl=0.5))
+            brand_dp.update.middleware(BanCheckMiddleware(DATABASE_PATH))
+            brand_dp.update.middleware(BrandMiddleware(brand_ctx))
+
+            # Dependency injection
+            db = self.db
+            xui_client = self.xui_client
+            brand_mgr = self.brand_mgr
+
+            @brand_dp.update.middleware()
+            async def brand_db_middleware(handler, event, data):
+                data['db'] = db
+                data['xui_client'] = xui_client
+                data['bot'] = brand_bot
+                data['brand_mgr'] = brand_mgr
+                return await handler(event, data)
+
+            # Создаём свежие роутеры для бренд-бота (нельзя шарить между диспетчерами)
+            import importlib
+            brand_common = importlib.reload(importlib.import_module('bot.handlers.common'))
+            brand_manager = importlib.reload(importlib.import_module('bot.handlers.manager'))
+            brand_dp.include_router(brand_common.router)
+            brand_dp.include_router(brand_manager.router)
+            # Восстанавливаем оригинальные модули
+            importlib.reload(importlib.import_module('bot.handlers.common'))
+            importlib.reload(importlib.import_module('bot.handlers.manager'))
+
+            # Запуск polling в отдельной задаче
+            task = asyncio.create_task(
+                brand_dp.start_polling(brand_bot, allowed_updates=brand_dp.resolve_used_update_types()),
+                name=f"brand_bot_{brand.id}"
+            )
+
+            self.bots[brand.id] = {
+                'bot': brand_bot,
+                'dp': brand_dp,
+                'task': task,
+                'brand': brand
+            }
+
+            logger.info(f"Бренд-бот '{brand.name}' (id={brand.id}) запущен")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка запуска бренд-бота '{brand.name}': {e}")
+            return False
+
+    async def stop_brand_bot(self, brand_id: int) -> bool:
+        """Остановить бота бренда"""
+        if brand_id not in self.bots:
+            return False
+
+        entry = self.bots[brand_id]
+        try:
+            await entry['dp'].stop_polling()
+            entry['task'].cancel()
+            try:
+                await entry['task']
+            except asyncio.CancelledError:
+                pass
+            await entry['bot'].session.close()
+            del self.bots[brand_id]
+            logger.info(f"Бренд-бот id={brand_id} остановлен")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка остановки бренд-бота {brand_id}: {e}")
+            return False
+
+    async def start_all_brand_bots(self):
+        """Запустить всех активных бренд-ботов (кроме основного brand_id=1)"""
+        brands = await self.brand_mgr.list_brands(active_only=True)
+        started = 0
+        for brand in brands:
+            if brand.id == 1:
+                continue  # Основной бот запускается отдельно
+            ok = await self.start_brand_bot(brand)
+            if ok:
+                started += 1
+        logger.info(f"Запущено {started} бренд-ботов")
+        return started
+
+    async def stop_all(self):
+        """Остановить всех бренд-ботов"""
+        for brand_id in list(self.bots.keys()):
+            await self.stop_brand_bot(brand_id)
+
+    def is_running(self, brand_id: int) -> bool:
+        """Проверить запущен ли бот бренда"""
+        return brand_id in self.bots
+
+
 async def main():
     """Основная функция запуска бота"""
 
@@ -1181,6 +1312,34 @@ async def main():
     db = DatabaseManager(DATABASE_PATH)
     await db.init_db()
     logger.info("База данных инициализирована")
+
+    # Инициализация таблиц брендов
+    brand_mgr = BrandManager(DATABASE_PATH)
+    await brand_mgr.init_brands_tables()
+    await brand_mgr.ensure_default_brand(
+        bot_token=BOT_TOKEN,
+        domain=os.getenv('BRAND_DOMAIN', 'zov-gor.ru'),
+        name=os.getenv('BRAND_NAME', 'ZoVGoR VPN'),
+        admin_id=ADMIN_ID
+    )
+    logger.info("Таблицы брендов инициализированы")
+
+    # Создание контекста бренда для основного бота
+    default_brand = await brand_mgr.get_brand(1)
+    brand_context = BrandContext(
+        brand_id=default_brand.id,
+        name=default_brand.name,
+        domain=default_brand.domain,
+        bot_token=default_brand.bot_token,
+        theme_color=default_brand.theme_color,
+        logo_url=default_brand.logo_url,
+        admin_id=default_brand.admin_id,
+        allowed_servers=default_brand.allowed_servers
+    )
+
+    # Устанавливаем домен подписки для хендлеров
+    set_manager_sub_domain(default_brand.domain)
+    set_admin_sub_domain(default_brand.domain)
 
     # Ретроспективное заполнение server_name (одноразово)
     await backfill_server_names(db)
@@ -1213,6 +1372,7 @@ async def main():
     dp.update.middleware(ThrottlingMiddleware(default_ttl=0.5))
     dp.update.middleware(BanCheckMiddleware(DATABASE_PATH))
     dp.update.middleware(MaintenanceMiddleware(admin_ids=[ADMIN_ID]))
+    dp.update.middleware(BrandMiddleware(brand_context))
     logger.info("Middleware зарегистрированы")
 
     # Middleware для передачи зависимостей
@@ -1221,6 +1381,7 @@ async def main():
         data['db'] = db
         data['xui_client'] = xui_client
         data['bot'] = bot
+        data['brand_mgr'] = brand_mgr
         return await handler(event, data)
 
     # Регистрация роутеров
@@ -1235,6 +1396,7 @@ async def main():
     try:
         # Передаем бота для уведомлений админу о веб-заказах
         set_bot_instance(bot, ADMIN_ID)
+        set_brand_manager(brand_mgr, default_brand)
         webapp_runner = await start_webapp_server(WEBAPP_HOST, WEBAPP_PORT)
         logger.info("WebApp сервер запущен успешно")
     except Exception as e:
@@ -1261,6 +1423,11 @@ async def main():
     sync_settings_task = asyncio.create_task(sync_server_settings_task(bot))
     logger.info("Задача синхронизации настроек серверов запущена (каждые 10 минут)")
 
+    # Запуск мониторинга лимита устройств
+    from bot.services.device_monitor import device_monitor_loop
+    device_monitor_task = asyncio.create_task(device_monitor_loop(bot))
+    logger.info("Задача мониторинга устройств запущена (каждые 2 минуты)")
+
     # Синхронизация подписок при старте
     try:
         from bot.database.client_manager import ClientManager
@@ -1273,6 +1440,14 @@ async def main():
     except Exception as e:
         logger.error(f"Ошибка начальной синхронизации подписок: {e}")
 
+    # Создание и запуск менеджера мульти-ботов
+    bot_manager = BotManager(brand_mgr, db, xui_client)
+    await bot_manager.start_all_brand_bots()
+
+    # Делаем bot_manager доступным глобально для админских хендлеров
+    import builtins
+    builtins._bot_manager = bot_manager
+
     # Запуск бота
     try:
         logger.info("Бот запущен и готов к работе")
@@ -1283,6 +1458,8 @@ async def main():
         expiry_task.cancel()
         traffic_reset_task.cancel()
         sync_settings_task.cancel()
+        device_monitor_task.cancel()
+        await bot_manager.stop_all()
         try:
             await backup_task
         except asyncio.CancelledError:
@@ -1301,6 +1478,10 @@ async def main():
             pass
         try:
             await sync_settings_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await device_monitor_task
         except asyncio.CancelledError:
             pass
         await bot.session.close()

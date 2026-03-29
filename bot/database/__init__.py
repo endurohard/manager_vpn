@@ -14,6 +14,7 @@ from .client_manager import ClientManager
 from .promo_manager import PromoManager, ReferralManager
 from .audit_manager import AuditManager, AuditAction, EntityType, AuditContext
 from .analytics_manager import AnalyticsManager
+from .brand_manager import BrandManager, Brand
 from .pool import (
     PoolConfig,
     DatabasePool,
@@ -42,6 +43,8 @@ __all__ = [
     'ReferralManager',
     'AuditManager',
     'AnalyticsManager',
+    'BrandManager',
+    'Brand',
 
     # Аудит
     'AuditAction',

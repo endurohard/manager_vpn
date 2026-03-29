@@ -173,12 +173,66 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 bot_instance = None
 admin_id = None
 
+# Глобальная ссылка на менеджер брендов
+_brand_manager = None
+_default_brand = None
+
 
 def set_bot_instance(bot, admin):
     """Установить экземпляр бота для уведомлений"""
     global bot_instance, admin_id
     bot_instance = bot
     admin_id = admin
+
+
+def set_brand_manager(brand_mgr, default_brand=None):
+    """Установить менеджер брендов для webapp"""
+    global _brand_manager, _default_brand
+    _brand_manager = brand_mgr
+    _default_brand = default_brand
+
+
+async def get_brand_from_request(request):
+    """Определить бренд по Host заголовку запроса"""
+    if not _brand_manager:
+        return _default_brand
+    host = request.host.split(":")[0]  # убираем порт
+    brand = await _brand_manager.get_brand_by_domain(host)
+    return brand or _default_brand
+
+
+def get_brand_domain(brand):
+    """Получить домен бренда или дефолтный"""
+    if brand:
+        return brand.domain
+    return _default_brand.domain if _default_brand else "zov-gor.ru"
+
+
+def _get_req_brand_domain():
+    """Получить домен из _req_brand (локальная переменная вызывающей функции) или дефолтный"""
+    import inspect
+    frame = inspect.currentframe().f_back
+    req_brand = frame.f_locals.get('_req_brand')
+    if req_brand and hasattr(req_brand, 'domain'):
+        return req_brand.domain
+    return _default_brand.domain if _default_brand else "zov-gor.ru"
+
+
+def get_brand_name(brand):
+    """Получить имя бренда или дефолтное"""
+    if brand:
+        return brand.name
+    return _default_brand.name if _default_brand else "VPN"
+
+
+def _get_brand_logo_url():
+    """Получить URL лого из бренда или дефолтный"""
+    import inspect
+    frame = inspect.currentframe().f_back
+    req_brand = frame.f_locals.get('_req_brand')
+    if req_brand and hasattr(req_brand, 'logo_url') and req_brand.logo_url:
+        return req_brand.logo_url
+    return f"/static/logo.png"
 
 
 async def init_orders_db():
@@ -896,7 +950,7 @@ async def api_order_status(request):
             if vless_key.startswith("vless://"):
                 try:
                     uuid_part = vless_key.split("://")[1].split("@")[0]
-                    response["subscription_url"] = f"https://zov-gor.ru/sub/{uuid_part}"
+                    response["subscription_url"] = f"https://{_get_req_brand_domain()}/sub/{uuid_part}"
                 except:
                     pass
 
@@ -1163,8 +1217,11 @@ async def get_client_info_from_panel(uuid_str, server):
         return None
 
 
-def render_subscription_page(client_id, client_info, links_count, servers_list):
+def render_subscription_page(client_id, client_info, links_count, servers_list, brand_name=None, brand_logo=None, brand_domain=None):
     """Рендер HTML страницы подписки"""
+    brand_title = brand_name or get_brand_name(_default_brand)
+    brand_logo = brand_logo or "/static/logo.png"
+    brand_domain = brand_domain or (_default_brand.domain if _default_brand else "zov-gor.ru")
     email = client_info.get('email', 'client')
     upload = client_info.get('upload', 0)
     download = client_info.get('download', 0)
@@ -1216,7 +1273,7 @@ def render_subscription_page(client_id, client_info, links_count, servers_list):
     status_str = "Активен" if enable else "Отключён"
     status_class = "success" if enable else "danger"
 
-    sub_url = f"https://zov-gor.ru/sub/{client_id}"
+    sub_url = f"https://{brand_domain}/sub/{client_id}"
 
     # Серверы
     servers_html = ""
@@ -1228,8 +1285,8 @@ def render_subscription_page(client_id, client_info, links_count, servers_list):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZoVGoR VPN - Подписка</title>
-    <link rel="icon" href="/static/logo.png">
+    <title>{brand_title} - Подписка</title>
+    <link rel="icon" href="{brand_logo}">
     <style>
         * {{
             margin: 0;
@@ -1425,8 +1482,8 @@ def render_subscription_page(client_id, client_info, links_count, servers_list):
 <body>
     <div class="container">
         <div class="header">
-            <img src="/static/logo.png" alt="ZoVGoR" class="logo">
-            <h1 class="title">ZoVGoR VPN</h1>
+            <img src="{brand_logo}" alt="{brand_title}" class="logo">
+            <h1 class="title">{brand_title}</h1>
             <p class="subtitle">Информация о подписке</p>
         </div>
 
@@ -1750,6 +1807,9 @@ async def _build_subscription_data(client_id):
 
 async def subscription_handler(request):
     """Обработчик подписки - возвращает ключи клиента с активных серверов"""
+    _req_brand = await get_brand_from_request(request)
+    brand_title = get_brand_name(_req_brand)
+
     client_id = request.match_info.get('client_id', '')
 
     if not client_id:
@@ -1770,7 +1830,7 @@ async def subscription_handler(request):
         if is_browser_request(request):
             error_html = '''<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZoVGoR VPN - Ошибка</title>
+<title>''' + brand_title + ''' - Ошибка</title>
 <style>body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:20px;}
 .container{text-align:center;max-width:400px;}.icon{font-size:64px;margin-bottom:20px;}h1{margin-bottom:10px;}p{color:#888;}</style>
 </head><body><div class="container"><div class="icon">😔</div><h1>Клиент не найден</h1><p>Подписка не найдена или истекла. Обратитесь в поддержку: <a href="https://t.me/bagamedovit" style="color:#667eea">@bagamedovit</a></p></div></body></html>'''
@@ -1788,14 +1848,16 @@ async def subscription_handler(request):
 
     # Если запрос из браузера - показываем HTML страницу
     if is_browser_request(request):
-        html = render_subscription_page(client_id, client_info, len(links), servers_list)
+        brand_logo = _get_brand_logo_url()
+        _brand_domain = _req_brand.domain if _req_brand and hasattr(_req_brand, "domain") else (_default_brand.domain if _default_brand else "zov-gor.ru")
+        html = render_subscription_page(client_id, client_info, len(links), servers_list, brand_name=brand_title, brand_logo=brand_logo, brand_domain=_brand_domain)
         return web.Response(text=html, content_type='text/html')
 
     # Для VPN клиентов - стандартный base64 ответ
     import base64
 
     # Название подписки с именем клиента
-    profile_name = f"ZoVGoR - {client_email}"
+    profile_name = f"{get_brand_name(_req_brand) if '_req_brand' in dir() else get_brand_name(_default_brand)} - {client_email}"
     profile_name_b64 = base64.b64encode(profile_name.encode()).decode()
 
     subscription_content = '\n'.join(links)
@@ -1806,7 +1868,7 @@ async def subscription_handler(request):
     announce_b64 = "base64:" + base64.b64encode(announce_text.encode()).decode()
 
     # URL иконки
-    icon_url = 'https://zov-gor.ru/static/logo.png'
+    icon_url = _get_brand_logo_url() if _get_brand_logo_url().startswith('http') else f'https://{_get_req_brand_domain()}{_get_brand_logo_url()}'
 
     return web.Response(
         text=encoded,
@@ -1826,13 +1888,16 @@ async def subscription_handler(request):
             'Profile-Icon-URL': icon_url,
             # Other clients
             'Support-URL': 'https://t.me/bagamedovit',
-            'Profile-Web-Page-URL': 'https://zov-gor.ru/static/profile.html',
-            'Homepage': 'https://zov-gor.ru'
+            'Profile-Web-Page-URL': f'https://{_get_req_brand_domain()}/static/profile.html',
+            'Homepage': f'https://{_get_req_brand_domain()}'
         }
     )
 
 
 async def subscription_deeplink_handler(request):
+    _req_brand = await get_brand_from_request(request)
+    brand_title = get_brand_name(_req_brand)
+    brand_logo = _get_brand_logo_url()
     """Deep link для открытия подписки в v2RayTun"""
     client_id = request.match_info.get('client_id', '')
 
@@ -1847,7 +1912,7 @@ async def subscription_deeplink_handler(request):
 
     # Формируем ссылку на подписку
     import urllib.parse
-    sub_url = f"https://zov-gor.ru/sub/{client_id}"
+    sub_url = f"https://{brand_domain}/sub/{client_id}"
     encoded_url = urllib.parse.quote(sub_url, safe='')
 
     # Deep link для v2RayTun
@@ -1859,7 +1924,7 @@ async def subscription_deeplink_handler(request):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZoVGoR VPN - Подключение</title>
+    <title>{brand_title} - Подключение</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1948,8 +2013,8 @@ async def subscription_deeplink_handler(request):
 </head>
 <body>
     <div class="container">
-        <img src="/static/logo.png" alt="ZoVGoR" class="logo">
-        <h1>ZoVGoR VPN</h1>
+        <img src="{brand_logo}" alt="{brand_title}" class="logo">
+        <h1>{brand_title}</h1>
         <p class="subtitle">Выберите приложение для подключения</p>
 
         <a href="{v2raytun_link}" class="btn btn-primary" id="v2raytun-btn">
@@ -2001,6 +2066,7 @@ async def subscription_deeplink_handler(request):
 
 
 async def subscription_json_handler(request):
+    _req_brand = await get_brand_from_request(request)
     """Подписка в JSON формате (для некоторых клиентов) со всех серверов"""
     client_id = request.match_info.get('client_id', '')
 
@@ -2029,7 +2095,7 @@ async def subscription_json_handler(request):
             'link': link,
             'port': item['inbound'].get('port', 443),
             'tag': item['inbound'].get('tag', ''),
-            'server': 'ZoVGoR'
+            'server': get_brand_name(_req_brand) if '_req_brand' in dir() else get_brand_name(_default_brand)
         })
 
     # Внешние серверы - параллельная проверка и генерация ссылок

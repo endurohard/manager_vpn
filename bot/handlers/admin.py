@@ -3,13 +3,14 @@
 """
 import logging
 import asyncio
+import aiosqlite
 from functools import wraps
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from bot.config import ADMIN_ID, INBOUND_ID, DOMAIN
+from bot.config import ADMIN_ID, INBOUND_ID, DOMAIN, DATABASE_PATH
 from bot.database import DatabaseManager
 from bot.api.xui_client import XUIClient
 from bot.utils import Keyboards, generate_user_id, generate_qr_code, notify_admin_xui_error
@@ -129,6 +130,13 @@ class BulkAddServerStates(StatesGroup):
     processing = State()
 
 
+class ManageSubscriptionStates(StatesGroup):
+    """Состояния для управления подпиской (исключение серверов)"""
+    waiting_for_search = State()
+    waiting_for_action = State()  # Выбор действия (исключить сервер и т.д.)
+    confirming_exclude = State()  # Подтверждение исключения
+
+
 def admin_only(func):
     """Декоратор для проверки прав администратора"""
     @wraps(func)
@@ -196,15 +204,14 @@ async def admin_generate_id(message: Message, state: FSMContext, xui_client: XUI
         await state.clear()
         return
 
-    await state.update_data(servers=servers)
+    all_indices = list(range(len(servers)))
+    await state.update_data(servers=servers, selected_server_indices=all_indices)
     await state.set_state(AdminCreateKeyStates.waiting_for_server)
     await message.answer(
         f"🆔 Сгенерирован ID: <code>{user_id_value}</code>\n\n"
-        f"🖥 <b>Выберите сервер:</b>\n"
-        f"🟢 - активен для новых\n"
-        f"🟡 - отключен для новых\n"
-        f"🔴 - выключен",
-        reply_markup=Keyboards.server_selection(servers),
+        f"🖥 <b>Выберите серверы</b> (можно несколько):\n"
+        f"Нажмите на сервер чтобы вкл/выкл, затем ✅ Продолжить",
+        reply_markup=Keyboards.server_multi_selection(servers, all_indices),
         parse_mode="HTML"
     )
 
@@ -234,47 +241,96 @@ async def admin_process_phone(message: Message, state: FSMContext, xui_client: X
         await state.clear()
         return
 
-    await state.update_data(servers=servers)
+    all_indices = list(range(len(servers)))
+    await state.update_data(servers=servers, selected_server_indices=all_indices)
     await state.set_state(AdminCreateKeyStates.waiting_for_server)
     await message.answer(
         f"🆔 ID клиента: <code>{user_input}</code>\n\n"
-        f"🖥 <b>Выберите сервер:</b>\n"
-        f"🟢 - активен для новых\n"
-        f"🟡 - отключен для новых\n"
-        f"🔴 - выключен",
-        reply_markup=Keyboards.server_selection(servers),
+        f"🖥 <b>Выберите серверы</b> (можно несколько):\n"
+        f"Нажмите на сервер чтобы вкл/выкл, затем ✅ Продолжить",
+        reply_markup=Keyboards.server_multi_selection(servers, all_indices),
         parse_mode="HTML"
     )
 
 
-@router.callback_query(AdminCreateKeyStates.waiting_for_server, F.data.startswith("server_"))
-async def admin_process_server(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора сервера"""
-    server_idx = int(callback.data.split("_", 1)[1])
+@router.callback_query(AdminCreateKeyStates.waiting_for_server, F.data.startswith("mserver_"))
+async def admin_process_multi_server(callback: CallbackQuery, state: FSMContext):
+    """Мульти-выбор серверов для админа"""
     data = await state.get_data()
     servers = data.get('servers', [])
+    selected = data.get('selected_server_indices', [])
+    action = callback.data.replace("mserver_", "")
 
-    if server_idx >= len(servers):
-        await callback.answer("Ошибка: сервер не найден", show_alert=True)
+    if action == "all":
+        if set(selected) == set(range(len(servers))):
+            selected = []
+        else:
+            selected = list(range(len(servers)))
+        await state.update_data(selected_server_indices=selected)
+        await callback.message.edit_reply_markup(
+            reply_markup=Keyboards.server_multi_selection(servers, selected)
+        )
+        await callback.answer()
         return
 
-    selected_server = servers[server_idx]
-    await state.update_data(selected_server=selected_server, server_idx=server_idx)
+    if action == "done":
+        if not selected:
+            await callback.answer("Выберите хотя бы один сервер!", show_alert=True)
+            return
 
-    # Показываем inbound'ы этого сервера из конфига
-    inbounds = selected_server.get('inbounds', {})
+        phone = data.get('phone', '')
+        selected_servers = [servers[i] for i in selected if i < len(servers)]
 
-    if not inbounds:
-        await callback.answer("У сервера нет inbound'ов", show_alert=True)
+        if len(selected_servers) == 1:
+            srv = selected_servers[0]
+            # Если один сервер — показываем выбор inbound
+            inbounds = srv.get('inbounds', {})
+            if not inbounds:
+                await callback.answer("У сервера нет inbound'ов", show_alert=True)
+                return
+
+            await state.update_data(
+                selected_server=srv,
+                multi_servers=None,
+                server_idx=selected[0]
+            )
+            await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
+            await callback.message.edit_text(
+                f"🖥 Сервер: <b>{srv.get('name', '?')}</b>\n\n"
+                f"🔌 <b>Выберите inbound:</b>",
+                reply_markup=Keyboards.inbound_selection_from_config(inbounds, srv.get('name', '')),
+                parse_mode="HTML"
+            )
+        else:
+            # Мульти-сервер — используем main inbound каждого
+            server_text = ", ".join(s.get('name', '?') for s in selected_servers)
+            await state.update_data(
+                selected_server=selected_servers[0],
+                selected_inbound=selected_servers[0].get('inbounds', {}).get('main', {}),
+                inbound_id=selected_servers[0].get('inbounds', {}).get('main', {}).get('id', 1),
+                multi_servers=selected_servers
+            )
+            await state.set_state(AdminCreateKeyStates.waiting_for_period)
+            await callback.message.edit_text(
+                f"🆔 ID: <code>{phone}</code>\n"
+                f"🖥 Серверы: <b>{server_text}</b>\n\n"
+                "Выберите срок действия ключа:",
+                reply_markup=Keyboards.subscription_periods(),
+                parse_mode="HTML"
+            )
+        await callback.answer()
         return
 
-    server_name = selected_server.get('name', 'Unknown')
-    await state.set_state(AdminCreateKeyStates.waiting_for_inbound)
-    await callback.message.edit_text(
-        f"🖥 Сервер: <b>{server_name}</b>\n\n"
-        f"🔌 <b>Выберите inbound:</b>",
-        reply_markup=Keyboards.inbound_selection_from_config(inbounds, server_name),
-        parse_mode="HTML"
+    # Toggle конкретного сервера
+    idx = int(action)
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+    await state.update_data(selected_server_indices=selected)
+    await callback.message.edit_reply_markup(
+        reply_markup=Keyboards.server_multi_selection(servers, selected)
     )
     await callback.answer()
 
@@ -287,11 +343,12 @@ async def admin_back_to_servers(callback: CallbackQuery, state: FSMContext):
     servers = data.get('servers', [])
     phone = data.get('phone', '')
 
+    selected = data.get('selected_server_indices', list(range(len(servers))))
     await state.set_state(AdminCreateKeyStates.waiting_for_server)
     await callback.message.edit_text(
         f"🆔 ID клиента: <code>{phone}</code>\n\n"
-        f"🖥 <b>Выберите сервер:</b>",
-        reply_markup=Keyboards.server_selection(servers),
+        f"🖥 <b>Выберите серверы</b> (можно несколько):",
+        reply_markup=Keyboards.server_multi_selection(servers, selected),
         parse_mode="HTML"
     )
     await callback.answer()
@@ -447,7 +504,7 @@ async def admin_cancel_key_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "admin_confirm_key")
 async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
-                           xui_client: XUIClient, bot):
+                           xui_client: XUIClient, bot, **kwargs):
     """Создание ключа на выбранном сервере"""
     import urllib.parse
     import uuid
@@ -626,7 +683,7 @@ async def admin_confirm_key(callback: CallbackQuery, state: FSMContext, db: Data
         )
 
         # Ссылка подписки
-        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+        subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
 
         # QR код для ссылки подписки
         try:
@@ -1636,9 +1693,10 @@ async def show_keys_for_deletion(message: Message, db: DatabaseManager, **kwargs
 
 
 @router.callback_query(F.data == "cancel_key_delete")
-async def cancel_key_deletion(callback: CallbackQuery):
-    """Отмена удаления ключа"""
+async def cancel_key_deletion(callback: CallbackQuery, **kwargs):
+    """Отмена операции — возврат в админ-меню"""
     await callback.message.delete()
+    await callback.message.answer("Панель администратора", reply_markup=Keyboards.admin_menu())
     await callback.answer("Отменено")
 
 
@@ -2829,7 +2887,7 @@ async def cancel_search_key(message: Message, state: FSMContext):
 
 
 @router.message(SearchKeyStates.waiting_for_search_query)
-async def process_search_query(message: Message, state: FSMContext, db: DatabaseManager):
+async def process_search_query(message: Message, state: FSMContext, db: DatabaseManager, **kwargs):
     """Обработка поискового запроса - ищет в базе и на X-UI серверах"""
     query = message.text.strip()
 
@@ -2893,7 +2951,7 @@ async def process_search_query(message: Message, state: FSMContext, db: Database
             expiry = client.get('expiry_str', 'N/A')
             uuid_short = client.get('uuid', '')[:8] + '...' if client.get('uuid') else 'N/A'
 
-            sub_url = f"https://zov-gor.ru/sub/{client.get('uuid', '')}" if client.get('uuid') else ''
+            sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client.get('uuid', '')}" if client.get('uuid') else ''
 
             text += f"{idx}. <b>{email}</b>\n"
             text += f"   🖥 Сервер: {server}\n"
@@ -3594,7 +3652,7 @@ async def do_extend_client_callback(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("get_link_"))
-async def get_client_link_callback(callback: CallbackQuery):
+async def get_client_link_callback(callback: CallbackQuery, **kwargs):
     """Получить VLESS ссылку для клиента по UUID"""
     uuid_prefix = callback.data.replace("get_link_", "")
 
@@ -3794,7 +3852,7 @@ async def get_client_link_callback(callback: CallbackQuery):
         vless_link = await get_client_link_from_active_server(full_uuid, email)
 
     if vless_link:
-        sub_url = f"https://zov-gor.ru/sub/{full_uuid}"
+        sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{full_uuid}"
 
         text = (
             f"🔑 <b>Ключ клиента</b>\n\n"
@@ -3830,6 +3888,24 @@ async def get_client_link_callback(callback: CallbackQuery):
 import json
 import aiosqlite
 from pathlib import Path
+
+
+# Глобальный домен подписки (обновляется при инициализации)
+_sub_domain = 'zov-gor.ru'
+
+def set_sub_domain(domain: str):
+    """Установить домен подписки"""
+    global _sub_domain
+    _sub_domain = domain
+
+def _get_sub_domain(kwargs_dict=None):
+    """Получить домен подписки — из brand context если есть, иначе глобальный"""
+    if isinstance(kwargs_dict, dict):
+        brand = kwargs_dict.get('brand')
+        if brand and hasattr(brand, 'domain'):
+            return brand.domain
+    return _sub_domain
+
 
 PAYMENT_FILE = Path(__file__).parent.parent.parent / 'payment_details.json'
 ORDERS_DB = Path(__file__).parent.parent.parent / 'web_orders.db'
@@ -4016,7 +4092,7 @@ async def payment_off(message: Message):
 
 
 @router.message(F.text.startswith("/web_approve"))
-async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
+async def approve_web_order(message: Message, db: DatabaseManager, xui_client, **kwargs):
     """Подтвердить веб-заказ и выдать ключ"""
     if message.from_user.id != ADMIN_ID:
         return
@@ -4074,7 +4150,7 @@ async def approve_web_order(message: Message, db: DatabaseManager, xui_client):
 
             if vless_key:
                 # Формируем ссылку подписки
-                subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
+                subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}" if client_uuid else ""
 
                 # Сохраняем ключ в заказ
                 async with aiosqlite.connect(ORDERS_DB) as db_orders:
@@ -4196,7 +4272,7 @@ async def show_web_orders_button(message: Message):
 # ============== CALLBACK HANDLERS FOR WEB ORDERS ==============
 
 @router.callback_query(F.data.startswith("web_approve_"))
-async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManager, xui_client):
+async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManager, xui_client, **kwargs):
     """Подтвердить веб-заказ через кнопку"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа")
@@ -4264,7 +4340,7 @@ async def callback_approve_web_order(callback: CallbackQuery, db: DatabaseManage
 
             if vless_key:
                 # Формируем ссылку подписки
-                subscription_url = f"https://zov-gor.ru/sub/{client_uuid}" if client_uuid else ""
+                subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}" if client_uuid else ""
 
                 # Сохраняем ключ в заказ
                 async with aiosqlite.connect(ORDERS_DB) as db_orders:
@@ -6252,7 +6328,7 @@ async def cancel_add_server_to_sub(message: Message, state: FSMContext):
 
 
 @router.message(AddToSubscriptionStates.waiting_for_search)
-async def process_add_sub_search(message: Message, state: FSMContext):
+async def process_add_sub_search(message: Message, state: FSMContext, **kwargs):
     """Обработка поискового запроса для добавления сервера"""
     query = message.text.strip()
 
@@ -6336,7 +6412,7 @@ async def process_add_sub_search(message: Message, state: FSMContext):
         else:
             expiry_str = "Безлимит"
 
-        sub_url = f"https://zov-gor.ru/sub/{client['uuid']}"
+        sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client['uuid']}"
 
         text += f"{idx + 1}. <b>{email}</b>\n"
         text += f"   🔑 UUID: <code>{uuid_short}</code>\n"
@@ -7511,3 +7587,1678 @@ async def cmd_manual_backup(message: Message, bot, **kwargs):
         f"📋 <b>Бэкап завершён</b>\n\n" + "\n".join(results),
         parse_mode="HTML"
     )
+
+
+# ==================== УПРАВЛЕНИЕ ПОДПИСКОЙ (исключение серверов) ====================
+
+@router.message(F.text == "📋 Управление подпиской")
+@admin_only
+async def start_manage_subscription(message: Message, state: FSMContext, **kwargs):
+    """Начало управления подпиской клиента"""
+    await state.clear()
+    await state.set_state(ManageSubscriptionStates.waiting_for_search)
+    await message.answer(
+        "📋 <b>УПРАВЛЕНИЕ ПОДПИСКОЙ</b>\n\n"
+        "Здесь вы можете:\n"
+        "• Посмотреть на каких серверах клиент\n"
+        "• Исключить серверы из подписки\n\n"
+        "Введите email, UUID или телефон клиента:\n\n"
+        "Примеры:\n"
+        "• <code>79001234567</code>\n"
+        "• <code>Иван</code>",
+        parse_mode="HTML",
+        reply_markup=Keyboards.cancel()
+    )
+
+
+@router.message(ManageSubscriptionStates.waiting_for_search, F.text == "Отмена")
+async def cancel_manage_sub(message: Message, state: FSMContext):
+    """Отмена управления подпиской"""
+    await state.clear()
+    await message.answer("Операция отменена.", reply_markup=Keyboards.admin_menu())
+
+
+@router.message(ManageSubscriptionStates.waiting_for_search)
+async def process_manage_sub_search(message: Message, state: FSMContext, **kwargs):
+    """Поиск клиента для управления подпиской"""
+    query = message.text.strip()
+
+    admin_menu_buttons = {
+        "📡 Добавить сервер", "📡 Сервер → всем", "🔑 Создать ключ (выбор inbound)",
+        "Добавить менеджера", "Список менеджеров", "Общая статистика",
+        "Детальная статистика", "💰 Изменить цены", "🔍 Поиск ключа",
+        "📅 Продлить подписку", "📋 Управление подпиской",
+        "🗑️ Удалить ключ", "📢 Отправить уведомление", "🌐 Управление SNI",
+        "💳 Реквизиты", "📋 Веб-заказы", "🖥 Статус серверов", "🔧 Панели X-UI",
+        "💳 Оплата серверов", "🌐 Админ-панель сайта",
+        "Назад", "Панель администратора", "Создать ключ", "🔄 Замена ключа",
+        "🔧 Исправить ключ", "💰 Прайс", "Моя статистика", "💾 Бэкап",
+    }
+    if query in admin_menu_buttons:
+        await state.clear()
+        await message.answer("Операция отменена.", reply_markup=Keyboards.admin_menu())
+        return
+
+    if len(query) < 2:
+        await message.answer("❌ Введите минимум 2 символа для поиска.")
+        return
+
+    status_msg = await message.answer("🔍 Поиск клиента на серверах...")
+
+    xui_clients = await search_clients_on_servers(query)
+
+    if not xui_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
+            "Попробуйте другой запрос.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Группируем по UUID
+    clients_by_uuid = {}
+    for client in xui_clients:
+        uuid = client.get('uuid', '')
+        if not uuid:
+            continue
+        if uuid not in clients_by_uuid:
+            clients_by_uuid[uuid] = {
+                'email': client.get('email', ''),
+                'uuid': uuid,
+                'servers': [],
+                'expiry_time': client.get('expiry_time', 0),
+                'ip_limit': client.get('limit_ip', 2)
+            }
+        srv = client.get('server', 'Unknown')
+        if srv not in clients_by_uuid[uuid]['servers']:
+            clients_by_uuid[uuid]['servers'].append(srv)
+
+    unique_clients = list(clients_by_uuid.values())
+
+    if not unique_clients:
+        await status_msg.edit_text(
+            f"🔍 По запросу «<b>{query}</b>» ничего не найдено.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(msub_search_results=unique_clients)
+
+    text = f"📋 <b>УПРАВЛЕНИЕ ПОДПИСКОЙ</b>\n"
+    text += f"Запрос: «{query}»\n\n"
+
+    buttons = []
+
+    for idx, client in enumerate(unique_clients[:10]):
+        email = client['email']
+        servers_str = ', '.join(client['servers'])
+        expiry_time = client.get('expiry_time', 0)
+
+        if expiry_time > 0:
+            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
+            expiry_str = expiry_dt.strftime("%d.%m.%Y")
+            now_ms = int(datetime.now().timestamp() * 1000)
+            if expiry_time < now_ms:
+                expiry_str += " ❌ истекла"
+        else:
+            expiry_str = "Безлимит"
+
+        text += f"{idx + 1}. <b>{email}</b>\n"
+        text += f"   🖥 Серверы ({len(client['servers'])}): {servers_str}\n"
+        text += f"   ⏰ До: {expiry_str}\n\n"
+
+        buttons.append([InlineKeyboardButton(
+            text=f"📋 {email[:30]}",
+            callback_data=f"msub_sel_{idx}"
+        )])
+
+        if len(text) > 3000:
+            text += "...\n"
+            break
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="msub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "msub_cancel")
+async def cancel_manage_sub_cb(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Отмена управления подпиской (callback)"""
+    await state.clear()
+    await callback.message.edit_text("Операция отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("msub_sel_"))
+async def manage_sub_select_client(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Выбор клиента — показ серверов с возможностью исключения"""
+    from bot.api.remote_xui import find_client_presence_on_all_servers
+
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    search_results = data.get('msub_search_results', [])
+
+    if idx >= len(search_results):
+        await callback.answer("Ошибка: клиент не найден")
+        return
+
+    client = search_results[idx]
+    client_uuid = client['uuid']
+    email = client['email']
+
+    await callback.message.edit_text("🔍 Проверяю серверы...")
+
+    presence = await find_client_presence_on_all_servers(client_uuid)
+    found_on = presence.get('found_on', [])
+    not_found_on = presence.get('not_found_on', [])
+
+    # Сохраняем found_on для последующего исключения
+    found_servers = []
+    for srv in found_on:
+        found_servers.append({
+            'server_name': srv['server_name'],
+            'name_prefix': srv.get('name_prefix', srv['server_name']),
+            'expiry_time': srv.get('expiry_time', 0),
+            'server_config': srv.get('server_config', {})
+        })
+
+    await state.update_data(
+        msub_client_uuid=client_uuid,
+        msub_client_email=email,
+        msub_found_servers=found_servers,
+    )
+    await state.set_state(ManageSubscriptionStates.waiting_for_action)
+
+    # Формируем текст
+    sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
+    text = f"📋 <b>Управление подпиской</b>\n\n"
+    text += f"Клиент: <b>{email}</b>\n"
+    text += f"📱 Подписка: <code>{sub_url}</code>\n\n"
+
+    if found_on:
+        text += f"<b>🖥 На серверах ({len(found_on)}):</b>\n"
+        for i, srv in enumerate(found_on):
+            exp = srv.get('expiry_time', 0)
+            if exp > 0:
+                exp_str = datetime.fromtimestamp(exp / 1000).strftime("%d.%m.%Y")
+            else:
+                exp_str = "Безлимит"
+            prefix = srv.get('name_prefix', '')
+            label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            text += f"  {i + 1}. ✅ {label} — до {exp_str}\n"
+        text += "\n"
+    else:
+        text += "⚠️ Клиент не найден ни на одном сервере.\n\n"
+
+    if not_found_on:
+        text += f"<b>➕ Нет на серверах ({len(not_found_on)}):</b>\n"
+        for srv in not_found_on:
+            prefix = srv.get('name_prefix', '')
+            label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            text += f"  ➖ {label}\n"
+        text += "\n"
+
+    buttons = []
+
+    if len(found_on) > 0:
+        text += "Выберите сервер для <b>исключения</b> из подписки:"
+
+        for i, srv in enumerate(found_servers):
+            prefix = srv.get('name_prefix', '')
+            btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑 {btn_label}",
+                callback_data=f"msub_excl_{i}"
+            )])
+
+    buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="msub_newsearch")])
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="msub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "msub_newsearch")
+async def manage_sub_new_search(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Новый поиск"""
+    await state.clear()
+    await state.set_state(ManageSubscriptionStates.waiting_for_search)
+    await callback.message.edit_text(
+        "📋 <b>УПРАВЛЕНИЕ ПОДПИСКОЙ</b>\n\n"
+        "Введите email, UUID или телефон клиента для поиска:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(ManageSubscriptionStates.waiting_for_action, F.data.startswith("msub_excl_"))
+async def manage_sub_confirm_exclude(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Подтверждение исключения сервера"""
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    found_servers = data.get('msub_found_servers', [])
+    email = data.get('msub_client_email', '')
+
+    if idx >= len(found_servers):
+        await callback.answer("Ошибка: сервер не найден")
+        return
+
+    srv = found_servers[idx]
+    server_name = srv['server_name']
+    prefix = srv.get('name_prefix', '')
+    label = f"{server_name} [{prefix}]" if prefix and prefix != server_name else server_name
+
+    await state.update_data(msub_exclude_idx=idx)
+    await state.set_state(ManageSubscriptionStates.confirming_exclude)
+
+    text = (
+        f"⚠️ <b>Подтверждение исключения</b>\n\n"
+        f"Клиент: <b>{email}</b>\n"
+        f"Сервер: <b>{label}</b>\n\n"
+        f"Клиент будет <b>удалён</b> с этого сервера.\n"
+        f"Подписка на остальных серверах сохранится.\n\n"
+        f"Вы уверены?"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text="✅ Да, исключить", callback_data="msub_excl_confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="msub_excl_back")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="msub_cancel")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(ManageSubscriptionStates.confirming_exclude, F.data == "msub_excl_back")
+async def manage_sub_back_to_servers(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Назад к списку серверов"""
+    await state.set_state(ManageSubscriptionStates.waiting_for_action)
+
+    data = await state.get_data()
+    client_uuid = data.get('msub_client_uuid', '')
+    email = data.get('msub_client_email', '')
+    found_servers = data.get('msub_found_servers', [])
+
+    sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
+    text = f"📋 <b>Управление подпиской</b>\n\n"
+    text += f"Клиент: <b>{email}</b>\n"
+    text += f"📱 Подписка: <code>{sub_url}</code>\n\n"
+
+    if found_servers:
+        text += f"<b>🖥 На серверах ({len(found_servers)}):</b>\n"
+        for i, srv in enumerate(found_servers):
+            exp = srv.get('expiry_time', 0)
+            if exp > 0:
+                exp_str = datetime.fromtimestamp(exp / 1000).strftime("%d.%m.%Y")
+            else:
+                exp_str = "Безлимит"
+            prefix = srv.get('name_prefix', '')
+            label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+            text += f"  {i + 1}. ✅ {label} — до {exp_str}\n"
+        text += "\nВыберите сервер для <b>исключения</b>:"
+
+    buttons = []
+    for i, srv in enumerate(found_servers):
+        prefix = srv.get('name_prefix', '')
+        btn_label = f"{srv['server_name']} [{prefix}]" if prefix and prefix != srv['server_name'] else srv['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {btn_label}",
+            callback_data=f"msub_excl_{i}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="msub_newsearch")])
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="msub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(ManageSubscriptionStates.confirming_exclude, F.data == "msub_excl_confirm")
+async def manage_sub_execute_exclude(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Выполнить исключение сервера из подписки"""
+    from bot.api.remote_xui import delete_client_via_panel
+
+    data = await state.get_data()
+    client_uuid = data.get('msub_client_uuid', '')
+    email = data.get('msub_client_email', '')
+    found_servers = data.get('msub_found_servers', [])
+    exclude_idx = data.get('msub_exclude_idx', 0)
+
+    if exclude_idx >= len(found_servers):
+        await callback.answer("Ошибка")
+        return
+
+    srv = found_servers[exclude_idx]
+    server_name = srv['server_name']
+    server_config = srv.get('server_config', {})
+    prefix = srv.get('name_prefix', '')
+    label = f"{server_name} [{prefix}]" if prefix and prefix != server_name else server_name
+
+    await callback.message.edit_text(f"⏳ Удаление клиента с сервера {label}...")
+
+    # Удаляем с панели
+    success = False
+    try:
+        if server_config.get('local', False):
+            # Локальный сервер — удаляем через XUIClient
+            from bot.api.xui_client import XUIClient
+            from bot.config import HOST, USERNAME, PASSWORD
+            async with XUIClient(HOST, USERNAME, PASSWORD) as xui:
+                if await xui.login():
+                    # Находим inbound_id
+                    inbounds = await xui.get_inbounds()
+                    for inbound in inbounds:
+                        inbound_id = inbound.get('id')
+                        try:
+                            del_result = await xui.delete_client(inbound_id, client_uuid)
+                            if del_result:
+                                success = True
+                        except Exception:
+                            pass
+        else:
+            success = await delete_client_via_panel(server_config, client_uuid)
+    except Exception as e:
+        logger.error(f"Ошибка удаления клиента {email} с {server_name}: {e}")
+
+    # Удаляем из client_servers в БД
+    try:
+        from bot.config import DATABASE_PATH
+        import aiosqlite
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "DELETE FROM client_servers WHERE client_uuid = ? AND server_name = ?",
+                (client_uuid, server_name)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"Ошибка удаления из client_servers: {e}")
+
+    # Обновляем список серверов в state
+    found_servers.pop(exclude_idx)
+    await state.update_data(msub_found_servers=found_servers)
+
+    if success:
+        result_text = (
+            f"✅ <b>Сервер исключён</b>\n\n"
+            f"Клиент: <b>{email}</b>\n"
+            f"Удалён с: <b>{label}</b>\n\n"
+        )
+    else:
+        result_text = (
+            f"⚠️ <b>Возможно не удалось удалить</b>\n\n"
+            f"Клиент: <b>{email}</b>\n"
+            f"Сервер: <b>{label}</b>\n"
+            f"Проверьте панель сервера вручную.\n\n"
+        )
+
+    if found_servers:
+        result_text += f"<b>Остальные серверы ({len(found_servers)}):</b>\n"
+        for i, s in enumerate(found_servers):
+            p = s.get('name_prefix', '')
+            lbl = f"{s['server_name']} [{p}]" if p and p != s['server_name'] else s['server_name']
+            result_text += f"  ✅ {lbl}\n"
+    else:
+        result_text += "⚠️ Клиент больше не на серверах."
+
+    await state.set_state(ManageSubscriptionStates.waiting_for_action)
+
+    buttons = []
+    for i, s in enumerate(found_servers):
+        p = s.get('name_prefix', '')
+        btn_label = f"{s['server_name']} [{p}]" if p and p != s['server_name'] else s['server_name']
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {btn_label}",
+            callback_data=f"msub_excl_{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔍 Новый поиск", callback_data="msub_newsearch")])
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="msub_cancel")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(result_text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+# ============ МОНИТОРИНГ ЛИМИТА УСТРОЙСТВ ============
+
+class DeviceLimitStates(StatesGroup):
+    waiting_for_search = State()
+    waiting_for_new_limit = State()
+
+
+@router.message(F.text == "📱 Лимит устройств")
+@admin_only
+async def show_device_limits_menu(message: Message, **kwargs):
+    """Показать меню управления лимитом устройств"""
+    from bot.services.device_monitor import get_blocked_clients, check_device_limits
+
+    blocked = get_blocked_clients()
+
+    text = "📱 <b>Мониторинг устройств</b>\n\n"
+    text += f"🔄 Проверка каждые 2 минуты\n"
+    text += f"🚫 Заблокировано сейчас: <b>{len(blocked)}</b>\n\n"
+
+    if blocked:
+        text += "<b>Заблокированные клиенты:</b>\n"
+        # Получим email для UUID из БД
+        try:
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                for uuid, ts in list(blocked.items())[:10]:
+                    async with db.execute(
+                        "SELECT email, ip_limit FROM clients WHERE uuid = ?", (uuid,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            from datetime import datetime
+                            blocked_time = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+                            text += f"• <code>{row[0]}</code> (лимит: {row[1]}) — с {blocked_time}\n"
+        except Exception:
+            pass
+
+        if len(blocked) > 10:
+            text += f"\n... и ещё {len(blocked) - 10}\n"
+
+    buttons = [
+        [InlineKeyboardButton(text="🔍 Проверить клиента", callback_data="devlim_check_client")],
+        [InlineKeyboardButton(text="✏️ Изменить лимит клиента", callback_data="devlim_edit_limit")],
+        [InlineKeyboardButton(text="🔄 Запустить проверку сейчас", callback_data="devlim_run_now")],
+        [InlineKeyboardButton(text="🔓 Разблокировать всех", callback_data="devlim_unblock_all")],
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "devlim_run_now")
+@admin_only
+async def run_device_check_now(callback: CallbackQuery, **kwargs):
+    """Запустить проверку лимита устройств прямо сейчас"""
+    from bot.services.device_monitor import check_device_limits
+
+    await callback.answer("🔄 Запускаю проверку...")
+    await callback.message.edit_text("⏳ Проверяю подключения на всех серверах...")
+
+    bot = callback.bot
+    await check_device_limits(bot)
+
+    from bot.services.device_monitor import get_blocked_clients
+    blocked = get_blocked_clients()
+
+    await callback.message.edit_text(
+        f"✅ Проверка завершена.\n\n"
+        f"🚫 Заблокировано: <b>{len(blocked)}</b>",
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "devlim_unblock_all")
+@admin_only
+async def unblock_all_devices(callback: CallbackQuery, **kwargs):
+    """Разблокировать всех заблокированных клиентов"""
+    from bot.services.device_monitor import get_blocked_clients, _blocked_clients
+    from bot.api.remote_xui import load_servers_config, get_all_clients_from_panel
+
+    blocked = get_blocked_clients()
+    if not blocked:
+        await callback.answer("Нет заблокированных клиентов", show_alert=True)
+        return
+
+    await callback.answer("🔓 Разблокирую...")
+    await callback.message.edit_text(f"⏳ Разблокирую {len(blocked)} клиентов...")
+
+    # Для каждого заблокированного — включить на всех серверах
+    from bot.services.device_monitor import collect_client_presence_on_servers, toggle_client_on_panel
+
+    servers_config = load_servers_config()
+    servers = [s for s in servers_config.get('servers', [])
+               if s.get('enabled', True) and s.get('panel')]
+
+    uuid_to_servers = await collect_client_presence_on_servers(servers)
+    restored = 0
+
+    for uuid in list(blocked.keys()):
+        entries = uuid_to_servers.get(uuid, [])
+        for entry in entries:
+            await toggle_client_on_panel(
+                entry['server_config'],
+                uuid,
+                entry['inbound_id'],
+                entry['client_data'],
+                enable=True,
+            )
+        if uuid in _blocked_clients:
+            del _blocked_clients[uuid]
+        restored += 1
+
+    await callback.message.edit_text(
+        f"✅ Разблокировано: <b>{restored}</b> клиентов",
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "devlim_check_client")
+@admin_only
+async def ask_client_for_device_check(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Запросить email/UUID клиента для проверки устройств"""
+    await state.set_state(DeviceLimitStates.waiting_for_search)
+    await state.update_data(action="check")
+    await callback.message.edit_text(
+        "🔍 Введите <b>email</b> или <b>UUID</b> клиента для проверки подключённых устройств:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "devlim_edit_limit")
+@admin_only
+async def ask_client_for_limit_edit(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Запросить email/UUID клиента для изменения лимита"""
+    await state.set_state(DeviceLimitStates.waiting_for_search)
+    await state.update_data(action="edit")
+    await callback.message.edit_text(
+        "✏️ Введите <b>email</b> или <b>UUID</b> клиента для изменения лимита устройств:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(DeviceLimitStates.waiting_for_search)
+async def process_device_limit_search(message: Message, state: FSMContext, **kwargs):
+    """Обработка ввода email/UUID для проверки или изменения лимита"""
+    query = message.text.strip()
+    data = await state.get_data()
+    action = data.get("action", "check")
+
+    # Ищем клиента в БД
+    client = None
+    try:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT uuid, email, ip_limit, status, telegram_id FROM clients WHERE email = ? OR uuid = ?",
+                (query, query)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    client = dict(row)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка поиска: {e}")
+        await state.clear()
+        return
+
+    if not client:
+        await message.answer(
+            f"❌ Клиент не найден по запросу: <code>{query}</code>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    if action == "edit":
+        await state.set_state(DeviceLimitStates.waiting_for_new_limit)
+        await state.update_data(client_uuid=client['uuid'], client_email=client['email'])
+        await message.answer(
+            f"📱 Клиент: <code>{client['email']}</code>\n"
+            f"Текущий лимит: <b>{client['ip_limit']}</b> устройств\n\n"
+            f"Введите новый лимит (число от 1 до 10, или 0 для безлимитного):",
+            parse_mode="HTML"
+        )
+        return
+
+    # action == "check" — показываем текущие подключения
+    await state.clear()
+
+    from bot.services.device_monitor import get_client_ips_from_panel
+    from bot.api.remote_xui import load_servers_config
+
+    servers_config = load_servers_config()
+    servers = [s for s in servers_config.get('servers', [])
+               if s.get('enabled', True) and s.get('panel')]
+
+    text = f"📱 <b>Устройства клиента</b>\n\n"
+    text += f"Email: <code>{client['email']}</code>\n"
+    text += f"UUID: <code>{client['uuid']}</code>\n"
+    text += f"Лимит: <b>{client['ip_limit']}</b> устройств\n"
+    text += f"Статус: {client['status']}\n\n"
+
+    all_ips = set()
+    for server in servers:
+        # Ищем email клиента на этом сервере (может отличаться)
+        ips = await get_client_ips_from_panel(server, client['email'])
+        server_name = server.get('name', '?')
+        if ips:
+            all_ips.update(ips)
+            text += f"🖥 <b>{server_name}</b>: {', '.join(ips)}\n"
+        else:
+            text += f"🖥 {server_name}: нет подключений\n"
+
+    text += f"\n<b>Всего уникальных IP: {len(all_ips)}</b>"
+    if client['ip_limit'] > 0 and len(all_ips) > client['ip_limit']:
+        text += f" ⚠️ <b>ПРЕВЫШЕНИЕ</b> (лимит: {client['ip_limit']})"
+
+    from bot.services.device_monitor import get_blocked_clients
+    if client['uuid'] in get_blocked_clients():
+        text += "\n\n🚫 <b>Клиент сейчас заблокирован мониторингом</b>"
+
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(DeviceLimitStates.waiting_for_new_limit)
+async def process_new_device_limit(message: Message, state: FSMContext, **kwargs):
+    """Обработка нового лимита устройств"""
+    try:
+        new_limit = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите число от 0 до 10")
+        return
+
+    if new_limit < 0 or new_limit > 10:
+        await message.answer("❌ Лимит должен быть от 0 (безлимитный) до 10")
+        return
+
+    data = await state.get_data()
+    client_uuid = data.get('client_uuid')
+    client_email = data.get('client_email')
+
+    # Обновляем в БД
+    try:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE clients SET ip_limit = ? WHERE uuid = ?",
+                (new_limit, client_uuid)
+            )
+            # Также обновим в client_servers
+            await db.execute(
+                "UPDATE client_servers SET ip_limit = ? WHERE client_uuid = ?",
+                (new_limit, client_uuid)
+            )
+            await db.commit()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка обновления БД: {e}")
+        await state.clear()
+        return
+
+    # Если клиент был заблокирован и новый лимит больше — разблокируем
+    from bot.services.device_monitor import _blocked_clients
+    if client_uuid in _blocked_clients:
+        del _blocked_clients[client_uuid]
+
+    limit_text = "безлимитный" if new_limit == 0 else f"{new_limit} устройств"
+    await message.answer(
+        f"✅ Лимит для <code>{client_email}</code> изменён на <b>{limit_text}</b>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ==================== УПРАВЛЕНИЕ БРЕНДАМИ ====================
+
+class AddBrandStates(StatesGroup):
+    waiting_for_token = State()
+    waiting_for_domain = State()
+    waiting_for_name = State()
+    waiting_for_theme = State()
+    confirming = State()
+
+
+class AssignBrandManagerStates(StatesGroup):
+    waiting_for_manager_id = State()
+
+
+@router.message(F.text == "🏷 Бренды")
+@admin_only
+async def brand_menu(message: Message, db: DatabaseManager, brand_mgr=None, **kwargs):
+    """Меню управления брендами"""
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brands = await brand_mgr.list_brands()
+    from bot.utils.keyboards import Keyboards
+    await message.answer(
+        f"🏷 <b>Управление брендами</b>\n\n"
+        f"Всего брендов: {len(brands)}\n"
+        f"Активных: {sum(1 for b in brands if b.is_active)}",
+        reply_markup=Keyboards.brand_list_keyboard(brands)
+    )
+
+
+@router.callback_query(F.data == "brand_list")
+async def brand_list_callback(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Список брендов (callback)"""
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brands = await brand_mgr.list_brands()
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        f"🏷 <b>Управление брендами</b>\n\n"
+        f"Всего брендов: {len(brands)}\n"
+        f"Активных: {sum(1 for b in brands if b.is_active)}",
+        reply_markup=Keyboards.brand_list_keyboard(brands)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_view_"))
+async def brand_view(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Просмотр бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    if not brand:
+        await callback.answer("Бренд не найден", show_alert=True)
+        return
+
+    managers = await brand_mgr.get_brand_managers(brand_id)
+    status = "🟢 Активен" if brand.is_active else "🔴 Отключён"
+
+    # Проверяем запущен ли бот
+    import builtins
+    bot_manager = getattr(builtins, '_bot_manager', None)
+    bot_status = "▶️ Запущен" if (bot_manager and bot_manager.is_running(brand_id)) or brand_id == 1 else "⏹ Остановлен"
+
+    text = (
+        f"🏷 <b>{brand.name}</b>\n\n"
+        f"📌 ID: {brand.id}\n"
+        f"🌐 Домен: <code>{brand.domain}</code>\n"
+        f"🎨 Цвет: {brand.theme_color}\n"
+        f"📊 Статус: {status}\n"
+        f"🤖 Бот: {bot_status}\n"
+        f"👥 Менеджеров: {len(managers)}\n"
+    )
+
+    brand_servers = brand.get_allowed_servers()
+    if brand_servers:
+        text += f"🖥 Серверы: {', '.join(brand_servers)}\n"
+    else:
+        text += f"🖥 Серверы: все\n"
+
+    if brand.logo_url:
+        text += f"🖼 Лого: {brand.logo_url}\n"
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        text,
+        reply_markup=Keyboards.brand_actions_keyboard(brand_id, brand.is_active)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_servers_"))
+async def brand_servers_manage(callback: CallbackQuery, state: FSMContext, brand_mgr=None, **kwargs):
+    """Управление серверами бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    current_servers = brand.get_allowed_servers() or []
+
+    # Загружаем все серверы
+    from bot.api.remote_xui import load_servers_config
+    config = load_servers_config()
+    all_servers = [s.get('name', '') for s in config.get('servers', []) if s.get('name')]
+
+    buttons = []
+    for srv_name in all_servers:
+        selected = srv_name in current_servers
+        icon = "✅" if selected else "⬜"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {srv_name}",
+            callback_data=f"brand_srv_toggle_{brand_id}_{srv_name}"
+        )])
+    buttons.append([InlineKeyboardButton(text="☑️ Все серверы", callback_data=f"brand_srv_all_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"brand_srv_save_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"brand_view_{brand_id}")])
+
+    await state.update_data(brand_servers=current_servers)
+    await callback.message.edit_text(
+        f"🖥 <b>Серверы бренда «{brand.name}»</b>\n\n"
+        f"Выберите серверы, доступные для этого бренда.\n"
+        f"Если ни один не выбран — доступны все.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_srv_toggle_"))
+async def brand_srv_toggle(callback: CallbackQuery, state: FSMContext, brand_mgr=None, **kwargs):
+    """Переключить сервер для бренда"""
+    parts = callback.data.replace("brand_srv_toggle_", "").split("_", 1)
+    brand_id = int(parts[0])
+    srv_name = parts[1]
+
+    data = await state.get_data()
+    servers = data.get('brand_servers', [])
+
+    if srv_name in servers:
+        servers.remove(srv_name)
+    else:
+        servers.append(srv_name)
+    await state.update_data(brand_servers=servers)
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+
+    from bot.api.remote_xui import load_servers_config
+    config = load_servers_config()
+    all_servers = [s.get('name', '') for s in config.get('servers', []) if s.get('name')]
+
+    buttons = []
+    for name in all_servers:
+        selected = name in servers
+        icon = "✅" if selected else "⬜"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {name}",
+            callback_data=f"brand_srv_toggle_{brand_id}_{name}"
+        )])
+    buttons.append([InlineKeyboardButton(text="☑️ Все серверы", callback_data=f"brand_srv_all_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"brand_srv_save_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"brand_view_{brand_id}")])
+
+    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_srv_all_"))
+async def brand_srv_select_all(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Выбрать все серверы (= без ограничений)"""
+    brand_id = int(callback.data.split("_")[-1])
+    await state.update_data(brand_servers=[])
+    await callback.answer("Все серверы выбраны (без ограничений)")
+    # Trigger re-render
+    callback.data = f"brand_servers_{brand_id}"
+    await brand_servers_manage(callback, state, **kwargs)
+
+
+@router.callback_query(F.data.startswith("brand_srv_save_"))
+async def brand_srv_save(callback: CallbackQuery, state: FSMContext, brand_mgr=None, **kwargs):
+    """Сохранить серверы бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    servers = data.get('brand_servers', [])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    # Пустой список = все серверы (NULL)
+    await brand_mgr.set_brand_servers(brand_id, servers if servers else None)
+    await state.clear()
+
+    brand = await brand_mgr.get_brand(brand_id)
+    if servers:
+        await callback.answer(f"Сохранено: {', '.join(servers)}")
+    else:
+        await callback.answer("Сохранено: все серверы")
+
+    # Вернуться к карточке бренда
+    callback.data = f"brand_view_{brand_id}"
+    await brand_view(callback, brand_mgr=brand_mgr, **kwargs)
+
+
+@router.callback_query(F.data == "brand_add")
+async def brand_add_start(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Начало добавления бренда"""
+    await callback.message.edit_text(
+        "🏷 <b>Добавление нового бренда</b>\n\n"
+        "Шаг 1/4: Отправьте <b>токен Telegram бота</b>\n\n"
+        "Получить токен можно у @BotFather"
+    )
+    await state.set_state(AddBrandStates.waiting_for_token)
+    await callback.answer()
+
+
+@router.message(AddBrandStates.waiting_for_token)
+async def brand_add_token(message: Message, state: FSMContext, **kwargs):
+    """Получение токена бота"""
+    token = message.text.strip()
+
+    # Проверка формата токена
+    if ':' not in token or len(token) < 30:
+        await message.answer("❌ Неверный формат токена. Отправьте токен от @BotFather:")
+        return
+
+    # Проверяем что токен рабочий
+    from aiogram import Bot
+    try:
+        test_bot = Bot(token=token)
+        bot_info = await test_bot.get_me()
+        await test_bot.session.close()
+    except Exception as e:
+        await message.answer(f"❌ Токен не валидный: {e}\n\nОтправьте корректный токен:")
+        return
+
+    await state.update_data(bot_token=token, bot_username=bot_info.username, bot_name=bot_info.first_name)
+    await message.answer(
+        f"✅ Бот найден: @{bot_info.username} ({bot_info.first_name})\n\n"
+        f"Шаг 2/4: Отправьте <b>домен</b> для подписок\n"
+        f"Например: <code>kobra.peakvip.ru</code>\n\n"
+        f"⚠️ DNS должен быть уже настроен (A-запись → IP этого сервера)"
+    )
+    await state.set_state(AddBrandStates.waiting_for_domain)
+
+
+@router.message(AddBrandStates.waiting_for_domain)
+async def brand_add_domain(message: Message, state: FSMContext, **kwargs):
+    """Получение домена"""
+    domain = message.text.strip().lower()
+
+    # Валидация
+    if ' ' in domain or '/' in domain or not '.' in domain:
+        await message.answer("❌ Неверный формат домена. Пример: <code>kobra.peakvip.ru</code>")
+        return
+
+    # Проверяем что домен не занят
+    from bot.database.brand_manager import BrandManager
+    from bot.config import DATABASE_PATH
+    brand_mgr = BrandManager(DATABASE_PATH)
+    existing = await brand_mgr.get_brand_by_domain(domain)
+    if existing:
+        await message.answer(f"❌ Домен {domain} уже используется брендом '{existing.name}'")
+        return
+
+    await state.update_data(domain=domain)
+    await message.answer(
+        f"✅ Домен: <code>{domain}</code>\n\n"
+        f"Шаг 3/4: Отправьте <b>название бренда</b>\n"
+        f"Например: <code>KOBRA</code>"
+    )
+    await state.set_state(AddBrandStates.waiting_for_name)
+
+
+@router.message(AddBrandStates.waiting_for_name)
+async def brand_add_name(message: Message, state: FSMContext, **kwargs):
+    """Получение названия бренда"""
+    name = message.text.strip()
+    if len(name) > 50:
+        await message.answer("❌ Название слишком длинное (макс 50 символов)")
+        return
+
+    await state.update_data(name=name)
+
+    from bot.utils.keyboards import Keyboards
+    await message.answer(
+        f"✅ Бренд: <b>{name}</b>\n\n"
+        f"Шаг 4/4: Отправьте <b>цвет темы</b> (HEX)\n"
+        f"Например: <code>#FF6600</code>\n\n"
+        f"Или нажмите «Пропустить» для стандартного цвета",
+        reply_markup=Keyboards.brand_skip_theme()
+    )
+    await state.set_state(AddBrandStates.waiting_for_theme)
+
+
+@router.callback_query(F.data == "brand_skip_theme", AddBrandStates.waiting_for_theme)
+async def brand_skip_theme(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Пропустить выбор темы"""
+    await state.update_data(theme_color='#007bff')
+    await _show_brand_confirm(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@router.message(AddBrandStates.waiting_for_theme)
+async def brand_add_theme(message: Message, state: FSMContext, **kwargs):
+    """Получение цвета темы"""
+    color = message.text.strip()
+    if not color.startswith('#') or len(color) != 7:
+        color = '#007bff'
+
+    await state.update_data(theme_color=color)
+    await _show_brand_confirm(message, state)
+
+
+async def _show_brand_confirm(message, state, edit=False):
+    """Показать подтверждение создания бренда"""
+    data = await state.get_data()
+    from bot.utils.keyboards import Keyboards
+
+    text = (
+        f"🏷 <b>Подтверждение создания бренда</b>\n\n"
+        f"📛 Название: <b>{data['name']}</b>\n"
+        f"🤖 Бот: @{data['bot_username']}\n"
+        f"🌐 Домен: <code>{data['domain']}</code>\n"
+        f"🎨 Цвет: {data['theme_color']}\n\n"
+        f"⚠️ После подтверждения:\n"
+        f"1. Будет получен SSL-сертификат\n"
+        f"2. Настроен nginx\n"
+        f"3. Бот будет запущен"
+    )
+
+    kb = Keyboards.brand_confirm_create(data)
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+    await state.set_state(AddBrandStates.confirming)
+
+
+@router.callback_query(F.data == "brand_confirm_create", AddBrandStates.confirming)
+async def brand_confirm_create(callback: CallbackQuery, state: FSMContext, brand_mgr=None, **kwargs):
+    """Подтверждение и создание бренда"""
+    data = await state.get_data()
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    await callback.message.edit_text("⏳ Создаю бренд и настраиваю домен...")
+
+    # 1. Создаём бренд в БД
+    brand_id = await brand_mgr.create_brand(
+        name=data['name'],
+        bot_token=data['bot_token'],
+        domain=data['domain'],
+        theme_color=data.get('theme_color', '#007bff'),
+        admin_id=callback.from_user.id
+    )
+
+    if not brand_id:
+        await callback.message.edit_text("❌ Ошибка создания бренда (токен или домен уже используется)")
+        await state.clear()
+        await callback.answer()
+        return
+
+    # 2. Настраиваем SSL + nginx
+    from bot.utils.ssl_manager import setup_brand_domain
+    from bot.config import WEBAPP_PORT
+    ssl_ok, ssl_msg = await setup_brand_domain(data['domain'], port=WEBAPP_PORT, db_path=DATABASE_PATH)
+
+    # 3. Запускаем бота
+    import builtins
+    bot_manager = getattr(builtins, '_bot_manager', None)
+    bot_started = False
+    if bot_manager:
+        brand = await brand_mgr.get_brand(brand_id)
+        bot_started = await bot_manager.start_brand_bot(brand)
+
+    status_parts = [f"✅ Бренд <b>{data['name']}</b> создан (ID: {brand_id})"]
+
+    if ssl_ok:
+        status_parts.append(f"✅ SSL + nginx настроены для {data['domain']}")
+    else:
+        status_parts.append(f"⚠️ SSL/nginx: {ssl_msg}")
+
+    if bot_started:
+        status_parts.append(f"✅ Бот @{data['bot_username']} запущен")
+    else:
+        status_parts.append(f"⚠️ Бот не запущен (запустится при перезагрузке)")
+
+    await callback.message.edit_text("\n".join(status_parts))
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(F.data == "brand_cancel_create")
+async def brand_cancel_create(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Отмена создания бренда"""
+    await state.clear()
+    await callback.message.edit_text("❌ Создание бренда отменено")
+    await callback.answer()
+
+
+
+
+class EditBrandStates(StatesGroup):
+    waiting_for_field_value = State()
+
+
+@router.callback_query(F.data.startswith("brand_edit_"))
+async def brand_edit_menu(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Меню редактирования бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    if not brand:
+        await callback.answer("Бренд не найден", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"📛 Название: {brand.name}", callback_data=f"brand_set_name_{brand_id}")],
+        [InlineKeyboardButton(text=f"🌐 Домен: {brand.domain}", callback_data=f"brand_set_domain_{brand_id}")],
+        [InlineKeyboardButton(text=f"🎨 Цвет: {brand.theme_color}", callback_data=f"brand_set_color_{brand_id}")],
+        [InlineKeyboardButton(text=f"🖼 Лого: {brand.logo_url or 'не задан'}", callback_data=f"brand_set_logo_{brand_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"brand_view_{brand_id}")]
+    ]
+
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование бренда «{brand.name}»</b>\n\n"
+        f"Выберите что изменить:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"brand_set_(name|domain|color|logo)_(\d+)"))
+async def brand_edit_field(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Начало редактирования поля бренда"""
+    parts = callback.data.replace("brand_set_", "").rsplit("_", 1)
+    field = parts[0]
+    brand_id = int(parts[1])
+
+    field_labels = {
+        "name": ("📛 Название", "Отправьте новое название бренда:"),
+        "domain": ("🌐 Домен", "Отправьте новый домен (например: kobra.peakvip.ru):"),
+        "color": ("🎨 Цвет", "Отправьте HEX цвет (например: #FF6600):"),
+        "logo": ("🖼 Лого", "Отправьте <b>изображение</b> (файл/фото) или URL логотипа:")
+    }
+
+    label, prompt = field_labels.get(field, ("", "Введите значение:"))
+
+    await state.update_data(edit_brand_id=brand_id, edit_brand_field=field)
+    await state.set_state(EditBrandStates.waiting_for_field_value)
+    await callback.message.edit_text(f"{label}\n\n{prompt}")
+    await callback.answer()
+
+
+@router.message(EditBrandStates.waiting_for_field_value, F.photo)
+async def brand_edit_save_photo(message: Message, state: FSMContext, bot, brand_mgr=None, **kwargs):
+    """Сохранение лого бренда из загруженного фото"""
+    data = await state.get_data()
+    brand_id = data['edit_brand_id']
+    field = data['edit_brand_field']
+
+    if field != 'logo':
+        await message.answer("❌ Для этого поля нужно отправить текст, не фото")
+        return
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    # Скачиваем фото
+    import uuid as _uuid
+    photo = message.photo[-1]  # Наибольшее разрешение
+    file = await bot.get_file(photo.file_id)
+    ext = 'jpg'
+    filename = f"brand_{brand_id}_logo_{_uuid.uuid4().hex[:8]}.{ext}"
+    static_dir = Path(__file__).parent.parent / 'webapp' / 'static'
+    save_path = static_dir / filename
+
+    await bot.download_file(file.file_path, save_path)
+
+    logo_url = f"/static/{filename}"
+    ok = await brand_mgr.update_brand(brand_id, logo_url=logo_url)
+    if ok:
+        brand = await brand_mgr.get_brand(brand_id)
+        await message.answer(
+            f"✅ Лого бренда <b>{brand.name}</b> обновлено\n"
+            f"Путь: <code>{logo_url}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Ошибка сохранения")
+
+    await state.clear()
+
+
+@router.message(EditBrandStates.waiting_for_field_value, F.document)
+async def brand_edit_save_document(message: Message, state: FSMContext, bot, brand_mgr=None, **kwargs):
+    """Сохранение лого бренда из загруженного документа"""
+    data = await state.get_data()
+    brand_id = data['edit_brand_id']
+    field = data['edit_brand_field']
+
+    if field != 'logo':
+        await message.answer("❌ Для этого поля нужно отправить текст, не файл")
+        return
+
+    doc = message.document
+    if not doc.mime_type or not doc.mime_type.startswith('image/'):
+        await message.answer("❌ Отправьте изображение (PNG, JPG, SVG)")
+        return
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    import uuid as _uuid
+    ext = doc.file_name.rsplit('.', 1)[-1] if '.' in doc.file_name else 'png'
+    filename = f"brand_{brand_id}_logo_{_uuid.uuid4().hex[:8]}.{ext}"
+    static_dir = Path(__file__).parent.parent / 'webapp' / 'static'
+    save_path = static_dir / filename
+
+    file = await bot.get_file(doc.file_id)
+    await bot.download_file(file.file_path, save_path)
+
+    logo_url = f"/static/{filename}"
+    ok = await brand_mgr.update_brand(brand_id, logo_url=logo_url)
+    if ok:
+        brand = await brand_mgr.get_brand(brand_id)
+        await message.answer(
+            f"✅ Лого бренда <b>{brand.name}</b> обновлено\n"
+            f"Путь: <code>{logo_url}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Ошибка сохранения")
+
+    await state.clear()
+
+
+@router.message(EditBrandStates.waiting_for_field_value)
+async def brand_edit_save(message: Message, state: FSMContext, brand_mgr=None, **kwargs):
+    """Сохранение изменённого поля бренда (текст)"""
+    data = await state.get_data()
+    brand_id = data['edit_brand_id']
+    field = data['edit_brand_field']
+    value = message.text.strip() if message.text else ''
+
+    if not value:
+        await message.answer("❌ Отправьте текстовое значение")
+        return
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    field_map = {"name": "name", "domain": "domain", "color": "theme_color", "logo": "logo_url"}
+    db_field = field_map.get(field)
+
+    if not db_field:
+        await message.answer("❌ Неизвестное поле")
+        await state.clear()
+        return
+
+    ok = await brand_mgr.update_brand(brand_id, **{db_field: value})
+    if ok:
+        await message.answer(f"✅ {field} обновлён на: <b>{value}</b>")
+    else:
+        await message.answer("❌ Ошибка обновления")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("brand_toggle_"))
+async def brand_toggle(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Включить/отключить бренд"""
+    brand_id = int(callback.data.split("_")[-1])
+
+    if brand_id == 1:
+        await callback.answer("Нельзя отключить основной бренд", show_alert=True)
+        return
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    new_status = await brand_mgr.toggle_brand(brand_id)
+    if new_status is None:
+        await callback.answer("Бренд не найден", show_alert=True)
+        return
+
+    import builtins
+    bot_manager = getattr(builtins, '_bot_manager', None)
+
+    if new_status:
+        # Активирован — запускаем бота
+        if bot_manager:
+            brand = await brand_mgr.get_brand(brand_id)
+            await bot_manager.start_brand_bot(brand)
+        await callback.answer("✅ Бренд активирован и бот запущен")
+    else:
+        # Деактивирован — останавливаем бота
+        if bot_manager:
+            await bot_manager.stop_brand_bot(brand_id)
+        await callback.answer("🔴 Бренд отключён и бот остановлен")
+
+    # Обновляем карточку
+    brand = await brand_mgr.get_brand(brand_id)
+    managers = await brand_mgr.get_brand_managers(brand_id)
+    status = "🟢 Активен" if brand.is_active else "🔴 Отключён"
+    bot_status = "▶️ Запущен" if (bot_manager and bot_manager.is_running(brand_id)) else "⏹ Остановлен"
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        f"🏷 <b>{brand.name}</b>\n\n"
+        f"📌 ID: {brand.id}\n"
+        f"🌐 Домен: <code>{brand.domain}</code>\n"
+        f"📊 Статус: {status}\n"
+        f"🤖 Бот: {bot_status}\n"
+        f"👥 Менеджеров: {len(managers)}",
+        reply_markup=Keyboards.brand_actions_keyboard(brand_id, brand.is_active)
+    )
+
+
+@router.callback_query(F.data.startswith("brand_delete_"))
+async def brand_delete_ask(callback: CallbackQuery, **kwargs):
+    """Подтверждение удаления бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+
+    if brand_id == 1:
+        await callback.answer("Нельзя удалить основной бренд", show_alert=True)
+        return
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        "⚠️ <b>Вы уверены?</b>\n\n"
+        "Будет удалён бренд, все назначения менеджеров, "
+        "бот будет остановлен.\n\n"
+        "Клиенты и ключи останутся в базе.",
+        reply_markup=Keyboards.brand_confirm_delete(brand_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_confirm_del_"))
+async def brand_confirm_delete(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Удаление бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    if not brand:
+        await callback.answer("Бренд не найден", show_alert=True)
+        return
+
+    # Останавливаем бота
+    import builtins
+    bot_manager = getattr(builtins, '_bot_manager', None)
+    if bot_manager:
+        await bot_manager.stop_brand_bot(brand_id)
+
+    # Удаляем nginx конфиг
+    from bot.utils.ssl_manager import remove_brand_domain
+    await remove_brand_domain(brand.domain, db_path=DATABASE_PATH)
+
+    # Удаляем из БД
+    await brand_mgr.delete_brand(brand_id)
+
+    await callback.message.edit_text(f"✅ Бренд <b>{brand.name}</b> удалён")
+    await callback.answer()
+
+
+# ==================== МЕНЕДЖЕРЫ БРЕНДОВ ====================
+
+@router.callback_query(F.data.startswith("brand_managers_"))
+async def brand_managers_list(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Список менеджеров бренда"""
+    brand_id = int(callback.data.split("_")[-1])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    managers = await brand_mgr.get_brand_managers(brand_id)
+
+    # Получаем информацию о лимитах
+    for mgr in managers:
+        limit_info = await brand_mgr.get_manager_key_limit(mgr['manager_id'], brand_id)
+        count = await brand_mgr.get_manager_keys_count(mgr['manager_id'], brand_id)
+        mgr['key_limit'] = limit_info['limit']
+        mgr['is_verified'] = limit_info['verified']
+        mgr['keys_count'] = count
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        f"👥 <b>Менеджеры бренда «{brand.name}»</b>\n\n"
+        f"Назначено: {len(managers)}",
+        reply_markup=Keyboards.brand_managers_keyboard(brand_id, managers)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_add_mgr_"))
+async def brand_add_manager_start(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Начало добавления менеджера в бренд"""
+    brand_id = int(callback.data.split("_")[-1])
+    await state.update_data(brand_id=brand_id)
+    await callback.message.edit_text(
+        "👤 <b>Добавление менеджера</b>\n\n"
+        "Отправьте <b>Telegram ID</b> менеджера:"
+    )
+    await state.set_state(AssignBrandManagerStates.waiting_for_manager_id)
+    await callback.answer()
+
+
+@router.message(AssignBrandManagerStates.waiting_for_manager_id)
+async def brand_add_manager_process(message: Message, state: FSMContext, db: DatabaseManager, brand_mgr=None, **kwargs):
+    """Обработка добавления менеджера в бренд"""
+    try:
+        manager_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Отправьте числовой Telegram ID")
+        return
+
+    data = await state.get_data()
+    brand_id = data['brand_id']
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    # Если менеджер не в системе — автоматически добавляем
+    if not await db.is_manager(manager_id):
+        await db.add_manager(
+            user_id=manager_id,
+            username=str(manager_id),
+            full_name=f"Manager {manager_id}",
+            added_by=message.from_user.id
+        )
+        logger.info(f"Менеджер {manager_id} автоматически добавлен в систему для бренда")
+
+    # Назначаем
+    ok = await brand_mgr.assign_manager(brand_id, manager_id)
+    if ok:
+        brand = await brand_mgr.get_brand(brand_id)
+        mgr_info = await db.get_manager(manager_id) if hasattr(db, 'get_manager') else None
+        mgr_name = str(manager_id)
+        if mgr_info:
+            mgr_name = mgr_info.get('custom_name') or mgr_info.get('full_name') or mgr_info.get('username', str(manager_id))
+
+        await message.answer(
+            f"✅ Менеджер <b>{mgr_name}</b> (ID: {manager_id}) "
+            f"назначен на бренд <b>{brand.name}</b>"
+        )
+    else:
+        await message.answer("❌ Ошибка назначения менеджера")
+
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("brand_rm_mgr_"))
+async def brand_remove_manager(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Убрать менеджера из бренда"""
+    parts = callback.data.split("_")
+    brand_id = int(parts[3])
+    manager_id = int(parts[4])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    await brand_mgr.remove_manager(brand_id, manager_id)
+    await callback.answer(f"✅ Менеджер {manager_id} убран из бренда")
+
+    # Обновляем список
+    brand = await brand_mgr.get_brand(brand_id)
+    managers = await brand_mgr.get_brand_managers(brand_id)
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        f"👥 <b>Менеджеры бренда «{brand.name}»</b>\n\n"
+        f"Назначено: {len(managers)}",
+        reply_markup=Keyboards.brand_managers_keyboard(brand_id, managers)
+    )
+
+
+
+
+class SetKeyLimitStates(StatesGroup):
+    waiting_for_limit = State()
+
+
+@router.callback_query(F.data.startswith("brand_mgr_info_"))
+async def brand_mgr_info(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Информация о менеджере бренда с опциями лимита"""
+    parts = callback.data.replace("brand_mgr_info_", "").split("_")
+    brand_id = int(parts[0])
+    manager_id = int(parts[1])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    brand = await brand_mgr.get_brand(brand_id)
+    limit_info = await brand_mgr.get_manager_key_limit(manager_id, brand_id)
+    count = await brand_mgr.get_manager_keys_count(manager_id, brand_id)
+
+    verified = "✅ Проверен" if limit_info['verified'] else "⏳ Не проверен"
+    limit_str = "безлимит" if limit_info['limit'] == 0 or limit_info['verified'] else str(limit_info['limit'])
+
+    buttons = []
+    if not limit_info['verified']:
+        buttons.append([InlineKeyboardButton(
+            text="✅ Подтвердить (безлимит)",
+            callback_data=f"brand_verify_mgr_{brand_id}_{manager_id}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="🔒 Снять подтверждение",
+            callback_data=f"brand_unverify_mgr_{brand_id}_{manager_id}"
+        )])
+    buttons.append([InlineKeyboardButton(
+        text=f"📝 Установить лимит ({limit_str})",
+        callback_data=f"brand_set_limit_{brand_id}_{manager_id}"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data=f"brand_managers_{brand_id}"
+    )])
+
+    await callback.message.edit_text(
+        f"👤 <b>Менеджер {manager_id}</b>\n"
+        f"🏷 Бренд: {brand.name}\n\n"
+        f"📊 Статус: {verified}\n"
+        f"🔑 Создано ключей: {count}\n"
+        f"📏 Лимит: {limit_str}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("brand_verify_mgr_"))
+async def brand_verify_manager(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Подтвердить менеджера — снять лимит"""
+    parts = callback.data.replace("brand_verify_mgr_", "").split("_")
+    brand_id = int(parts[0])
+    manager_id = int(parts[1])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    await brand_mgr.verify_manager(brand_id, manager_id, True)
+    await callback.answer("✅ Менеджер подтверждён — лимит снят")
+    # Обновить карточку
+    callback.data = f"brand_mgr_info_{brand_id}_{manager_id}"
+    await brand_mgr_info(callback, brand_mgr=brand_mgr, **kwargs)
+
+
+@router.callback_query(F.data.startswith("brand_unverify_mgr_"))
+async def brand_unverify_manager(callback: CallbackQuery, brand_mgr=None, **kwargs):
+    """Снять подтверждение менеджера — вернуть лимит"""
+    parts = callback.data.replace("brand_unverify_mgr_", "").split("_")
+    brand_id = int(parts[0])
+    manager_id = int(parts[1])
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    await brand_mgr.verify_manager(brand_id, manager_id, False)
+    await callback.answer("🔒 Подтверждение снято — лимит 5 ключей")
+    callback.data = f"brand_mgr_info_{brand_id}_{manager_id}"
+    await brand_mgr_info(callback, brand_mgr=brand_mgr, **kwargs)
+
+
+@router.callback_query(F.data.startswith("brand_set_limit_"))
+async def brand_set_limit_start(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Начать установку лимита"""
+    parts = callback.data.replace("brand_set_limit_", "").split("_")
+    brand_id = int(parts[0])
+    manager_id = int(parts[1])
+
+    await state.update_data(limit_brand_id=brand_id, limit_manager_id=manager_id)
+    await state.set_state(SetKeyLimitStates.waiting_for_limit)
+    await callback.message.edit_text(
+        "📏 <b>Установка лимита ключей</b>\n\n"
+        "Отправьте число:\n"
+        "• <b>0</b> = безлимит\n"
+        "• <b>5</b>, <b>10</b>, <b>50</b> и т.д. = конкретный лимит"
+    )
+    await callback.answer()
+
+
+@router.message(SetKeyLimitStates.waiting_for_limit)
+async def brand_set_limit_save(message: Message, state: FSMContext, brand_mgr=None, **kwargs):
+    """Сохранить лимит"""
+    try:
+        limit = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Отправьте число")
+        return
+
+    if limit < 0:
+        await message.answer("❌ Лимит не может быть отрицательным")
+        return
+
+    data = await state.get_data()
+    brand_id = data['limit_brand_id']
+    manager_id = data['limit_manager_id']
+
+    if not brand_mgr:
+        from bot.database.brand_manager import BrandManager
+        from bot.config import DATABASE_PATH
+        brand_mgr = BrandManager(DATABASE_PATH)
+
+    await brand_mgr.set_manager_key_limit(brand_id, manager_id, limit)
+    limit_str = "безлимит" if limit == 0 else str(limit)
+    await message.answer(f"✅ Лимит для менеджера {manager_id} установлен: <b>{limit_str}</b>")
+    await state.clear()
+
+@router.callback_query(F.data == "brand_back")
+async def brand_back_to_admin(callback: CallbackQuery, **kwargs):
+    """Вернуться в админ меню"""
+    from bot.utils.keyboards import Keyboards
+    await callback.message.delete()
+    await callback.message.answer("Панель администратора", reply_markup=Keyboards.admin_menu())
+    await callback.answer()

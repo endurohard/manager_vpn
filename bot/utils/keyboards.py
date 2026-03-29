@@ -48,10 +48,12 @@ class Keyboards:
             [KeyboardButton(text="📢 Отправить уведомление")],
             [KeyboardButton(text="🌐 Управление SNI")],
             [KeyboardButton(text="💳 Реквизиты"), KeyboardButton(text="📋 Веб-заказы")],
+            [KeyboardButton(text="📋 Управление подпиской")],
             [KeyboardButton(text="📡 Добавить сервер"), KeyboardButton(text="📡 Сервер → всем")],
             [KeyboardButton(text="🖥 Статус серверов"), KeyboardButton(text="🔧 Панели X-UI")],
-            [KeyboardButton(text="💳 Оплата серверов")],
+            [KeyboardButton(text="💳 Оплата серверов"), KeyboardButton(text="📱 Лимит устройств")],
             [KeyboardButton(text="🌐 Админ-панель сайта"), KeyboardButton(text="💾 Бэкап")],
+            [KeyboardButton(text="🏷 Бренды")],
             [KeyboardButton(text="Назад")]
         ]
         return ReplyKeyboardMarkup(
@@ -429,3 +431,95 @@ class Keyboards:
         buttons.append(action_buttons)
 
         return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def brand_list_keyboard(brands):
+        """Inline список брендов"""
+        buttons = []
+        for brand in brands:
+            status = "🟢" if brand.is_active else "🔴"
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{status} {brand.name} ({brand.domain})",
+                    callback_data=f"brand_view_{brand.id}"
+                )
+            ])
+        buttons.append([
+            InlineKeyboardButton(text="➕ Добавить бренд", callback_data="brand_add")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🔙 Назад", callback_data="brand_back")
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def brand_actions_keyboard(brand_id, is_active=True):
+        """Действия с брендом"""
+        toggle_text = "🔴 Отключить" if is_active else "🟢 Включить"
+        buttons = [
+            [InlineKeyboardButton(text="👥 Менеджеры", callback_data=f"brand_managers_{brand_id}"),
+             InlineKeyboardButton(text="🖥 Серверы", callback_data=f"brand_servers_{brand_id}")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"brand_edit_{brand_id}")],
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"brand_toggle_{brand_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"brand_delete_{brand_id}")],
+            [InlineKeyboardButton(text="🔙 К списку", callback_data="brand_list")]
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def brand_managers_keyboard(brand_id, managers):
+        """Список менеджеров бренда"""
+        buttons = []
+        for mgr in managers:
+            name = mgr.get("custom_name") or mgr.get("full_name") or mgr.get("username") or str(mgr["manager_id"])
+            # Показываем статус лимита
+            if mgr.get("is_verified"):
+                status = "✅"
+            else:
+                count = mgr.get("keys_count", 0)
+                limit = mgr.get("key_limit", 5)
+                status = f"🔑{count}/{limit}"
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"{status} {name}",
+                    callback_data=f"brand_mgr_info_{brand_id}_{mgr['manager_id']}"
+                ),
+                InlineKeyboardButton(
+                    text="❌",
+                    callback_data=f"brand_rm_mgr_{brand_id}_{mgr['manager_id']}"
+                )
+            ])
+        buttons.append([
+            InlineKeyboardButton(text="➕ Добавить менеджера", callback_data=f"brand_add_mgr_{brand_id}")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🔙 Назад", callback_data=f"brand_view_{brand_id}")
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
+    def brand_confirm_delete(brand_id):
+        """Подтверждение удаления бренда"""
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"brand_confirm_del_{brand_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"brand_view_{brand_id}")
+            ]
+        ])
+
+    @staticmethod
+    def brand_skip_theme():
+        """Пропустить настройку темы"""
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="brand_skip_theme")]
+        ])
+
+    @staticmethod
+    def brand_confirm_create(brand_data):
+        """Подтверждение создания бренда"""
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Создать", callback_data="brand_confirm_create"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="brand_cancel_create")
+            ]
+        ])

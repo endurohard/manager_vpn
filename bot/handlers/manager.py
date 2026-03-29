@@ -17,6 +17,48 @@ from bot.utils import Keyboards, validate_phone, format_phone, generate_user_id,
 from bot.handlers.common import is_authorized
 from bot.price_config import get_subscription_periods
 
+
+# Глобальный домен подписки (обновляется при инициализации)
+_sub_domain = 'zov-gor.ru'
+
+def set_sub_domain(domain: str):
+    """Установить домен подписки"""
+    global _sub_domain
+    _sub_domain = domain
+
+def _get_sub_domain(kwargs_dict=None):
+    """Получить домен подписки — из brand context если есть, иначе глобальный"""
+    if isinstance(kwargs_dict, dict):
+        brand = kwargs_dict.get('brand')
+        if brand and hasattr(brand, 'domain'):
+            return brand.domain
+    return _sub_domain
+
+
+def _filter_servers_by_brand(servers: list, brand=None) -> list:
+    """Фильтровать серверы по ограничениям бренда (читает из БД для актуальности)"""
+    if not brand:
+        return servers
+    brand_id = getattr(brand, 'brand_id', None)
+    if not brand_id or brand_id == 1:
+        return servers  # Основной бренд — все серверы
+    # Читаем актуальные ограничения из БД
+    try:
+        import sqlite3, json
+        from bot.config import DATABASE_PATH
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT allowed_servers FROM brands WHERE id = ?", (brand_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            allowed = json.loads(row[0])
+            return [s for s in servers if s.get('name', '') in allowed]
+    except Exception:
+        pass
+    return servers
+
+
 router = Router()
 
 
@@ -97,7 +139,7 @@ async def start_create_key(message: Message, state: FSMContext, db: DatabaseMana
 
 
 @router.message(CreateKeyStates.waiting_for_phone, F.text == "Сгенерировать ID")
-async def generate_user_identifier(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager):
+async def generate_user_identifier(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager, **kwargs):
     """Генерация случайного ID пользователя"""
     from bot.api.remote_xui import load_servers_config
 
@@ -107,6 +149,10 @@ async def generate_user_identifier(message: Message, state: FSMContext, xui_clie
     # Загружаем список серверов
     servers_config = load_servers_config()
     servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    try:
+        servers = _filter_servers_by_brand(servers, kwargs.get('brand'))
+    except NameError:
+        pass
     servers = await _get_allowed_servers(message.from_user.id, db, servers)
 
     if not servers:
@@ -146,7 +192,7 @@ async def cancel_key_creation(message: Message, state: FSMContext):
 
 
 @router.message(CreateKeyStates.waiting_for_phone)
-async def process_phone_input(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager):
+async def process_phone_input(message: Message, state: FSMContext, xui_client: XUIClient, db: DatabaseManager, **kwargs):
     """Обработка введенного ID/номера телефона"""
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
@@ -221,6 +267,10 @@ async def process_phone_input(message: Message, state: FSMContext, xui_client: X
     from bot.api.remote_xui import load_servers_config
     servers_config = load_servers_config()
     servers = [s for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+    try:
+        servers = _filter_servers_by_brand(servers, kwargs.get('brand'))
+    except NameError:
+        pass
     servers = await _get_allowed_servers(user_id, db, servers)
 
     if not servers:
@@ -615,7 +665,7 @@ async def process_custom_price_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("create_"))
 async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
-                             xui_client: XUIClient, bot):
+                             xui_client: XUIClient, bot, **kwargs):
     """Подтверждение и создание ключа"""
     user_id = callback.from_user.id
 
@@ -956,7 +1006,7 @@ async def confirm_create_key(callback: CallbackQuery, state: FSMContext, db: Dat
         )
 
         # Формируем ссылку подписки
-        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+        subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
 
         # Информация о серверах
         servers_info = ""
@@ -1270,7 +1320,7 @@ async def cancel_replacement_callback(callback: CallbackQuery, state: FSMContext
 
 @router.callback_query(F.data.startswith("replace_") & ~F.data.startswith("replace_period_"))
 async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: DatabaseManager,
-                               xui_client: XUIClient, bot):
+                               xui_client: XUIClient, bot, **kwargs):
     """Подтверждение и замена ключа - поиск в локальной базе, создание на удалённом сервере"""
     user_id = callback.from_user.id
     is_admin = user_id == ADMIN_ID
@@ -1465,7 +1515,7 @@ async def confirm_replace_key(callback: CallbackQuery, state: FSMContext, db: Da
         )
 
         # Формируем ссылку подписки
-        subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+        subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
 
         # Генерируем QR код для ссылки подписки
         try:
@@ -1766,7 +1816,7 @@ async def _execute_fix_key_search_all(message: Message, state: FSMContext, serve
     await _generate_fixed_link(message, state, target_server, client_info, uuid_part, original_fragment, is_admin)
 
 
-async def _execute_fix_key(message: Message, state: FSMContext, target_server: dict, uuid_part: str, original_fragment: str, is_admin: bool):
+async def _execute_fix_key(message: Message, state: FSMContext, target_server: dict, uuid_part: str, original_fragment: str, is_admin: bool, **kwargs):
     """Выполнение исправления ключа на ВЫБРАННОМ сервере (для админа)"""
     import urllib.parse
     from datetime import datetime, timedelta
@@ -1911,7 +1961,7 @@ async def _execute_fix_key(message: Message, state: FSMContext, target_server: d
     fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
 
     # Генерируем QR код для ссылки подписки (не для VLESS ключа)
-    subscription_url = f"https://zov-gor.ru/sub/{uuid_part}"
+    subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{uuid_part}"
     qr_code = generate_qr_code(subscription_url)
 
     # Формируем информацию об изменениях
@@ -1971,7 +2021,7 @@ async def _execute_fix_key(message: Message, state: FSMContext, target_server: d
     )
 
 
-async def _generate_fixed_link(message: Message, state: FSMContext, target_server: dict, client_info: dict, uuid_part: str, original_fragment: str, is_admin: bool):
+async def _generate_fixed_link(message: Message, state: FSMContext, target_server: dict, client_info: dict, uuid_part: str, original_fragment: str, is_admin: bool, **kwargs):
     """Генерация исправленной VLESS ссылки"""
     import urllib.parse
     from datetime import datetime
@@ -2035,7 +2085,7 @@ async def _generate_fixed_link(message: Message, state: FSMContext, target_serve
     fixed_link = f"vless://{uuid_part}@{target_domain}:{target_port}?{new_query}#{link_name}"
 
     # Генерируем QR код для ссылки подписки (не для VLESS ключа)
-    subscription_url = f"https://zov-gor.ru/sub/{uuid_part}"
+    subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{uuid_part}"
     qr_code = generate_qr_code(subscription_url)
 
     # Статус
@@ -2117,7 +2167,7 @@ async def cancel_search_client(message: Message, state: FSMContext):
 
 
 @router.message(SearchClientStates.waiting_for_query)
-async def process_search_client(message: Message, state: FSMContext, db: DatabaseManager):
+async def process_search_client(message: Message, state: FSMContext, db: DatabaseManager, **kwargs):
     """Обработка поиска клиента менеджером"""
     user_id = message.from_user.id
     is_admin = user_id == ADMIN_ID
@@ -2158,7 +2208,7 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
                 client_email = r.get('client_email', 'N/A')
                 server_name = r.get('server_name', '')
                 if client_uuid:
-                    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+                    subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
                     try:
                         qr_code = generate_qr_code(subscription_url)
                         await status_msg.delete()
@@ -2234,7 +2284,7 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
         created_at = key['created_at'][:16].replace('T', ' ')
 
         if client_uuid:
-            subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+            subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
             try:
                 qr_code = generate_qr_code(subscription_url)
                 await status_msg.delete()
@@ -2314,7 +2364,7 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
 
 
 @router.callback_query(F.data.startswith("mgr_sub_"))
-async def show_client_subscription(callback: CallbackQuery, db: DatabaseManager):
+async def show_client_subscription(callback: CallbackQuery, db: DatabaseManager, **kwargs):
     """Показать подписку и QR код клиента"""
     user_id = callback.from_user.id
     if not await is_authorized(user_id, db):
@@ -2322,7 +2372,7 @@ async def show_client_subscription(callback: CallbackQuery, db: DatabaseManager)
         return
 
     client_uuid = callback.data.replace("mgr_sub_", "")
-    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
 
     try:
         qr_code = generate_qr_code(subscription_url)
@@ -2685,7 +2735,7 @@ async def mgr_cancel_manage_sub(message: Message, state: FSMContext):
 
 
 @router.message(MgrAddServerStates.waiting_for_search)
-async def mgr_process_sub_search(message: Message, state: FSMContext, db: DatabaseManager):
+async def mgr_process_sub_search(message: Message, state: FSMContext, db: DatabaseManager, **kwargs):
     """Поиск клиента для управления подпиской"""
     from bot.handlers.admin import search_clients_on_servers
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -2789,7 +2839,7 @@ async def mgr_process_sub_search(message: Message, state: FSMContext, db: Databa
         else:
             expiry_str = "Безлимит"
 
-        sub_url = f"https://zov-gor.ru/sub/{client['uuid']}"
+        sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client['uuid']}"
 
         text += f"{idx + 1}. <b>{email}</b>\n"
         text += f"   🖥 Серверы: {servers_str}\n"
@@ -2807,7 +2857,7 @@ async def mgr_process_sub_search(message: Message, state: FSMContext, db: Databa
 
 
 @router.callback_query(F.data.startswith("mgrsub_sel_"))
-async def mgr_select_client_for_sub(callback: CallbackQuery, state: FSMContext, db: DatabaseManager):
+async def mgr_select_client_for_sub(callback: CallbackQuery, state: FSMContext, db: DatabaseManager, **kwargs):
     """Менеджер: выбор клиента — показ серверов и действий"""
     from bot.api.remote_xui import find_client_presence_on_all_servers, load_servers_config
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -2871,7 +2921,7 @@ async def mgr_select_client_for_sub(callback: CallbackQuery, state: FSMContext, 
     )
 
     # Формируем текст
-    sub_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
     text = f"📡 <b>Клиент:</b> <code>{email}</code>\n"
     text += f"📱 Подписка: <code>{sub_url}</code>\n\n"
 
@@ -2936,7 +2986,7 @@ async def mgr_select_client_for_sub(callback: CallbackQuery, state: FSMContext, 
 
 
 @router.callback_query(F.data.startswith("mgrsub_qr_"))
-async def mgr_show_sub_qr(callback: CallbackQuery, db: DatabaseManager):
+async def mgr_show_sub_qr(callback: CallbackQuery, db: DatabaseManager, **kwargs):
     """Показать QR код подписки"""
     user_id = callback.from_user.id
     if not await is_authorized(user_id, db):
@@ -2944,7 +2994,7 @@ async def mgr_show_sub_qr(callback: CallbackQuery, db: DatabaseManager):
         return
 
     client_uuid = callback.data[len("mgrsub_qr_"):]
-    subscription_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    subscription_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
 
     try:
         qr_code = generate_qr_code(subscription_url)
@@ -3206,7 +3256,7 @@ async def mgr_traffic_choice(callback: CallbackQuery, state: FSMContext):
     await _mgr_execute_add(callback, state, data, selected_servers)
 
 
-async def _mgr_execute_add(callback: CallbackQuery, state: FSMContext, data: dict, selected_servers: list):
+async def _mgr_execute_add(callback: CallbackQuery, state: FSMContext, data: dict, selected_servers: list, **kwargs):
     """Выполнить добавление клиента на серверы"""
     from bot.api.remote_xui import create_client_via_panel
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -3246,7 +3296,7 @@ async def _mgr_execute_add(callback: CallbackQuery, state: FSMContext, data: dic
 
     await state.clear()
 
-    sub_url = f"https://zov-gor.ru/sub/{client_uuid}"
+    sub_url = f"https://{_get_sub_domain(kwargs)}/sub/{client_uuid}"
     text = "📡 <b>Результат:</b>\n\n"
     for r in results:
         if r.get('success'):
