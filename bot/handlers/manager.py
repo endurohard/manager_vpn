@@ -117,7 +117,7 @@ class MgrAddServerStates(StatesGroup):
 
 
 @router.message(F.text == "Создать ключ")
-async def start_create_key(message: Message, state: FSMContext, db: DatabaseManager):
+async def start_create_key(message: Message, state: FSMContext, db: DatabaseManager, **kwargs):
     """Начало процесса создания ключа"""
     user_id = message.from_user.id
 
@@ -125,6 +125,37 @@ async def start_create_key(message: Message, state: FSMContext, db: DatabaseMana
     if not await is_authorized(user_id, db):
         await message.answer("У вас нет доступа к этой функции.")
         return
+
+    # Проверка лимита создания ключей (только для не-админов)
+    if user_id != ADMIN_ID:
+        limit_info = await db.get_manager_key_limit_info(user_id)
+        limit = limit_info.get('limit', 0)
+        count = limit_info.get('keys_since_reset', 0)
+        if limit > 0 and count >= limit:
+            await message.answer(
+                "⚠️ <b>Лимит создания ключей исчерпан!</b>\n\n"
+                "Необходимо погасить задолженность для продолжения работы.",
+                parse_mode="HTML"
+            )
+            try:
+                bot = kwargs.get('bot')
+                mgr = await db.get_manager(user_id)
+                display_name = (
+                    (mgr.get('custom_name') or mgr.get('full_name') or
+                     mgr.get('username') or str(user_id)) if mgr else str(user_id)
+                )
+                if bot:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ <b>Менеджер достиг лимита ключей!</b>\n\n"
+                        f"👤 {display_name} (ID: <code>{user_id}</code>)\n"
+                        f"🔑 Создано ключей: <b>{count}/{limit}</b>\n\n"
+                        f"Сброс: Список менеджеров → менеджер → 🔓 Сброс",
+                        parse_mode="HTML"
+                    )
+            except Exception:
+                pass
+            return
 
     await state.set_state(CreateKeyStates.waiting_for_phone)
     await message.answer(
@@ -2264,15 +2295,17 @@ async def process_search_client(message: Message, state: FSMContext, db: Databas
                 await message.answer("Главное меню:", reply_markup=Keyboards.main_menu(is_admin))
                 return
 
+        search_buttons = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Повторить поиск", callback_data="search_retry")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="search_to_menu")]
+        ])
         await status_msg.edit_text(
             f"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n"
-            "Попробуйте другой запрос или нажмите 'Отмена' для выхода.",
-            parse_mode="HTML"
+            "Попробуйте другой запрос.",
+            parse_mode="HTML",
+            reply_markup=search_buttons
         )
         return
-
-    await state.clear()
-
     # Если один результат — сразу показываем подписку с QR
     if len(keys) == 1:
         key = keys[0]
@@ -3318,6 +3351,60 @@ async def _mgr_execute_add(callback: CallbackQuery, state: FSMContext, data: dic
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "search_retry")
+async def search_retry_callback(callback: CallbackQuery, state: FSMContext):
+    """Повторный поиск клиента"""
+    await state.clear()
+    await state.set_state(SearchClientStates.waiting_for_query)
+    await callback.message.edit_text(
+        "🔍 <b>ПОИСК КЛИЕНТА</b>\n\n"
+        "Введите номер телефона или имя клиента для поиска.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "search_to_menu")
+async def search_to_menu_callback(callback: CallbackQuery, state: FSMContext):
+    """Возврат в меню из поиска"""
+    is_admin = callback.from_user.id == ADMIN_ID
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer(
+        "Главное меню:",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "search_retry")
+async def search_retry_callback(callback: CallbackQuery, state: FSMContext):
+    """Повторный поиск клиента"""
+    await state.clear()
+    await state.set_state(SearchClientStates.waiting_for_query)
+    await callback.message.edit_text(
+        "🔍 <b>ПОИСК КЛИЕНТА</b>\n\n"
+        "Введите номер телефона или имя клиента для поиска.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "search_to_menu")
+async def search_to_menu_callback(callback: CallbackQuery, state: FSMContext):
+    """Возврат в меню из поиска"""
+    is_admin = callback.from_user.id == ADMIN_ID
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer(
+        "Главное меню:",
+        reply_markup=Keyboards.main_menu(is_admin)
+    )
     await callback.answer()
 
 

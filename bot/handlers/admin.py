@@ -970,7 +970,7 @@ async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
 
     import json as _json
     text = "👥 <b>СПИСОК МЕНЕДЖЕРОВ</b>\n\n"
-    text += "✏️ - изменить имя | 🖥 - настроить серверы\n\n"
+    text += "✏️ - изменить имя | 🖥 - настроить серверы | 📏 - лимит ключей\n\n"
 
     buttons = []
 
@@ -1012,7 +1012,18 @@ async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
         else:
             text += f"   🖥 Серверы: все\n"
 
-        # Кнопки редактирования
+        # Показываем лимит ключей
+        limit_info = await db.get_manager_key_limit_info(manager['user_id'])
+        mgr_limit = limit_info.get('limit', 0)
+        mgr_count = limit_info.get('keys_since_reset', 0)
+        if mgr_limit == 0:
+            limit_str = "нет"
+        else:
+            limit_str = f"{mgr_count}/{mgr_limit}"
+        if mgr_limit > 0:
+            text += f"   📏 Лимит ключей: {mgr_count}/{mgr_limit}\n"
+
+        # Кнопки редактирования (имя + серверы)
         buttons.append([
             InlineKeyboardButton(
                 text=f"✏️ {display_name[:20]}",
@@ -1021,6 +1032,17 @@ async def show_managers_list(message: Message, db: DatabaseManager, **kwargs):
             InlineKeyboardButton(
                 text=f"🖥 Серверы",
                 callback_data=f"edit_mgr_servers_{manager['user_id']}"
+            )
+        ])
+        # Кнопки лимита ключей
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📏 Лимит ({limit_str})",
+                callback_data=f"mgr_setlimit_{manager['user_id']}"
+            ),
+            InlineKeyboardButton(
+                text=f"🔓 Сброс",
+                callback_data=f"mgr_resetlimit_{manager['user_id']}"
             )
         ])
         text += "\n"
@@ -2669,16 +2691,17 @@ async def cancel_sni_management(callback: CallbackQuery, state: FSMContext):
 # ===== ПОИСК КЛЮЧЕЙ =====
 
 async def search_clients_on_servers(query: str) -> list:
-    """Поиск клиентов по email/имени на всех X-UI серверах"""
+    """Поиск клиентов по email/имени на всех X-UI серверах (параллельно)"""
     import json
     import subprocess
+    import asyncio
     from pathlib import Path
     from datetime import datetime
+    from concurrent.futures import ThreadPoolExecutor
 
     results = []
     query_lower = query.lower()
 
-    # Загружаем конфиг серверов
     servers_file = Path(__file__).parent.parent.parent / 'servers_config.json'
     if not servers_file.exists():
         return results
@@ -2686,14 +2709,13 @@ async def search_clients_on_servers(query: str) -> list:
     with open(servers_file, 'r') as f:
         config = json.load(f)
 
-    # Определяем имя локального сервера из конфига
     local_server_name = 'Local'
     for server in config.get('servers', []):
         if server.get('local', False):
             local_server_name = server.get('name', 'Local')
             break
 
-    # Поиск на локальном сервере
+    # Поиск на локальном сервере (быстро, из SQLite)
     try:
         import sqlite3
         conn = sqlite3.connect('/etc/x-ui/x-ui.db')
@@ -2709,19 +2731,11 @@ async def search_clients_on_servers(query: str) -> list:
                     email = client.get('email', '')
                     if query_lower in email.lower():
                         expiry_time = client.get('expiryTime', 0)
-                        if expiry_time > 0:
-                            expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
-                            expiry_str = expiry_dt.strftime("%d.%m.%Y")
-                        else:
-                            expiry_str = "Безлимит"
-
+                        expiry_str = datetime.fromtimestamp(expiry_time / 1000).strftime("%d.%m.%Y") if expiry_time > 0 else "Безлимит"
                         results.append({
-                            'email': email,
-                            'uuid': client.get('id', ''),
-                            'server': local_server_name,
-                            'inbound_id': inbound_id,
-                            'expiry_time': expiry_time,
-                            'expiry_str': expiry_str,
+                            'email': email, 'uuid': client.get('id', ''),
+                            'server': local_server_name, 'inbound_id': inbound_id,
+                            'expiry_time': expiry_time, 'expiry_str': expiry_str,
                             'limit_ip': client.get('limitIp', 2)
                         })
             except:
@@ -2729,21 +2743,18 @@ async def search_clients_on_servers(query: str) -> list:
     except Exception as e:
         logger.error(f"Ошибка поиска на локальном сервере: {e}")
 
-    # Поиск на удалённых серверах
-    for server in config.get('servers', []):
-        if server.get('local') or not server.get('enabled', True):
-            continue
-
+    # Параллельный поиск на удалённых серверах
+    def _search_on_remote(server):
+        """Синхронный поиск на одном удалённом сервере (выполняется в thread pool)"""
+        server_results = []
         server_name = server.get('name', server.get('ip', 'Unknown'))
-
-        # Попробуем через API панели (если есть)
         panel_config = server.get('panel', {})
+
         if panel_config:
             try:
-                from bot.api.remote_xui import _get_panel_opener, _panel_login
-                import asyncio
                 import ssl
                 import urllib.request
+                import urllib.parse
                 import http.cookiejar
 
                 ip = server.get('ip', '')
@@ -2753,107 +2764,86 @@ async def search_clients_on_servers(query: str) -> list:
                 password = panel_config.get('password', '')
 
                 if ip and username and password:
-                    # Создаём opener для HTTPS без проверки сертификата
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
-
                     cookie_jar = http.cookiejar.CookieJar()
                     opener = urllib.request.build_opener(
                         urllib.request.HTTPCookieProcessor(cookie_jar),
                         urllib.request.HTTPSHandler(context=ctx)
                     )
-
                     base_url = f"https://{ip}:{port}{path}"
 
-                    # Логин
-                    import urllib.parse
-                    login_data = urllib.parse.urlencode({
-                        'username': username,
-                        'password': password
-                    }).encode()
-
-                    login_req = urllib.request.Request(
-                        f"{base_url}/login",
-                        data=login_data,
-                        method='POST'
-                    )
+                    login_data = urllib.parse.urlencode({'username': username, 'password': password}).encode()
+                    login_req = urllib.request.Request(f"{base_url}/login", data=login_data, method='POST')
                     login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-
                     resp = opener.open(login_req, timeout=10)
                     login_result = json.loads(resp.read())
 
                     if login_result.get('success'):
-                        # Получаем список inbounds
                         list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
                         resp = opener.open(list_req, timeout=10)
                         data = json.loads(resp.read())
-
                         if data.get('success'):
                             for inbound in data.get('obj', []):
-                                settings_str = inbound.get('settings', '{}')
                                 try:
-                                    settings = json.loads(settings_str)
+                                    settings = json.loads(inbound.get('settings', '{}'))
                                     for client in settings.get('clients', []):
                                         email = client.get('email', '')
                                         if query_lower in email.lower():
                                             expiry_time = client.get('expiryTime', 0)
-                                            if expiry_time > 0:
-                                                expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
-                                                expiry_str = expiry_dt.strftime("%d.%m.%Y")
-                                            else:
-                                                expiry_str = "Безлимит"
-
-                                            results.append({
-                                                'email': email,
-                                                'uuid': client.get('id', ''),
-                                                'server': server_name,
-                                                'inbound_id': inbound.get('id'),
-                                                'expiry_time': expiry_time,
-                                                'expiry_str': expiry_str,
+                                            expiry_str = datetime.fromtimestamp(expiry_time / 1000).strftime("%d.%m.%Y") if expiry_time > 0 else "Безлимит"
+                                            server_results.append({
+                                                'email': email, 'uuid': client.get('id', ''),
+                                                'server': server_name, 'inbound_id': inbound.get('id'),
+                                                'expiry_time': expiry_time, 'expiry_str': expiry_str,
                                                 'limit_ip': client.get('limitIp', 2)
                                             })
                                 except:
                                     continue
-                        continue  # Переходим к следующему серверу
+                        return server_results
             except Exception as e:
-                logger.error(f"Ошибка поиска через API панели {server_name}: {e}")
+                pass  # fallback to SSH
 
-        # Если нет панели или ошибка - пробуем через SSH
+        # SSH fallback
         ssh_config = server.get('ssh', {})
-        if not ssh_config.get('password') or not server.get('ip'):
-            continue
+        if ssh_config.get('password') and server.get('ip'):
+            try:
+                cmd = f"sshpass -p '{ssh_config['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_config.get('user', 'root')}@{server['ip']} \"sqlite3 /etc/x-ui/x-ui.db 'SELECT settings FROM inbounds WHERE enable=1'\""
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split('\n'):
+                        try:
+                            settings = json.loads(line)
+                            for client in settings.get('clients', []):
+                                email = client.get('email', '')
+                                if query_lower in email.lower():
+                                    expiry_time = client.get('expiryTime', 0)
+                                    expiry_str = datetime.fromtimestamp(expiry_time / 1000).strftime("%d.%m.%Y") if expiry_time > 0 else "Безлимит"
+                                    server_results.append({
+                                        'email': email, 'uuid': client.get('id', ''),
+                                        'server': server_name,
+                                        'expiry_time': expiry_time, 'expiry_str': expiry_str,
+                                        'limit_ip': client.get('limitIp', 2)
+                                    })
+                        except:
+                            continue
+            except Exception as e:
+                logger.error(f"Ошибка поиска на сервере {server_name}: {e}")
 
-        try:
-            cmd = f"sshpass -p '{ssh_config['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 {ssh_config.get('user', 'root')}@{server['ip']} \"sqlite3 /etc/x-ui/x-ui.db 'SELECT settings FROM inbounds WHERE enable=1'\""
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return server_results
 
-            if result.returncode == 0 and result.stdout.strip():
-                for line in result.stdout.strip().split('\n'):
-                    try:
-                        settings = json.loads(line)
-                        for client in settings.get('clients', []):
-                            email = client.get('email', '')
-                            if query_lower in email.lower():
-                                expiry_time = client.get('expiryTime', 0)
-                                if expiry_time > 0:
-                                    expiry_dt = datetime.fromtimestamp(expiry_time / 1000)
-                                    expiry_str = expiry_dt.strftime("%d.%m.%Y")
-                                else:
-                                    expiry_str = "Безлимит"
+    remote_servers = [s for s in config.get('servers', []) if not s.get('local') and s.get('enabled', True)]
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=len(remote_servers) or 1) as executor:
+        tasks = [loop.run_in_executor(executor, _search_on_remote, srv) for srv in remote_servers]
+        remote_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                                results.append({
-                                    'email': email,
-                                    'uuid': client.get('id', ''),
-                                    'server': server_name,
-                                    'expiry_time': expiry_time,
-                                    'expiry_str': expiry_str,
-                                    'limit_ip': client.get('limitIp', 2)
-                                })
-                    except:
-                        continue
-        except Exception as e:
-            logger.error(f"Ошибка поиска на сервере {server_name}: {e}")
+    for r in remote_results:
+        if isinstance(r, list):
+            results.extend(r)
+        elif isinstance(r, Exception):
+            logger.error(f"Ошибка параллельного поиска: {r}")
 
     return results
 
@@ -4492,6 +4482,251 @@ def save_servers_config(config: dict):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+
+
+@router.message(F.text == "📊 Онлайн мониторинг")
+@admin_only
+async def online_monitoring(message: Message, **kwargs):
+    """Мониторинг онлайн-клиентов на всех серверах"""
+    import json
+    import asyncio
+    import ssl
+    import urllib.request
+    import urllib.parse
+    import http.cookiejar
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor
+
+    status_msg = await message.answer("⏳ Собираю данные об онлайн-клиентах...")
+
+    config_path = Path('/root/manager_vpn/servers_config.json')
+    if not config_path.exists():
+        await status_msg.edit_text("❌ Конфиг серверов не найден.", parse_mode="HTML")
+        return
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    servers = [s for s in config.get('servers', []) if s.get('enabled', False)]
+
+    def _get_onlines_from_server(server):
+        """Получить онлайн-клиентов с сервера (синхронно, для thread pool)"""
+        server_name = server.get('name', 'Unknown')
+        is_local = server.get('local', False)
+
+        if is_local:
+            # Локальный сервер — читаем из SQLite + проверяем xray logs
+            try:
+                import sqlite3
+                conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT settings FROM inbounds WHERE enable=1")
+                rows = cursor.fetchall()
+                conn.close()
+                total_clients = 0
+                for (settings_str,) in rows:
+                    try:
+                        settings = json.loads(settings_str)
+                        total_clients += len(settings.get('clients', []))
+                    except:
+                        continue
+                return {'name': server_name, 'online': None, 'total': total_clients, 'error': 'Локальный (onlines недоступен)', 'local': True}
+            except Exception as e:
+                return {'name': server_name, 'online': None, 'total': 0, 'error': str(e), 'local': True}
+
+        panel = server.get('panel', {})
+        if not panel:
+            return {'name': server_name, 'online': None, 'total': 0, 'error': 'Нет панели'}
+
+        try:
+            ip = server.get('ip', '')
+            port = panel.get('port', 1020)
+            path = panel.get('path', '')
+            username = panel.get('username', '')
+            password = panel.get('password', '')
+            url = panel.get('url', '')
+
+            if url:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or port}{parsed.path}"
+            else:
+                base_url = f"https://{ip}:{port}{path}"
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cj),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+
+            # Login
+            login_data = urllib.parse.urlencode({'username': username, 'password': password}).encode()
+            login_req = urllib.request.Request(f"{base_url}/login", data=login_data, method='POST')
+            login_req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+            resp = opener.open(login_req, timeout=10)
+            login_result = json.loads(resp.read())
+
+            if not login_result.get('success'):
+                return {'name': server_name, 'online': None, 'total': 0, 'error': 'Ошибка авторизации'}
+
+            # Get onlines
+            onlines_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/onlines", method='POST')
+            resp = opener.open(onlines_req, timeout=10)
+            onlines_data = json.loads(resp.read())
+            online_list = onlines_data.get('obj', []) if onlines_data.get('success') else []
+
+            # Get total clients
+            list_req = urllib.request.Request(f"{base_url}/panel/api/inbounds/list")
+            resp = opener.open(list_req, timeout=10)
+            list_data = json.loads(resp.read())
+            total = 0
+            if list_data.get('success'):
+                for inbound in list_data.get('obj', []):
+                    try:
+                        settings = json.loads(inbound.get('settings', '{}'))
+                        total += len(settings.get('clients', []))
+                    except:
+                        continue
+
+            return {'name': server_name, 'online': len(online_list) if online_list else 0, 'online_list': online_list or [], 'total': total, 'error': None}
+
+        except Exception as e:
+            return {'name': server_name, 'online': None, 'total': 0, 'error': str(e)[:50]}
+
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=len(servers) or 1) as executor:
+        tasks = [loop.run_in_executor(executor, _get_onlines_from_server, srv) for srv in servers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    total_online = 0
+    total_clients = 0
+    # Собираем уникальных онлайн-клиентов: email -> [серверы]
+    clients_map = {}
+    server_stats = []
+
+    for r in results:
+        if isinstance(r, Exception):
+            server_stats.append({'name': '?', 'error': str(r)[:40]})
+            continue
+
+        name = r['name']
+        online = r.get('online')
+        total = r.get('total', 0)
+        error = r.get('error')
+        online_list = r.get('online_list', [])
+
+        server_stats.append(r)
+
+        # Собираем клиентов без дублей
+        for client_email in online_list:
+            clean = client_email.strip()
+            if clean:
+                if clean not in clients_map:
+                    clients_map[clean] = []
+                clients_map[clean].append(name)
+
+    text = "📊 <b>МОНИТОРИНГ ОНЛАЙН</b>\n\n"
+
+    for r in server_stats:
+        name = r.get('name', '?')
+        online = r.get('online')
+        total = r.get('total', 0)
+        error = r.get('error')
+
+        if r.get('local'):
+            text += f"🏠 <b>{name}</b> (локальный)\n"
+            text += f"   👥 Всего клиентов: {total}\n\n"
+            total_clients += total
+        elif error:
+            text += f"❌ <b>{name}</b>: {error}\n\n"
+        else:
+            pct = f"{(online / total * 100):.0f}%" if total > 0 else "0%"
+            text += f"🖥 <b>{name}</b>: 🟢 <b>{online}</b>/{total} ({pct})\n"
+            total_online += (online or 0)
+            total_clients += total
+
+    unique_count = len(clients_map)
+    text += f"\n━━━━━━━━━━━━━━━━\n"
+    text += f"📊 <b>Уникальных онлайн: {unique_count}</b>\n"
+    text += f"🔗 Всего подключений: {total_online}\n"
+    text += f"👥 Всего клиентов: {total_clients}\n"
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_monitoring")],
+        [InlineKeyboardButton(text="👤 Подробно (клиенты)", callback_data="monitoring_details")],
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    # Сохраняем данные для детализации
+    import json as _json
+    details_path = '/tmp/monitoring_details.json'
+    with open(details_path, 'w') as df:
+        _json.dump(clients_map, df, ensure_ascii=False)
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "refresh_monitoring")
+async def refresh_monitoring_callback(callback: CallbackQuery, **kwargs):
+    """Обновить мониторинг"""
+    await callback.answer("🔄 Обновляю...")
+    await callback.message.delete()
+    await online_monitoring(callback.message, **kwargs)
+
+
+@router.callback_query(F.data == "monitoring_details")
+async def monitoring_details_callback(callback: CallbackQuery, **kwargs):
+    """Показать детальный список онлайн-клиентов"""
+    import json as _json
+
+    await callback.answer()
+
+    details_path = '/tmp/monitoring_details.json'
+    try:
+        with open(details_path, 'r') as f:
+            clients_map = _json.load(f)
+    except Exception:
+        await callback.message.answer("❌ Данные устарели. Нажмите 🔄 Обновить.")
+        return
+
+    if not clients_map:
+        await callback.message.answer("📊 Нет онлайн-клиентов.")
+        return
+
+    # Сортируем по кол-ву серверов (убывание), потом по имени
+    sorted_clients = sorted(clients_map.items(), key=lambda x: (-len(x[1]), x[0]))
+
+    text = f"👤 <b>ОНЛАЙН КЛИЕНТЫ</b> ({len(sorted_clients)})\n\n"
+
+    for i, (email, servers) in enumerate(sorted_clients):
+        if len(text) > 3500:
+            remaining = len(sorted_clients) - i
+            text += f"\n<i>... и ещё {remaining} клиентов</i>"
+            break
+        srv_str = ", ".join(servers)
+        text += f"{'🟢'} <code>{email}</code>\n"
+        text += f"    📡 {srv_str}\n"
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_monitoring")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="monitoring_back")],
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "monitoring_back")
+async def monitoring_back_callback(callback: CallbackQuery, **kwargs):
+    """Назад к мониторингу"""
+    await callback.answer()
+    await callback.message.delete()
+    await online_monitoring(callback.message, **kwargs)
+
+
 @router.message(F.text == "🖥 Статус серверов")
 @admin_only
 async def check_servers_status(message: Message, **kwargs):
@@ -5300,6 +5535,54 @@ async def toggle_server_for_new(callback: CallbackQuery):
 # ============ РЕДАКТИРОВАНИЕ СЕРВЕРА ============
 
 @router.callback_query(F.data.startswith("srv_edit_"))
+async def _show_edit_server_menu_by_name(callback: CallbackQuery, server_name: str):
+    """Показать меню редактирования сервера по имени (без мутации callback.data)"""
+    from bot.api.remote_xui import load_servers_config
+    config = load_servers_config()
+    server = None
+    for s in config.get('servers', []):
+        if s.get('name') == server_name:
+            server = s
+            break
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+
+    domain = server.get('domain', 'N/A')
+    ip = server.get('ip', 'N/A')
+    port = server.get('port', 443)
+    enabled = server.get('enabled', True)
+    active_for_new = server.get('active_for_new', True)
+    description = server.get('description', '')
+
+    text = f"✏️ <b>РЕДАКТИРОВАНИЕ СЕРВЕРА</b>\n\n"
+    text += f"📛 Имя: <b>{server_name}</b>\n"
+    text += f"🌐 Домен: <code>{domain}</code>\n"
+    text += f"📍 IP: <code>{ip}</code>\n"
+    text += f"🔌 Порт: <code>{port}</code>\n"
+    text += f"📋 Описание: {description or 'нет'}\n"
+    text += f"✅ Включен: {'Да' if enabled else 'Нет'}\n"
+    text += f"🆕 Доступен для новых: {'Да' if active_for_new else 'Нет'}\n"
+
+    buttons = [
+        [InlineKeyboardButton(text="📛 Имя", callback_data=f"srvedit_name_{server_name}"),
+         InlineKeyboardButton(text="🌐 Домен", callback_data=f"srvedit_domain_{server_name}")],
+        [InlineKeyboardButton(text="📍 IP", callback_data=f"srvedit_ip_{server_name}"),
+         InlineKeyboardButton(text="🔌 Порт", callback_data=f"srvedit_port_{server_name}")],
+        [InlineKeyboardButton(text="📋 Описание", callback_data=f"srvedit_desc_{server_name}")],
+        [InlineKeyboardButton(
+            text=f"{'🔴 Выключить' if enabled else '🟢 Включить'}",
+            callback_data=f"srvedit_toggle_enabled_{server_name}"
+        )],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_servers_list")],
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
 async def show_edit_server_menu(callback: CallbackQuery, state: FSMContext):
     """Показать меню редактирования сервера"""
     if callback.from_user.id != ADMIN_ID:
@@ -5563,9 +5846,8 @@ async def toggle_server_enabled(callback: CallbackQuery):
             new_status = s['enabled']
             save_servers_config(config)
             await callback.answer(f"Сервер {'включен' if new_status else 'выключен'}")
-            # Перерисовываем меню
-            callback.data = f"srv_edit_{server_name}"
-            await show_edit_server_menu(callback, None)
+            # Перерисовываем меню без мутации frozen callback.data
+            await _show_edit_server_menu_by_name(callback, server_name)
             return
 
     await callback.answer("Сервер не найден", show_alert=True)
@@ -5807,6 +6089,10 @@ async def process_panel_path(message: Message, state: FSMContext):
         return
 
     panel_url = message.text.strip()
+
+    # Автоматически добавляем https:// если схема не указана
+    if not panel_url.startswith(('http://', 'https://')):
+        panel_url = 'https://' + panel_url
 
     # Парсим URL панели
     from urllib.parse import urlparse
@@ -8484,9 +8770,29 @@ async def brand_srv_select_all(callback: CallbackQuery, state: FSMContext, **kwa
     brand_id = int(callback.data.split("_")[-1])
     await state.update_data(brand_servers=[])
     await callback.answer("Все серверы выбраны (без ограничений)")
-    # Trigger re-render
-    callback.data = f"brand_servers_{brand_id}"
-    await brand_servers_manage(callback, state, **kwargs)
+    # Trigger re-render without mutating frozen callback.data
+    from bot.database.brand_manager import BrandManager
+    from bot.config import DATABASE_PATH
+    _bm = BrandManager(DATABASE_PATH)
+    brand = await _bm.get_brand(brand_id)
+    current_servers = []  # just cleared to []
+
+    from bot.api.remote_xui import load_servers_config
+    servers_config = load_servers_config()
+    all_servers = [s['name'] for s in servers_config.get('servers', []) if s.get('enabled', True) and not s.get('local', False)]
+
+    buttons = []
+    for name in all_servers:
+        selected = name in current_servers
+        icon = "✅" if selected else "⬜"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {name}",
+            callback_data=f"brand_srv_toggle_{brand_id}_{name}"
+        )])
+    buttons.append([InlineKeyboardButton(text="☑️ Все серверы", callback_data=f"brand_srv_all_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"brand_srv_save_{brand_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"brand_view_{brand_id}")])
+    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router.callback_query(F.data.startswith("brand_srv_save_"))
@@ -8511,9 +8817,37 @@ async def brand_srv_save(callback: CallbackQuery, state: FSMContext, brand_mgr=N
     else:
         await callback.answer("Сохранено: все серверы")
 
-    # Вернуться к карточке бренда
-    callback.data = f"brand_view_{brand_id}"
-    await brand_view(callback, brand_mgr=brand_mgr, **kwargs)
+    # Вернуться к карточке бренда без мутации frozen callback.data
+    brand = await brand_mgr.get_brand(brand_id)
+    managers = await brand_mgr.get_brand_managers(brand_id)
+    status = "🟢 Активен" if brand.is_active else "🔴 Отключён"
+
+    import builtins
+    bot_manager = getattr(builtins, '_bot_manager', None)
+    bot_status = "▶️ Запущен" if (bot_manager and bot_manager.is_running(brand_id)) or brand_id == 1 else "⏹ Остановлен"
+
+    text = (
+        f"🏷 <b>{brand.name}</b>\n\n"
+        f"📌 ID: {brand.id}\n"
+        f"🌐 Домен: <code>{brand.domain}</code>\n"
+        f"🎨 Цвет: {brand.theme_color}\n"
+        f"📊 Статус: {status}\n"
+        f"🤖 Бот: {bot_status}\n"
+        f"👥 Менеджеров: {len(managers)}\n"
+    )
+    brand_servers = brand.get_allowed_servers()
+    if brand_servers:
+        text += f"🖥 Серверы: {', '.join(brand_servers)}\n"
+    else:
+        text += f"🖥 Серверы: все\n"
+    if brand.logo_url:
+        text += f"🖼 Лого: {brand.logo_url}\n"
+
+    from bot.utils.keyboards import Keyboards
+    await callback.message.edit_text(
+        text,
+        reply_markup=Keyboards.brand_actions_keyboard(brand_id, brand.is_active)
+    )
 
 
 @router.callback_query(F.data == "brand_add")
@@ -9123,6 +9457,49 @@ class SetKeyLimitStates(StatesGroup):
     waiting_for_limit = State()
 
 
+class ManagerKeyLimitStates(StatesGroup):
+    waiting_for_limit = State()
+
+
+async def brand_mgr_info_by_ids(message_obj, brand_id: int, manager_id: int, brand_mgr):
+    """Показать карточку менеджера бренда без мутации callback.data"""
+    brand = await brand_mgr.get_brand(brand_id)
+    limit_info = await brand_mgr.get_manager_key_limit(manager_id, brand_id)
+    count = await brand_mgr.get_manager_keys_count(manager_id, brand_id)
+
+    verified = "✅ Проверен" if limit_info['verified'] else "⏳ Не проверен"
+    limit_str = "безлимит" if limit_info['limit'] == 0 or limit_info['verified'] else str(limit_info['limit'])
+
+    buttons = []
+    if not limit_info['verified']:
+        buttons.append([InlineKeyboardButton(
+            text="✅ Подтвердить (безлимит)",
+            callback_data=f"brand_verify_mgr_{brand_id}_{manager_id}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="🔒 Снять подтверждение",
+            callback_data=f"brand_unverify_mgr_{brand_id}_{manager_id}"
+        )])
+    buttons.append([InlineKeyboardButton(
+        text=f"📝 Установить лимит ({limit_str})",
+        callback_data=f"brand_set_limit_{brand_id}_{manager_id}"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data=f"brand_managers_{brand_id}"
+    )])
+    await message_obj.edit_text(
+        f"👤 <b>Менеджер {manager_id}</b>\n"
+        f"🏷 Бренд: {brand.name}\n\n"
+        f"📊 Статус: {verified}\n"
+        f"🔑 Создано ключей: {count}\n"
+        f"📏 Лимит: {limit_str}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+
 @router.callback_query(F.data.startswith("brand_mgr_info_"))
 async def brand_mgr_info(callback: CallbackQuery, brand_mgr=None, **kwargs):
     """Информация о менеджере бренда с опциями лимита"""
@@ -9187,9 +9564,8 @@ async def brand_verify_manager(callback: CallbackQuery, brand_mgr=None, **kwargs
 
     await brand_mgr.verify_manager(brand_id, manager_id, True)
     await callback.answer("✅ Менеджер подтверждён — лимит снят")
-    # Обновить карточку
-    callback.data = f"brand_mgr_info_{brand_id}_{manager_id}"
-    await brand_mgr_info(callback, brand_mgr=brand_mgr, **kwargs)
+    # Обновить карточку (без мутации frozen callback.data)
+    await brand_mgr_info_by_ids(callback.message, brand_id, manager_id, brand_mgr)
 
 
 @router.callback_query(F.data.startswith("brand_unverify_mgr_"))
@@ -9206,8 +9582,8 @@ async def brand_unverify_manager(callback: CallbackQuery, brand_mgr=None, **kwar
 
     await brand_mgr.verify_manager(brand_id, manager_id, False)
     await callback.answer("🔒 Подтверждение снято — лимит 5 ключей")
-    callback.data = f"brand_mgr_info_{brand_id}_{manager_id}"
-    await brand_mgr_info(callback, brand_mgr=brand_mgr, **kwargs)
+    # Обновить карточку (без мутации frozen callback.data)
+    await brand_mgr_info_by_ids(callback.message, brand_id, manager_id, brand_mgr)
 
 
 @router.callback_query(F.data.startswith("brand_set_limit_"))
@@ -9262,3 +9638,55 @@ async def brand_back_to_admin(callback: CallbackQuery, **kwargs):
     await callback.message.delete()
     await callback.message.answer("Панель администратора", reply_markup=Keyboards.admin_menu())
     await callback.answer()
+
+@router.callback_query(F.data.startswith("mgr_setlimit_"))
+async def mgr_setlimit_start(callback: CallbackQuery, state: FSMContext, **kwargs):
+    """Начать установку лимита ключей для менеджера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    manager_id = int(callback.data.replace("mgr_setlimit_", ""))
+    await state.update_data(mgr_limit_target=manager_id)
+    await state.set_state(ManagerKeyLimitStates.waiting_for_limit)
+    await callback.message.answer(
+        "📏 <b>Установка лимита ключей для менеджера</b>\n\n"
+        "Введите число:\n"
+        "• <b>0</b> = снять лимит (безлимит)\n"
+        "• <b>5</b>, <b>10</b>, <b>20</b> и т.д. = конкретный лимит на цикл",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(ManagerKeyLimitStates.waiting_for_limit)
+async def mgr_setlimit_save(message: Message, state: FSMContext, db: DatabaseManager, **kwargs):
+    """Сохранить лимит ключей менеджера"""
+    try:
+        limit = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Отправьте число")
+        return
+    if limit < 0:
+        await message.answer("❌ Лимит не может быть отрицательным")
+        return
+    data = await state.get_data()
+    manager_id = data.get('mgr_limit_target')
+    await db.set_manager_key_limit(manager_id, limit)
+    limit_str = "снят (безлимит)" if limit == 0 else str(limit)
+    await message.answer(
+        f"✅ Лимит для менеджера <code>{manager_id}</code> установлен: <b>{limit_str}</b>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("mgr_resetlimit_"))
+async def mgr_resetlimit(callback: CallbackQuery, db: DatabaseManager, **kwargs):
+    """Сбросить счётчик ключей менеджера"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    manager_id = int(callback.data.replace("mgr_resetlimit_", ""))
+    await db.reset_manager_key_limit(manager_id)
+    await callback.answer("✅ Счётчик ключей сброшен", show_alert=True)
+

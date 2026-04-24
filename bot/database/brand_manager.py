@@ -95,7 +95,10 @@ class BrandManager:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_brands_token ON brands(bot_token)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_brands_brand ON manager_brands(brand_id)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_manager_brands_manager ON manager_brands(manager_id)')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_clients_brand ON clients(brand_id)')
+            try:
+                await db.execute('CREATE INDEX IF NOT EXISTS idx_clients_brand ON clients(brand_id)')
+            except Exception:
+                pass  # clients table may not exist
             await db.execute('CREATE INDEX IF NOT EXISTS idx_keys_history_brand ON keys_history(brand_id)')
 
             await db.commit()

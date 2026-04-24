@@ -69,6 +69,16 @@ class DatabaseManager:
             except Exception:
                 pass  # Колонка уже существует
 
+            # Добавляем колонки лимита ключей менеджера
+            try:
+                await db.execute('ALTER TABLE managers ADD COLUMN key_limit INTEGER DEFAULT 0')
+            except Exception:
+                pass
+            try:
+                await db.execute('ALTER TABLE managers ADD COLUMN key_limit_reset_at TIMESTAMP DEFAULT NULL')
+            except Exception:
+                pass
+
             # Добавляем колонку allowed_servers для ограничения серверов менеджера (JSON массив имён серверов, NULL = все)
             try:
                 await db.execute('ALTER TABLE managers ADD COLUMN allowed_servers TEXT DEFAULT NULL')
@@ -1301,6 +1311,67 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error marking payment notified for {server_name}: {e}")
             return False
+
+
+    async def get_manager(self, user_id: int) -> dict:
+        """Получить данные менеджера по user_id"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    'SELECT user_id, username, full_name, custom_name FROM managers WHERE user_id = ?',
+                    (user_id,)
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f'Error getting manager: {e}')
+            return None
+
+    async def get_manager_key_limit_info(self, manager_id: int) -> dict:
+        """Лимит ключей менеджера: {limit, reset_at, keys_since_reset}"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'SELECT key_limit, key_limit_reset_at FROM managers WHERE user_id = ?',
+                (manager_id,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return {'limit': 0, 'reset_at': None, 'keys_since_reset': 0}
+            limit = row[0] or 0
+            reset_at = row[1]
+            if limit > 0:
+                if reset_at:
+                    cursor2 = await db.execute(
+                        'SELECT COUNT(*) FROM keys_history WHERE manager_id = ? AND created_at >= ?',
+                        (manager_id, reset_at)
+                    )
+                else:
+                    cursor2 = await db.execute(
+                        'SELECT COUNT(*) FROM keys_history WHERE manager_id = ?',
+                        (manager_id,)
+                    )
+                count = (await cursor2.fetchone())[0]
+            else:
+                count = 0
+            return {'limit': limit, 'reset_at': reset_at, 'keys_since_reset': count}
+
+    async def set_manager_key_limit(self, manager_id: int, limit: int) -> bool:
+        """Установить лимит (0 = безлимит)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('UPDATE managers SET key_limit = ? WHERE user_id = ?', (limit, manager_id))
+            await db.commit()
+            return True
+
+    async def reset_manager_key_limit(self, manager_id: int) -> bool:
+        """Сбросить счётчик (обновить reset_at = сейчас)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                'UPDATE managers SET key_limit_reset_at = ? WHERE user_id = ?',
+                (datetime.now().isoformat(), manager_id)
+            )
+            await db.commit()
+            return True
 
     async def delete_server_payment(self, server_name: str) -> bool:
         """Удалить запись оплаты сервера"""
